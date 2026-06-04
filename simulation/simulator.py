@@ -49,9 +49,11 @@ USAGE
 """
 
 from __future__ import annotations
+from pathlib import Path
 from typing import List
 
 import numpy as np
+import pandas as pd
 from scipy.special import expit, beta as beta_fn
 
 from models.za_gas_model import ZAGASModel
@@ -277,11 +279,105 @@ def _draw_from_predictive(
     gb2_draws = np.zeros(n_draws)
     if n_pos > 0:
         try:
-            gb2_draws[is_positive == 1] = model.dist.rvs(n_pos, **call)
+            if hasattr(model.dist, "ppf"):
+                gb2_draws[is_positive == 1] = model.dist.ppf(
+                    rng.uniform(size=n_pos), **call
+                )
+            else:
+                gb2_draws[is_positive == 1] = model.dist.rvs(n_pos, **call)
         except Exception:
             pass  # leave as 0 on numerical failure
 
     return gb2_draws  # zeros for non-positive draws
+
+
+def _predictive_quantile(model: ZAGASModel, paths: dict, idx: int, q: float) -> float:
+    """Quantile of the zero-augmented predictive distribution."""
+    pi_t = float(paths["pi_oos"][idx])
+    zero_mass = 1.0 - pi_t
+    if q <= zero_mass:
+        return 0.0
+    static = paths["static"]
+    call = {
+        name: float(paths["f_arr_oos"][idx, j])
+        for j, name in enumerate(paths["tv_names"])
+    }
+    call.update(static)
+    q_pos = np.clip((q - zero_mass) / max(pi_t, 1e-12), 1e-12, 1.0 - 1e-12)
+    if hasattr(model.dist, "ppf"):
+        return float(model.dist.ppf(q_pos, **call))
+    draws = _draw_from_predictive(model, paths, idx, n_draws=5000)
+    return float(np.quantile(draws, q))
+
+
+def forecast_summary(
+    model: ZAGASModel,
+    paths: dict,
+    y: np.ndarray | None = None,
+    sample: str = "OOS",
+    model_id: str = "model",
+    quantiles: tuple[float, ...] = (0.50, 0.75, 0.90, 0.95, 0.97, 0.99),
+    n_draws: int = 1000,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """
+    Summarize predictive distributions with means and requested quantiles.
+
+    Columns include expected_value, q50, q75, q90, q95, q97, q99, sim_min,
+    sim_max, and optionally observed y.
+    """
+    rng = np.random.default_rng(seed)
+    n = len(paths["pi_oos"])
+    rows = []
+    for i in range(n):
+        row = {
+            "model_id": model_id,
+            "sample": sample,
+            "t_index": i,
+            "expected_value": _predictive_mean(model, paths, i),
+        }
+        for q in quantiles:
+            row[f"q{int(round(q * 100)):02d}"] = _predictive_quantile(
+                model, paths, i, q
+            )
+        if n_draws and n_draws > 0:
+            draws = _draw_from_predictive(model, paths, i, n_draws=n_draws, rng=rng)
+            row["sim_min"] = float(np.min(draws))
+            row["sim_max"] = float(np.max(draws))
+        else:
+            row["sim_min"] = 0.0
+            row["sim_max"] = np.nan
+        if y is not None:
+            row["observed"] = float(y[i])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def save_forecast_summary(frame: pd.DataFrame, path: str | Path) -> Path:
+    """Save forecast summary CSV for later reuse."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(out, index=False)
+    return out
+
+
+def predictive_loglik(model: ZAGASModel, paths: dict, y: np.ndarray) -> float:
+    """Log likelihood of observations under filtered predictive paths."""
+    total = 0.0
+    for i in range(len(y)):
+        pi_t = np.clip(float(paths["pi_oos"][i]), 1e-10, 1.0 - 1e-10)
+        if y[i] <= 0:
+            ll_t = np.log(1.0 - pi_t)
+        else:
+            call = {
+                name: float(paths["f_arr_oos"][i, j])
+                for j, name in enumerate(paths["tv_names"])
+            }
+            call.update(paths["static"])
+            ll_t = np.log(pi_t) + model.dist.logpdf(y[i], **call)
+        if np.isfinite(ll_t):
+            total += float(ll_t)
+    return total
 
 
 # ===========================================================================
@@ -367,6 +463,7 @@ def evaluate_metrics(
     is_pit = pit_values(is_cdfs, y_eff, randomise_zeros=True, rng=rng)
     is_qr  = quantile_residuals(is_cdfs, y_eff, randomise_zeros=True, rng=rng)
     is_jb  = jarque_bera(is_qr)
+    is_loglik = float(is_paths["loglik"])
 
     # ---- OUT-OF-SAMPLE ----
     oos_paths = simulate_oos(model, theta, y_train, y_test)
@@ -407,9 +504,19 @@ def evaluate_metrics(
     oos_pit = pit_values(oos_cdfs, y_test, randomise_zeros=True, rng=rng)
     oos_qr  = quantile_residuals(oos_cdfs, y_test, randomise_zeros=True, rng=rng)
     oos_jb  = jarque_bera(oos_qr)
+    oos_loglik = predictive_loglik(model, oos_paths, y_test)
+
+    k_params = len(model.parameter_names()) if hasattr(model, "parameter_names") else len(theta)
+    is_aic = float(-2.0 * is_loglik + 2.0 * k_params)
+    is_bic = float(-2.0 * is_loglik + k_params * np.log(max(n_eff, 1)))
+    oos_aic = float(-2.0 * oos_loglik + 2.0 * k_params)
+    oos_bic = float(-2.0 * oos_loglik + k_params * np.log(max(T_test, 1)))
 
     return {
         # In-sample
+        "is_loglik": is_loglik,
+        "is_aic":    is_aic,
+        "is_bic":    is_bic,
         "is_rmse":  is_rmse,
         "is_mad":   is_mad,
         "is_crps":  is_crps,
@@ -419,6 +526,9 @@ def evaluate_metrics(
         "is_cdfs":  is_cdfs,
         "is_paths": is_paths,
         # Out-of-sample
+        "oos_loglik": oos_loglik,
+        "oos_aic":    oos_aic,
+        "oos_bic":    oos_bic,
         "oos_rmse":  oos_rmse,
         "oos_mad":   oos_mad,
         "oos_crps":  oos_crps,

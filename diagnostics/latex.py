@@ -67,7 +67,7 @@ def latex_info_table(
 
 def latex_coverage_table(
     results: dict[str, List[dict]],
-    caption: str = "Coverage test results",
+    caption: str = "Kupiec and Christoffersen tests of 95\\% coverage",
     label: str = "tab:coverage",
 ) -> str:
     """
@@ -103,6 +103,38 @@ def latex_coverage_table(
         r"\end{table}",
     ]
     return "\n".join(lines)
+
+
+def latex_coverage_frame_table(
+    frame,
+    caption: str = "Kupiec and Christoffersen tests of 95\\% coverage",
+    label: str = "tab:coverage95",
+) -> str:
+    """LaTeX table from a coverage DataFrame with IS, OOS, and full samples."""
+    keep = frame[[
+        "model_id", "sample", "coverage", "violations", "violation_rate",
+        "LR_uc", "pvalue_uc", "LR_cc", "pvalue_cc",
+    ]].copy()
+    keep = keep.rename(columns={
+        "model_id": "Model",
+        "sample": "Sample",
+        "coverage": "Coverage",
+        "violations": "Viol.",
+        "violation_rate": "Rate",
+        "LR_uc": "$LR_{uc}$",
+        "pvalue_uc": "$p_{uc}$",
+        "LR_cc": "$LR_{cc}$",
+        "pvalue_cc": "$p_{cc}$",
+    })
+    body = keep.to_latex(index=False, float_format=lambda x: f"{x:.4f}")
+    return "\n".join([
+        r"\begin{table}[ht]",
+        r"\centering",
+        rf"\caption{{{caption}}}",
+        rf"\label{{{label}}}",
+        body,
+        r"\end{table}",
+    ])
 
 
 # ===========================================================================

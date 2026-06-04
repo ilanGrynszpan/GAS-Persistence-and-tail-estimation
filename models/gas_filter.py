@@ -373,6 +373,8 @@ class GASFilter:
                 theta0[idx[f"B_{name}_{l}"]] = 0.9 / n_l
 
         # Static GB2 parameters (on log scale for gamma / natural scale for zeta)
+        if "xi" in idx:
+            theta0[idx["xi"]] = float(np.log(1.2))
         if "gamma" in idx:
             theta0[idx["gamma"]] = 1.0   # p = exp(-gamma) ~ 0.37
         if "zeta" in idx:
@@ -399,8 +401,15 @@ class GASFilter:
                 bounds.append((-0.5, 1.0))          # A_l  (score)
             for _ in self.lags:
                 bounds.append((-0.99, 0.99))        # B_l  (AR)
-        bounds.append((0.1, 5.0))                   # gamma (static)
-        bounds.append((0.2, 10.0))                  # zeta  (static)
+        for name in self.static_names:
+            if name == "xi":
+                bounds.append((-3.0, 3.0))          # xi = log(a)
+            elif name == "gamma":
+                bounds.append((0.1, 5.0))           # gamma (static)
+            elif name == "zeta":
+                bounds.append((0.2, 10.0))          # zeta  (static)
+            else:
+                bounds.append((-10.0, 10.0))
         return bounds
 
     def fit(self, y: np.ndarray, verbose: bool = False) -> dict:

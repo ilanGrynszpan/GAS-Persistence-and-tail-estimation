@@ -123,6 +123,51 @@ class ZAGASModel:
         return {name: float(pi_theta[i])
                 for i, name in enumerate(self._pi_names)}
 
+    def parameter_names(self) -> List[str]:
+        """Flat theta parameter names in optimizer order."""
+        gas_names = [
+            name for name, _ in sorted(
+                self.gas.codec._idx.items(), key=lambda item: item[1]
+            )
+        ]
+        return gas_names + list(self._pi_names)
+
+    def parameter_blocks(self) -> dict[str, str]:
+        """Map each flat theta parameter to its model block."""
+        blocks = {}
+        for name in self.parameter_names():
+            if name in self._pi_names:
+                blocks[name] = "pi"
+            elif name in self.gas.static_names:
+                blocks[name] = "positive_static"
+            else:
+                blocks[name] = "gas"
+        return blocks
+
+    def parameter_count_breakdown(self) -> dict:
+        """Explain why the optimizer has this many parameters."""
+        n_lags = len(self.lags)
+        n_tv = len(self.gas.tv_names)
+        per_tv = 2 + 2 * n_lags
+        n_gas_dynamic = n_tv * per_tv
+        n_static = len(self.gas.static_names)
+        n_pi = len(self._pi_names)
+        return {
+            "seasonal": self.seasonal,
+            "lags": list(self.lags),
+            "n_lags": n_lags,
+            "tv_parameters": list(self.gas.tv_names),
+            "per_tv_parameter": per_tv,
+            "gas_dynamic_parameters": n_gas_dynamic,
+            "static_positive_parameters": n_static,
+            "pi_parameters": n_pi,
+            "total_parameters": n_gas_dynamic + n_static + n_pi,
+            "formula": (
+                "n_tv * (omega + f0 + A_lags + B_lags) + "
+                "n_static_positive + n_pi"
+            ),
+        }
+
     # ==================================================================
     # Core recursion
     # ==================================================================
@@ -377,7 +422,15 @@ class ZAGASModel:
             + self.pi_dyn.default_bounds(self.seasonal)
         )
 
-    def fit(self, y: np.ndarray, verbose: bool = False) -> dict:
+    def fit(
+        self,
+        y: np.ndarray,
+        verbose: bool = False,
+        method: str = "L-BFGS-B",
+        use_bounds: bool = True,
+        theta0: np.ndarray | None = None,
+        options: dict | None = None,
+    ) -> dict:
         """
         Estimate all parameters by maximum likelihood.
 
@@ -391,21 +444,23 @@ class ZAGASModel:
             'gas_theta': slice for GAS hyperparameters
             'pi_theta' : slice for pi dynamics parameters
         """
-        theta0 = self.initial_theta(y)
-        bounds = self.default_bounds()
+        theta0 = self.initial_theta(y) if theta0 is None else np.asarray(theta0, dtype=float)
+        bounds = self.default_bounds() if use_bounds else None
+        opt_options = {"maxiter": 5000, "disp": verbose}
+        if method.upper() == "L-BFGS-B":
+            opt_options.update({"ftol": 1e-10, "gtol": 1e-6})
+        elif method.upper() == "BFGS":
+            opt_options.update({"gtol": 1e-5})
+        if options:
+            opt_options.update(options)
 
         result = minimize(
             fun=self._run_filter,
             x0=theta0,
             args=(y, False),
-            method="L-BFGS-B",
+            method=method,
             bounds=bounds,
-            options={
-                "maxiter": 5000,
-                "ftol":    1e-10,
-                "gtol":    1e-6,
-                "disp":    verbose,
-            },
+            options=opt_options,
         )
 
         n_gas = self.gas.codec.n_params

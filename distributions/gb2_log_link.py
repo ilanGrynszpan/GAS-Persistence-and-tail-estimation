@@ -18,7 +18,7 @@ with  a = exp(xi), b = exp(zeta), p = exp(-gamma), σ = exp(phi).
 from __future__ import annotations
 from typing import Dict, List
 import numpy as np
-from scipy.special import digamma, polygamma, betainc
+from scipy.special import digamma, polygamma, betainc, betaincinv
 from scipy.special import beta as beta_fn
 
 from distributions.base import Distribution
@@ -94,6 +94,18 @@ class GB2LogLink(Distribution):
         z = (y / sigma) ** p
         u = np.clip(z / (1.0 + z), 1e-12, 1.0 - 1e-12)
         return float(betainc(a, b, u))
+
+    def ppf(self, q: float | np.ndarray, **params) -> float | np.ndarray:
+        """Quantile function for the positive GB2 component."""
+        phi, xi, gamma, zeta = self._unpack(params)
+        a = np.exp(xi)
+        b = np.exp(zeta)
+        p = np.exp(-gamma)
+        sigma = np.exp(phi)
+        q_arr = np.clip(np.asarray(q, dtype=float), 1e-12, 1.0 - 1e-12)
+        u = betaincinv(a, b, q_arr)
+        y = sigma * (u / (1.0 - u)) ** (1.0 / p)
+        return float(y) if np.ndim(q) == 0 else y
 
     def rvs(self, n: int = 1, **params) -> np.ndarray:
         phi, xi, gamma, zeta = self._unpack(params)

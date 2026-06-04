@@ -40,6 +40,7 @@ where  N_{ij} = #{I_{t-1}=i, I_t=j},  pi_ij = N_{ij} / N_{i.}
 from __future__ import annotations
 from typing import Tuple
 import numpy as np
+import pandas as pd
 from scipy.stats import chi2, jarque_bera as _jb
 
 
@@ -267,3 +268,44 @@ def coverage_tests(
             "reject_cc":      c["reject_5pct_cc"],
         })
     return rows
+
+
+def coverage_frame_95(
+    pit_by_model_sample: dict[str, dict[str, np.ndarray]],
+) -> pd.DataFrame:
+    """
+    Run Kupiec and Christoffersen tests of 95% coverage.
+
+    Parameters
+    ----------
+    pit_by_model_sample:
+        {model_id: {"IS": pit_is, "OOS": pit_oos, "Full": pit_full}}
+
+    Returns
+    -------
+    DataFrame with one row per model/sample. The tested tail probability is
+    alpha=0.05, i.e. the null coverage is 95%.
+    """
+    rows = []
+    alpha = 0.05
+    for model_id, samples in pit_by_model_sample.items():
+        for sample, pit in samples.items():
+            k = kupiec_test(pit, alpha=alpha)
+            c = christoffersen_test(pit, alpha=alpha)
+            rows.append({
+                "model_id": model_id,
+                "sample": sample,
+                "coverage": "95%",
+                "alpha": alpha,
+                "violations": k["actual_violations"],
+                "expected_violations": k["expected_violations"],
+                "violation_rate": k["violation_rate"],
+                "LR_uc": k["stat"],
+                "pvalue_uc": k["pvalue"],
+                "LR_ind": c["LR_ind"],
+                "LR_cc": c["LR_cc"],
+                "pvalue_cc": c["pvalue_cc"],
+                "reject_uc_5pct": k["reject_5pct"],
+                "reject_cc_5pct": c["reject_5pct_cc"],
+            })
+    return pd.DataFrame(rows)

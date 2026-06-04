@@ -21,8 +21,11 @@ env/
 # Results and outputs (large files; commit selectively)
 *.json
 *.png
-*.pdf
 *.tex
+*.csv
+artifacts/cache/
+artifacts/**/*.csv
+artifacts/**/*.tex
 
 # IDE
 .vscode/

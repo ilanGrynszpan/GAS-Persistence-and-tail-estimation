@@ -75,8 +75,11 @@ def pit_values(
         zero_mask = (y == 0)
         if zero_mask.any():
             # F_t(0) = cdfs[t] for zero observations (already computed)
-            upper = cdfs[zero_mask]
+            upper = np.nan_to_num(cdfs[zero_mask], nan=1e-10, posinf=1.0 - 1e-10, neginf=1e-10)
+            upper = np.clip(upper, 1e-10, 1.0 - 1e-10)
             pit[zero_mask] = rng.uniform(0.0, upper)
+
+    pit = np.nan_to_num(pit, nan=0.5, posinf=1.0 - 1e-10, neginf=1e-10)
 
     # Clip away exact 0/1 for numerical stability in norm.ppf
     pit = np.clip(pit, 1e-10, 1.0 - 1e-10)
