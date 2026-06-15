@@ -59,7 +59,7 @@ from typing import List, Tuple
 
 import numpy as np
 from scipy.optimize import minimize
-from scipy.special import expit   # logistic σ(x) = 1/(1+e^{-x})
+from scipy.special import expit, log_expit  # logistic σ(x) = 1/(1+e^{-x})
 
 from distributions.base import Distribution
 from pi_dynamics.base import PiDynamics
@@ -88,14 +88,14 @@ class ZAGASModel:
         scale_score: bool = True,
         static_params: List[str] | None = None,
     ):
-        self.dist        = distribution
-        self.pi_dyn      = pi_dynamics
-        self.seasonal    = seasonal
-        self.lags        = SEASONAL_LAGS[seasonal]
-        self.max_lag     = max(self.lags)
+        self.dist = distribution
+        self.pi_dyn = pi_dynamics
+        self.seasonal = seasonal
+        self.lags = SEASONAL_LAGS[seasonal]
+        self.max_lag = max(self.lags)
 
         # Build the GAS filter for the distribution's TV parameters
-        self.gas         = GASFilter(
+        self.gas = GASFilter(
             distribution=distribution,
             seasonal=seasonal,
             scale_score=scale_score,
@@ -103,7 +103,7 @@ class ZAGASModel:
         )
 
         # Cache the pi parameter names (depends on the seasonal lag set)
-        self._pi_names   = pi_dynamics.param_names(seasonal)
+        self._pi_names = pi_dynamics.param_names(seasonal)
 
     # ==================================================================
     # Parameter vector helpers
@@ -120,15 +120,13 @@ class ZAGASModel:
 
     def _decode_pi(self, pi_theta: np.ndarray) -> dict:
         """Return dict mapping pi parameter names → values."""
-        return {name: float(pi_theta[i])
-                for i, name in enumerate(self._pi_names)}
+        return {name: float(pi_theta[i]) for i, name in enumerate(self._pi_names)}
 
     def parameter_names(self) -> List[str]:
         """Flat theta parameter names in optimizer order."""
         gas_names = [
-            name for name, _ in sorted(
-                self.gas.codec._idx.items(), key=lambda item: item[1]
-            )
+            name
+            for name, _ in sorted(self.gas.codec._idx.items(), key=lambda item: item[1])
         ]
         return gas_names + list(self._pi_names)
 
@@ -163,14 +161,40 @@ class ZAGASModel:
             "pi_parameters": n_pi,
             "total_parameters": n_gas_dynamic + n_static + n_pi,
             "formula": (
-                "n_tv * (omega + f0 + A_lags + B_lags) + "
-                "n_static_positive + n_pi"
+                "n_tv * (omega + f0 + A_lags + B_lags) + " "n_static_positive + n_pi"
             ),
         }
 
     # ==================================================================
     # Core recursion
     # ==================================================================
+
+    def _soft_stationarity_penalty(self, gp: dict, pi_params: dict) -> float:
+        penalty = 0.0
+        lam = 1e5
+
+        # Penalize GAS AR persistence: sum |B_l| < 0.98 for each TV state
+        for name in self.gas.tv_names:
+            b_vals = np.array([gp[f"B_{name}_{l}"] for l in self.lags])
+            b_sum = np.sum(np.abs(b_vals))
+
+            excess = max(0.0, b_sum - 0.98)
+            penalty += lam * excess**2
+
+        # Penalize very large score response, not stationarity, just stability
+        for name in self.gas.tv_names:
+            a_vals = np.array([gp[f"A_{name}_{l}"] for l in self.lags])
+            a_sum = np.sum(np.abs(a_vals))
+
+            excess = max(0.0, a_sum - 2.0)
+            penalty += 1e3 * excess**2
+
+        # Penalize pi AR coefficient
+        rho = pi_params.get("rho", 0.0)
+        excess = max(0.0, abs(rho) - 0.98)
+        penalty += lam * excess**2
+
+        return penalty
 
     def _run_filter(
         self,
@@ -181,31 +205,9 @@ class ZAGASModel:
         """
         Run the combined GAS + pi recursion over the series y.
 
-        For each t in the effective sample:
-
-          (a) GAS step:
-              f_t  = current state of distribution params (phi_t, xi_t)
-              s_t  = scaled score from distribution  (only when y_t > 0)
-              f_{t+1} updated via GAS(L,L) eq.
-
-          (b) Pi step:
-              eta_t computed from pi_dynamics
-              pi_t = sigma(eta_t)
-
-          (c) Likelihood:
-              log p(y_t | F_{t-1}) =
-                  log(1 - pi_t)                          if y_t = 0
-                  log(pi_t) + log g(y_t; f_t, static)   if y_t > 0
-
-        Parameters
-        ----------
-        theta        : combined [gas_theta | pi_theta]
-        y            : observed series (length T)
-        return_paths : if True return filtered paths, else return neg-loglik
-
-        Returns
-        -------
-        float (neg-loglik) when return_paths=False, or dict when True.
+        This version avoids clipping the filtered GAS states. Instead, it adds
+        smooth penalties for unstable persistence, excessive state magnitudes,
+        and extreme pi logits. This is better suited to unconstrained BFGS.
         """
 
         T = len(y)
@@ -214,146 +216,189 @@ class ZAGASModel:
 
         gas_theta, pi_theta = self._split_theta(theta)
         pi_params = self._decode_pi(pi_theta)
+        gp = self.gas.codec.decode(gas_theta)
 
-        # --- Decode GAS state arrays ---
-        # We reuse GASFilter._run_filter to advance the state.
-        # On return_paths=True it gives f_arr and s_arr indexed from max_lag.
-        # Here we need a slightly different approach: we need the GAS states
-        # at each t in [max_lag, T-1] and the ability to update them, while
-        # simultaneously running pi dynamics.
-        #
-        # Strategy: run the GAS recursion manually (mirrors gas_filter._run_filter)
-        # so we can interleave the pi update and the joint likelihood.
+        L = self.lags
+        n_tv = len(self.gas.tv_names)
 
-        gp     = self.gas.codec.decode(gas_theta)   # dict of GAS params
-        L      = self.lags
-        n_tv   = len(self.gas.tv_names)
+        # -----------------------------
+        # Penalty hyperparameters
+        # -----------------------------
+        penalty = 0.0
 
-        # Validity guard for static distribution parameters
+        LAM_PERSIST = 1e5
+        LAM_SCORE = 1e3
+        LAM_STATE = 1e3
+        LAM_ETA = 1e2
+        LAM_STATIC = 1e5
+
+        B_LIMIT = 0.98
+        RHO_LIMIT = 0.98
+        A_LIMIT = 2.0
+        STATE_LIMIT = 15.0
+        ETA_LIMIT = 30.0
+
+        # -----------------------------
+        # Static distribution penalties
+        # -----------------------------
         gamma_v = gp.get("gamma", 1.0)
-        zeta_v  = gp.get("zeta",  3.0)
-        if np.exp(gamma_v) <= 0 or np.exp(zeta_v) <= np.exp(gamma_v):
-            return 1e12 if not return_paths else {}
+        zeta_v = gp.get("zeta", 3.0)
 
-        # Validity guard for pi AR coefficient
+        # If zeta must exceed gamma for your moment condition, penalize violations.
+        # Since both are log-scale, exp(zeta) > exp(gamma) is equivalent to zeta > gamma.
+        static_excess = max(0.0, gamma_v - zeta_v + 1e-6)
+        penalty += LAM_STATIC * static_excess**2
+
+        # Avoid absurd static values under unconstrained BFGS
+        for s in self.gas.static_names:
+            val = gp[s]
+            excess = max(0.0, abs(val) - 20.0)
+            penalty += LAM_STATIC * excess**2
+
+        # -----------------------------
+        # GAS persistence penalties
+        # -----------------------------
+        for name in self.gas.tv_names:
+            b_vals = np.array([gp[f"B_{name}_{l}"] for l in L])
+            b_sum = np.sum(np.abs(b_vals))
+            excess_b = max(0.0, b_sum - B_LIMIT)
+            penalty += LAM_PERSIST * excess_b**2
+
+            a_vals = np.array([gp[f"A_{name}_{l}"] for l in L])
+            a_sum = np.sum(np.abs(a_vals))
+            excess_a = max(0.0, a_sum - A_LIMIT)
+            penalty += LAM_SCORE * excess_a**2
+
+        # -----------------------------
+        # Pi persistence penalty
+        # -----------------------------
         rho = pi_params.get("rho", 0.0)
-        if abs(rho) >= 1.0:
-            return 1e12 if not return_paths else {}
+        excess_rho = max(0.0, abs(rho) - RHO_LIMIT)
+        penalty += LAM_PERSIST * excess_rho**2
 
-        # -------------------------------------------------------------------
-        # Allocate state and score arrays (full length for easy lag indexing)
-        # -------------------------------------------------------------------
-        f_arr  = np.zeros((T + 1, n_tv))   # f_arr[t, j] = f^j_t
-        s_arr  = np.zeros((T,     n_tv))   # s_arr[t, j] = scaled score at t
-        eta_arr = np.zeros(T)              # logit of pi
-        pi_arr  = np.zeros(T)             # probability of non-zero
+        # -----------------------------
+        # Allocate arrays
+        # -----------------------------
+        f_arr = np.zeros((T + 1, n_tv))
+        s_arr = np.zeros((T, n_tv))
+        eta_arr = np.zeros(T)
+        pi_arr = np.zeros(T)
 
-        # Initialise burn-in with f0 for each TV parameter
         for j, name in enumerate(self.gas.tv_names):
-            f_arr[:self.max_lag + 1, j] = gp[f"f0_{name}"]
+            f_arr[: self.max_lag + 1, j] = gp[f"f0_{name}"]
 
         loglik = 0.0
 
-        # -------------------------------------------------------------------
+        # -----------------------------
         # Main recursion
-        # -------------------------------------------------------------------
+        # -----------------------------
         for t in range(self.max_lag, T):
 
-            # ---- (a) Assemble current parameter dict ----
             call_params = {
-                name: f_arr[t, j]
-                for j, name in enumerate(self.gas.tv_names)
+                name: f_arr[t, j] for j, name in enumerate(self.gas.tv_names)
             }
             call_params.update({s: gp[s] for s in self.gas.static_names})
 
-            # ---- (b) Pi step ----
-            # eta_t  =  pi_dynamics.compute_eta(...)
-            # pi_t   =  sigma(eta_t)
+            # Penalize extreme states instead of clipping them
+            for j in range(n_tv):
+                state_excess = max(0.0, abs(f_arr[t, j]) - STATE_LIMIT)
+                penalty += LAM_STATE * state_excess**2
+
+            # Pi recursion
             eta_arr[t] = self.pi_dyn.compute_eta(
-                i        = t - self.max_lag,   # effective index
-                eta_hist = eta_arr,             # full array; valid up to t-1
-                y_full   = y,
-                t        = t,
-                params   = pi_params,
-                seasonal = self.seasonal,
+                i=t - self.max_lag,
+                eta_hist=eta_arr,
+                y_full=y,
+                t=t,
+                params=pi_params,
+                seasonal=self.seasonal,
             )
+
+            eta_excess = max(0.0, abs(eta_arr[t]) - ETA_LIMIT)
+            penalty += LAM_ETA * eta_excess**2
+
             pi_arr[t] = float(expit(eta_arr[t]))
 
-            # Guard against degenerate probabilities
-            pi_t   = np.clip(pi_arr[t], 1e-10, 1.0 - 1e-10)
+            # Stable log probabilities; no clipping needed
+            log_pi_t = log_expit(eta_arr[t])
+            log_one_minus_pi_t = log_expit(-eta_arr[t])
 
-            # ---- (c) Likelihood contribution ----
+            # Likelihood
             if y[t] == 0:
-                # Zero observation: only pi contributes
-                ll_t = np.log(1.0 - pi_t)
+                ll_t = log_one_minus_pi_t
             else:
-                # Positive observation: pi * g(y_t)
                 ll_dist = self.dist.logpdf(y[t], **call_params)
+
                 if not np.isfinite(ll_dist):
-                    if not return_paths:
-                        return 1e12
-                    ll_dist = 0.0
-                ll_t = np.log(pi_t) + ll_dist
+                    return 1e12 + penalty if not return_paths else {}
+
+                ll_t = log_pi_t + ll_dist
 
             if not np.isfinite(ll_t):
-                if not return_paths:
-                    return 1e12
-                ll_t = 0.0
+                return 1e12 + penalty if not return_paths else {}
+
             loglik += ll_t
 
-            # ---- (d) Score for distribution parameters ----
-            # Score is zero for y_t = 0 (no info about positive-part params).
-            # See: score contribution to GAS update only from positive obs.
+            # Score
             if y[t] > 0:
                 raw_score = self.dist.score(y[t], **call_params)
+
                 if self.gas.scale_score:
                     fi = self.dist.fisher_info_diag(**call_params)
+
                     for j, name in enumerate(self.gas.tv_names):
-                        s_arr[t, j] = raw_score[name] / max(fi[name], 1e-8)
+                        denom = max(fi[name], 1e-8)
+                        s_arr[t, j] = raw_score[name] / denom
                 else:
                     for j, name in enumerate(self.gas.tv_names):
                         s_arr[t, j] = raw_score[name]
-            # else: s_arr[t, :] stays 0
 
-            # ---- (e) GAS update: f_{t+1}  =  omega  +  A(L) s_t  +  B(L) f_t ----
+                if not np.all(np.isfinite(s_arr[t, :])):
+                    return 1e12 + penalty if not return_paths else {}
+
+            # GAS update, no clipping
             for j, name in enumerate(self.gas.tv_names):
-                omega_j    = gp[f"omega_{name}"]
-                ar_part    = 0.0
+                omega_j = gp[f"omega_{name}"]
+                ar_part = 0.0
                 score_part = 0.0
 
                 for l in L:
-                    # l=1 → current (index t); l=2 → one step back (t-1)
-                    idx    = t - l + 1
+                    idx = t - l + 1
+
                     s_past = s_arr[idx, j] if idx >= 0 else 0.0
                     f_past = f_arr[idx, j] if idx >= 0 else gp[f"f0_{name}"]
 
                     score_part += gp[f"A_{name}_{l}"] * s_past
-                    ar_part    += gp[f"B_{name}_{l}"] * f_past
+                    ar_part += gp[f"B_{name}_{l}"] * f_past
 
-                f_arr[t + 1, j] = np.clip(
-                    omega_j + score_part + ar_part, -15.0, 15.0
-                )
+                f_next = omega_j + score_part + ar_part
 
-        # -------------------------------------------------------------------
-        # Return
-        # -------------------------------------------------------------------
+                if not np.isfinite(f_next):
+                    return 1e12 + penalty if not return_paths else {}
+
+                f_arr[t + 1, j] = f_next
+
+        objective = -loglik + penalty
+
         if not return_paths:
-            return -loglik
+            return objective
 
         eff = self.max_lag
+
         return {
-            # Sliced to effective sample  t = max_lag, ..., T-1
-            "phi":        f_arr[eff:T, 0],              # TV param 1 (phi)
-            "xi":         f_arr[eff:T, 1] if n_tv > 1 else None,  # TV param 2 (xi)
-            "f_arr":      f_arr[eff:T, :],              # all TV params
-            "s_arr":      s_arr[eff:T, :],              # all scaled scores
-            "eta":        eta_arr[eff:T],               # logit pi
-            "pi":         pi_arr[eff:T],                # prob of non-zero
-            "tv_names":   self.gas.tv_names,
-            "static":     {s: gp[s] for s in self.gas.static_names},
-            "eff_start":  eff,
-            "loglik":     loglik,
-            "y_eff":      y[eff:T],                     # observed y in effective window
+            "phi": f_arr[eff:T, 0],
+            "xi": f_arr[eff:T, 1] if n_tv > 1 else None,
+            "f_arr": f_arr[eff:T, :],
+            "s_arr": s_arr[eff:T, :],
+            "eta": eta_arr[eff:T],
+            "pi": pi_arr[eff:T],
+            "tv_names": self.gas.tv_names,
+            "static": {s: gp[s] for s in self.gas.static_names},
+            "eff_start": eff,
+            "loglik": loglik,
+            "penalty": penalty,
+            "objective": objective,
+            "y_eff": y[eff:T],
         }
 
     # ==================================================================
@@ -382,9 +427,9 @@ class ZAGASModel:
         if not paths:
             return np.array([])
 
-        T    = len(y)
-        eff  = paths["eff_start"]
-        n    = T - eff
+        T = len(y)
+        eff = paths["eff_start"]
+        n = T - eff
         cdfs = np.zeros(n)
 
         static = paths["static"]
@@ -393,8 +438,7 @@ class ZAGASModel:
             t = eff + i
             pi_t = paths["pi"][i]
             call = {
-                name: paths["f_arr"][i, j]
-                for j, name in enumerate(paths["tv_names"])
+                name: paths["f_arr"][i, j] for j, name in enumerate(paths["tv_names"])
             }
             call.update(static)
 
@@ -412,15 +456,12 @@ class ZAGASModel:
     def initial_theta(self, y: np.ndarray) -> np.ndarray:
         """Combined starting vector [gas_theta | pi_theta]."""
         gas_theta = self.gas.initial_theta(y)
-        pi_theta  = self.pi_dyn.initial_params(y, self.seasonal)
+        pi_theta = self.pi_dyn.initial_params(y, self.seasonal)
         return np.concatenate([gas_theta, pi_theta])
 
     def default_bounds(self) -> List[Tuple[float, float]]:
         """Combined bounds [gas_bounds | pi_bounds]."""
-        return (
-            self.gas.default_bounds()
-            + self.pi_dyn.default_bounds(self.seasonal)
-        )
+        return self.gas.default_bounds() + self.pi_dyn.default_bounds(self.seasonal)
 
     def fit(
         self,
@@ -444,7 +485,9 @@ class ZAGASModel:
             'gas_theta': slice for GAS hyperparameters
             'pi_theta' : slice for pi dynamics parameters
         """
-        theta0 = self.initial_theta(y) if theta0 is None else np.asarray(theta0, dtype=float)
+        theta0 = (
+            self.initial_theta(y) if theta0 is None else np.asarray(theta0, dtype=float)
+        )
         bounds = self.default_bounds() if use_bounds else None
         opt_options = {"maxiter": 5000, "disp": verbose}
         if method.upper() == "L-BFGS-B":
@@ -458,17 +501,17 @@ class ZAGASModel:
             fun=self._run_filter,
             x0=theta0,
             args=(y, False),
-            method=method,
-            bounds=bounds,
+            method="BFGS",
+            # bounds=bounds,
             options=opt_options,
         )
 
         n_gas = self.gas.codec.n_params
         return {
-            "theta":     result.x,
-            "loglik":   -result.fun,
-            "success":   result.success,
-            "result":    result,
+            "theta": result.x,
+            "loglik": -result.fun,
+            "success": result.success,
+            "result": result,
             "gas_theta": result.x[:n_gas],
-            "pi_theta":  result.x[n_gas:],
+            "pi_theta": result.x[n_gas:],
         }

@@ -36,12 +36,15 @@ class ARLogisticPiDynamics(PiDynamics):
         lags = SEASONAL_LAGS[seasonal]
         return ["omega0", "rho"] + [f"omega_y_{l}" for l in lags]
 
-    def default_bounds(self, seasonal: str) -> List[Tuple[float, float]]:
+    def default_bounds(self, seasonal: str):
         lags = SEASONAL_LAGS[seasonal]
-        return (
-            [(-10.0, 2.0), (-0.99, 0.99)]          # omega0, rho
-            + [(-5.0, 5.0)] * len(lags)             # omega_y
-        )
+
+        if seasonal == "daily":
+            return [(-5.0, 2.0), (-0.80, 0.80)] + [(-0.10, 0.10)] * len(  # omega0, rho
+                lags
+            )  # omega_y
+
+        return [(-5.0, 2.0), (-0.90, 0.90)] + [(-1.0, 1.0)] * len(lags)
 
     def initial_params(self, y: np.ndarray, seasonal: str) -> np.ndarray:
         lags = SEASONAL_LAGS[seasonal]
@@ -66,9 +69,6 @@ class ARLogisticPiDynamics(PiDynamics):
 
         eta_prev = eta_hist[i - 1] if i > 0 else 0.0
 
-        y_lags = np.array([
-            y_full[t - l] if (t - l) >= 0 else 0.0
-            for l in lags
-        ])
+        y_lags = np.array([y_full[t - l] if (t - l) >= 0 else 0.0 for l in lags])
 
         return float(omega0 + rho * eta_prev + np.dot(omega_y, y_lags))

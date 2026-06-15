@@ -9,6 +9,6 @@ from here without creating circular dependencies.
 # l=1 refers to the immediately preceding time step;
 # l=364 to approximately the same calendar day one year ago.
 SEASONAL_LAGS: dict[str, list[int]] = {
-    "daily":   [1, 2, 3, 364, 365, 366, 367],
+    "daily": [1, 365, 366],  # , 2, 3, 365, 366],  # 364, 365, 366, 367],
     "monthly": [1, 2, 3, 11, 12, 13],
 }

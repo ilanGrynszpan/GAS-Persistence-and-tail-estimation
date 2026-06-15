@@ -35,3 +35,8 @@ artifacts/**/*.tex
 # OS
 .DS_Store
 Thumbs.db
+
+
+# data
+data/input/
+input/

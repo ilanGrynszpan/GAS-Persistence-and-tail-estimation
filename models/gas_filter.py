@@ -62,10 +62,10 @@ from scipy.optimize import minimize
 from distributions.base import Distribution
 from models.lags import SEASONAL_LAGS
 
-
 # ===========================================================================
 # Parameter codec: maps a flat numpy vector <-> named parameter dict
 # ===========================================================================
+
 
 class _ParamCodec:
     """
@@ -84,30 +84,35 @@ class _ParamCodec:
 
     def __init__(
         self,
-        tv_param_names: List[str],      # e.g. ['phi', 'xi']
+        tv_param_names: List[str],  # e.g. ['phi', 'xi']
         static_param_names: List[str],  # e.g. ['gamma', 'zeta']
-        lags: List[int],                # seasonal lag set L
+        lags: List[int],  # seasonal lag set L
     ):
-        self.tv_names     = tv_param_names
+        self.tv_names = tv_param_names
         self.static_names = static_param_names
-        self.lags         = lags
+        self.lags = lags
 
         # Build index: parameter name -> position in flat vector
         self._idx: Dict[str, int] = {}
         pos = 0
 
         for name in tv_param_names:
-            self._idx[f"omega_{name}"] = pos; pos += 1   # intercept
-            self._idx[f"f0_{name}"]    = pos; pos += 1   # initial state
+            self._idx[f"omega_{name}"] = pos
+            pos += 1  # intercept
+            self._idx[f"f0_{name}"] = pos
+            pos += 1  # initial state
             for l in lags:
-                self._idx[f"A_{name}_{l}"] = pos; pos += 1  # score coefficients
+                self._idx[f"A_{name}_{l}"] = pos
+                pos += 1  # score coefficients
             for l in lags:
-                self._idx[f"B_{name}_{l}"] = pos; pos += 1  # AR coefficients
+                self._idx[f"B_{name}_{l}"] = pos
+                pos += 1  # AR coefficients
 
         for name in static_param_names:
-            self._idx[name] = pos; pos += 1
+            self._idx[name] = pos
+            pos += 1
 
-        self.n_params = pos   # total length of theta
+        self.n_params = pos  # total length of theta
 
     # ------------------------------------------------------------------
     def decode(self, theta: np.ndarray) -> Dict[str, float]:
@@ -121,6 +126,7 @@ class _ParamCodec:
 # ===========================================================================
 # GASFilter
 # ===========================================================================
+
 
 class GASFilter:
     """
@@ -153,13 +159,13 @@ class GASFilter:
                 f"seasonal must be one of {list(SEASONAL_LAGS)}, got '{seasonal}'"
             )
 
-        self.dist          = distribution
-        self.seasonal      = seasonal
-        self.lags          = SEASONAL_LAGS[seasonal]          # e.g. [1,2,3,364,365,366,367]
-        self.max_lag       = max(self.lags)                   # burn-in length
-        self.scale_score   = scale_score
-        self.tv_names      = distribution.tv_param_names      # e.g. ['phi', 'xi']
-        self.static_names  = static_params or self.DEFAULT_STATIC
+        self.dist = distribution
+        self.seasonal = seasonal
+        self.lags = SEASONAL_LAGS[seasonal]  # e.g. [1,2,3,364,365,366,367]
+        self.max_lag = max(self.lags)  # burn-in length
+        self.scale_score = scale_score
+        self.tv_names = distribution.tv_param_names  # e.g. ['phi', 'xi']
+        self.static_names = static_params or self.DEFAULT_STATIC
 
         # Build the flat-vector codec
         self.codec = _ParamCodec(self.tv_names, self.static_names, self.lags)
@@ -189,10 +195,10 @@ class GASFilter:
         float (neg-loglik) when return_paths=False, or dict when True.
         """
 
-        T        = len(y)
-        n_tv     = len(self.tv_names)
-        L        = self.lags
-        max_lag  = self.max_lag
+        T = len(y)
+        n_tv = len(self.tv_names)
+        L = self.lags
+        max_lag = self.max_lag
 
         # --- Minimum data length check ---
         # We need at least max_lag observations for the burn-in plus one
@@ -204,8 +210,8 @@ class GASFilter:
         p = self.codec.decode(theta)
 
         # --- Basic validity guards for static params ---
-        gamma_v = p.get("gamma", 1.0)   # GB2 shape (log scale)
-        zeta_v  = p.get("zeta",  3.0)   # GB2 shape (log scale)
+        gamma_v = p.get("gamma", 1.0)  # GB2 shape (log scale)
+        zeta_v = p.get("zeta", 3.0)  # GB2 shape (log scale)
         if np.exp(gamma_v) <= 0 or np.exp(zeta_v) <= np.exp(gamma_v):
             # GB2 requires b > a*p and both positive; return large penalty
             return 1e12 if not return_paths else {}
@@ -221,12 +227,12 @@ class GASFilter:
         #   s_arr[t, j]  =  0      (no score before effective window)
         # -------------------------------------------------------------------
         f_arr = np.zeros((T + 1, n_tv))  # +1 so f_arr[T] can be computed
-        s_arr = np.zeros((T,     n_tv))
+        s_arr = np.zeros((T, n_tv))
 
         for j, name in enumerate(self.tv_names):
             f0_j = p[f"f0_{name}"]
             # Fill burn-in period with the initial state value
-            f_arr[:max_lag + 1, j] = f0_j   # includes index max_lag itself
+            f_arr[: max_lag + 1, j] = f0_j  # includes index max_lag itself
 
         loglik = 0.0  # accumulated log-likelihood over effective sample
 
@@ -236,10 +242,7 @@ class GASFilter:
         for t in range(max_lag, T):
 
             # --- 1.  Assemble current call_params dict for distribution ---
-            call_params = {
-                name: f_arr[t, j]
-                for j, name in enumerate(self.tv_names)
-            }
+            call_params = {name: f_arr[t, j] for j, name in enumerate(self.tv_names)}
             call_params.update({s: p[s] for s in self.static_names})
 
             # --- 2.  Evaluate log-likelihood contribution ---
@@ -268,7 +271,9 @@ class GASFilter:
 
                 if self.scale_score:
                     # Scaling type 1: S_t = I(f_t)^{-1}  (diagonal approximation)
-                    fi = self.dist.fisher_info_diag(**call_params)  # dict: name -> float
+                    fi = self.dist.fisher_info_diag(
+                        **call_params
+                    )  # dict: name -> float
                     for j, name in enumerate(self.tv_names):
                         s_arr[t, j] = raw_score[name] / max(fi[name], 1e-8)
                 else:
@@ -286,11 +291,11 @@ class GASFilter:
             #       l = 2 accesses s[t-1] and f[t-1] (one step back), etc.
             for j, name in enumerate(self.tv_names):
                 omega_j = p[f"omega_{name}"]
-                ar_part    = 0.0
+                ar_part = 0.0
                 score_part = 0.0
 
                 for l in L:
-                    idx = t - l + 1   # index into full arrays at lag l
+                    idx = t - l + 1  # index into full arrays at lag l
                     # idx = t   when l = 1  (current)
                     # idx = t-1 when l = 2  (one step back)
                     # idx = t-363 when l = 364
@@ -298,7 +303,7 @@ class GASFilter:
                     f_past = f_arr[idx, j] if idx >= 0 else p[f"f0_{name}"]
 
                     score_part += p[f"A_{name}_{l}"] * s_past
-                    ar_part    += p[f"B_{name}_{l}"] * f_past
+                    ar_part += p[f"B_{name}_{l}"] * f_past
 
                 f_arr[t + 1, j] = omega_j + score_part + ar_part
 
@@ -309,16 +314,16 @@ class GASFilter:
         # Return
         # -------------------------------------------------------------------
         if not return_paths:
-            return -loglik   # negate because scipy.minimize minimises
+            return -loglik  # negate because scipy.minimize minimises
 
         return {
             # f_arr[t] is the state ENTERING time t; eff_start = max_lag
-            "f_arr":      f_arr[max_lag:T, :],   # shape (T - max_lag, n_tv)
-            "s_arr":      s_arr[max_lag:T, :],   # shape (T - max_lag, n_tv)
-            "tv_names":   self.tv_names,
-            "static":     {s: p[s] for s in self.static_names},
-            "eff_start":  max_lag,
-            "loglik":     loglik,
+            "f_arr": f_arr[max_lag:T, :],  # shape (T - max_lag, n_tv)
+            "s_arr": s_arr[max_lag:T, :],  # shape (T - max_lag, n_tv)
+            "tv_names": self.tv_names,
+            "static": {s: p[s] for s in self.static_names},
+            "eff_start": max_lag,
+            "loglik": loglik,
         }
 
     # ==================================================================
@@ -351,8 +356,8 @@ class GASFilter:
             y_pos = np.array([1.0])
 
         theta0 = np.zeros(self.codec.n_params)
-        idx    = self.codec._idx
-        n_l    = len(self.lags)
+        idx = self.codec._idx
+        n_l = len(self.lags)
 
         for j, name in enumerate(self.tv_names):
             if name == "phi":
@@ -361,8 +366,8 @@ class GASFilter:
                 # xi = log(a); a ~ 1.2 is a reasonable shape starting point
                 f0_guess = float(np.log(1.2))
 
-            theta0[idx[f"omega_{name}"]] = f0_guess * 0.05   # small intercept
-            theta0[idx[f"f0_{name}"]]    = f0_guess
+            theta0[idx[f"omega_{name}"]] = f0_guess * 0.05  # small intercept
+            theta0[idx[f"f0_{name}"]] = f0_guess
 
             # Score coefficients A_l: small uniform positive values
             for l in self.lags:
@@ -376,40 +381,35 @@ class GASFilter:
         if "xi" in idx:
             theta0[idx["xi"]] = float(np.log(1.2))
         if "gamma" in idx:
-            theta0[idx["gamma"]] = 1.0   # p = exp(-gamma) ~ 0.37
+            theta0[idx["gamma"]] = 1.0  # p = exp(-gamma) ~ 0.37
         if "zeta" in idx:
-            theta0[idx["zeta"]]  = 3.0   # b = exp(zeta) ~ 20 > a
+            theta0[idx["zeta"]] = 3.0  # b = exp(zeta) ~ 20 > a
 
         return theta0
 
-    def default_bounds(self) -> List[Tuple[float, float]]:
-        """
-        L-BFGS-B box constraints.
-
-        omega  : unconstrained in a generous range
-        f0     : generous range (log scale for phi and xi)
-        A_l    : small-to-moderate; score coefficients should stay bounded
-        B_l    : each in (-1, 1); sum < 1 enforced softly via initialisation
-        gamma  : (0.1, 5)  -- log scale, so exp(gamma) in (1.1, 148)
-        zeta   : (0.2, 10) -- log scale, must exceed gamma for finite variance
-        """
+    def default_bounds(self):
         bounds = []
+
         for name in self.tv_names:
-            bounds.append((-5.0, 8.0))              # omega
-            bounds.append((-8.0, 8.0))              # f0
+            bounds.append((-3.0, 5.0))  # omega
+            bounds.append((-5.0, 6.0))  # f0
+
             for _ in self.lags:
-                bounds.append((-0.5, 1.0))          # A_l  (score)
+                bounds.append((-0.25, 0.50))  # A_l score coefficients
+
             for _ in self.lags:
-                bounds.append((-0.99, 0.99))        # B_l  (AR)
+                bounds.append((-0.80, 0.80))  # B_l AR coefficients
+
         for name in self.static_names:
             if name == "xi":
-                bounds.append((-3.0, 3.0))          # xi = log(a)
+                bounds.append((-2.0, 2.0))
             elif name == "gamma":
-                bounds.append((0.1, 5.0))           # gamma (static)
+                bounds.append((-2.0, 2.0))  # if gamma is log-scale
             elif name == "zeta":
-                bounds.append((0.2, 10.0))          # zeta  (static)
+                bounds.append((0.1, 5.0))
             else:
-                bounds.append((-10.0, 10.0))
+                bounds.append((-5.0, 5.0))
+
         return bounds
 
     def fit(self, y: np.ndarray, verbose: bool = False) -> dict:
@@ -429,20 +429,20 @@ class GASFilter:
         result = minimize(
             fun=self._run_filter,
             x0=theta0,
-            args=(y, False),          # return_paths=False → negate loglik
+            args=(y, False),  # return_paths=False → negate loglik
             method="L-BFGS-B",
             bounds=bounds,
             options={
                 "maxiter": 5000,
-                "ftol":    1e-10,
-                "gtol":    1e-6,
-                "disp":    verbose,
+                "ftol": 1e-10,
+                "gtol": 1e-6,
+                "disp": verbose,
             },
         )
 
         return {
-            "theta":   result.x,
-            "loglik":  -result.fun,
+            "theta": result.x,
+            "loglik": -result.fun,
             "success": result.success,
-            "result":  result,
+            "result": result,
         }
