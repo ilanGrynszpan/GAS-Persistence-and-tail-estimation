@@ -23,6 +23,8 @@ env/
 *.png
 *.tex
 *.csv
+*.npz
+*.npy
 artifacts/cache/
 artifacts/**/*.csv
 artifacts/**/*.tex
@@ -40,3 +42,10 @@ Thumbs.db
 # data
 data/input/
 input/
+
+# claude
+claude.md
+docs/
+
+# nb
+nb_run_log.txt

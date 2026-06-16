@@ -1,0 +1,22 @@
+# ── Core scientific stack ──────────────────────────────────────────────────────
+numpy>=2.0
+scipy>=1.14
+pandas>=2.2
+matplotlib>=3.9
+
+# ── Notebook ───────────────────────────────────────────────────────────────────
+jupyter>=1.1
+notebook>=7.2
+ipykernel>=6.29
+
+# ── Statistics / diagnostics ──────────────────────────────────────────────────
+statsmodels>=0.14
+
+# ── Report generation ─────────────────────────────────────────────────────────
+# matplotlib.backends.backend_pdf is bundled with matplotlib (no extra install).
+# For PDF compilation from LaTeX, install a TeX distribution separately
+# (e.g. MiKTeX on Windows, TeX Live on Linux/macOS).
+
+# ── Optional: faster linear algebra ──────────────────────────────────────────
+# Uncomment if you have a suitable BLAS/LAPACK:
+# openblas
