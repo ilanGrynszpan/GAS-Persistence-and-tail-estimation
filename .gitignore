@@ -47,5 +47,8 @@ input/
 claude.md
 docs/
 
+# artifacts
+artifacts/
+
 # nb
 nb_run_log.txt
