@@ -32,3 +32,8 @@ class PiDynamicsFactory:
     @staticmethod
     def available() -> list[str]:
         return list(_REGISTRY)
+
+
+def make_pi_dynamics(name: str, seasonal: str = "daily") -> PiDynamics:
+    """Module-level convenience wrapper around PiDynamicsFactory.get()."""
+    return PiDynamicsFactory.get(name)

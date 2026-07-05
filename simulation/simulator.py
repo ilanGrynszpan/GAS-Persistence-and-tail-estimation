@@ -141,16 +141,12 @@ def simulate_oos(
         )
         pi_arr[t] = float(expit(eta_arr[t]))
 
-        # Score
+        # Score — delegate to model._scaled_score for consistent fallback behaviour
         if y_full[t] > 0:
-            raw = model.dist.score(y_full[t], **call_params)
-            if model.gas.scale_score:
-                fi = model.dist.fisher_info_diag(**call_params)
-                for j, name in enumerate(model.gas.tv_names):
-                    s_arr[t, j] = raw[name] / max(fi[name], 1e-8)
-            else:
-                for j, name in enumerate(model.gas.tv_names):
-                    s_arr[t, j] = raw[name]
+            raw    = model.dist.score(y_full[t], **call_params)
+            scaled = model.gas._scaled_score(raw, call_params)
+            for j, name in enumerate(model.gas.tv_names):
+                s_arr[t, j] = scaled[name]
 
         # GAS update
         for j, name in enumerate(model.gas.tv_names):
@@ -162,7 +158,7 @@ def simulate_oos(
                 f_past = f_arr[idx, j] if idx >= 0 else gp[f"f0_{name}"]
                 score_p += gp[f"A_{name}_{l}"] * s_past
                 ar_p    += gp[f"B_{name}_{l}"] * f_past
-            f_arr[t + 1, j] = np.clip(omega_j + score_p + ar_p, -15.0, 15.0)
+            f_arr[t + 1, j] = omega_j + score_p + ar_p
 
     # ---- Continue into test period ----
     for t in range(T_train, T_full):
@@ -181,14 +177,10 @@ def simulate_oos(
 
         # Score (using observed test y for 1-step rolling update)
         if y_full[t] > 0:
-            raw = model.dist.score(y_full[t], **call_params)
-            if model.gas.scale_score:
-                fi = model.dist.fisher_info_diag(**call_params)
-                for j, name in enumerate(model.gas.tv_names):
-                    s_arr[t, j] = raw[name] / max(fi[name], 1e-8)
-            else:
-                for j, name in enumerate(model.gas.tv_names):
-                    s_arr[t, j] = raw[name]
+            raw    = model.dist.score(y_full[t], **call_params)
+            scaled = model.gas._scaled_score(raw, call_params)
+            for j, name in enumerate(model.gas.tv_names):
+                s_arr[t, j] = scaled[name]
 
         # GAS update
         for j, name in enumerate(model.gas.tv_names):
@@ -200,7 +192,7 @@ def simulate_oos(
                 f_past = f_arr[idx, j] if idx >= 0 else gp[f"f0_{name}"]
                 score_p += gp[f"A_{name}_{l}"] * s_past
                 ar_p    += gp[f"B_{name}_{l}"] * f_past
-            f_arr[t + 1, j] = np.clip(omega_j + score_p + ar_p, -15.0, 15.0)
+            f_arr[t + 1, j] = omega_j + score_p + ar_p
 
     # Slice out test period only
     oos_slice = slice(T_train, T_full)

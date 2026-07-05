@@ -18,7 +18,7 @@ with  a = exp(xi), b = exp(zeta), p = exp(-gamma), σ = exp(phi).
 from __future__ import annotations
 from typing import Dict, List
 import numpy as np
-from scipy.special import digamma, polygamma, betainc, betaincinv
+from scipy.special import digamma, polygamma, betainc, betaincinv, betaln
 from scipy.special import beta as beta_fn
 
 from distributions.base import Distribution
@@ -53,6 +53,30 @@ class GB2LogLink(Distribution):
             - (a + b) * np.log(1.0 + z)
         )
 
+    def logpdf_sum(self, y_arr: np.ndarray, **params) -> float:
+        """Vectorized sum of log-densities over an array of positive observations.
+
+        Identical mathematics to logpdf() but operates on the full array at
+        once using numpy, avoiding the Python-loop overhead in _unconditional_mle.
+        """
+        phi, xi, gamma, zeta = self._unpack(params)
+        a = np.exp(xi)
+        b = np.exp(zeta)
+        p = np.exp(-gamma)
+        sigma = np.exp(phi)
+        z = (y_arr / sigma) ** p
+        ln_beta = betaln(a, b)
+        ll = (
+            np.log(p)
+            - np.log(sigma)
+            + (a * p - 1) * np.log(y_arr / sigma)
+            - ln_beta
+            - (a + b) * np.log(1.0 + z)
+        )
+        if not np.all(np.isfinite(ll)):
+            return -np.inf
+        return float(np.sum(ll))
+
     def score(self, y: float, **params) -> Dict[str, float]:
         phi, xi, gamma, zeta = self._unpack(params)
         a = np.exp(xi)
@@ -71,19 +95,81 @@ class GB2LogLink(Distribution):
         return {"phi": float(dphi), "xi": float(dxi)}
 
     def fisher_info_diag(self, **params) -> Dict[str, float]:
-        """Diagonal of the expected Fisher information for (phi, xi)."""
+        """Diagonal of the expected Fisher information for (phi, xi).
+
+        With a=exp(xi), b=exp(zeta), p=exp(-gamma), sigma=exp(phi):
+
+            I_{phi,phi} = p^2 * a * b / (a+b+1)
+
+            I_{xi,xi}   = a^2 * [psi_1(a) - psi_1(a+b)]
+
+        These are the log-space FI elements obtained by the chain rule
+        I_{log-param, log-param} = (natural-param)^2 * I_{natural}.
+        Full derivation in docs/math_proofs.tex §5.
+
+        Returns raw values without clamping.  Callers must handle the case
+        where a returned value is non-positive (indicates degenerate params).
+        """
         phi, xi, gamma, zeta = self._unpack(params)
         a = np.exp(xi)
         b = np.exp(zeta)
         p = np.exp(-gamma)
 
-        # I_phi = p^2 * a*b / (a+b+1)  (exact, from McDonald 1984)
         I_phi = p ** 2 * a * b / (a + b + 1.0)
+        I_xi  = a ** 2 * (polygamma(1, a) - polygamma(1, a + b))
 
-        # I_xi = a^2 * [ψ1(a) - ψ1(a+b)]  (exact, Beta Fisher information)
-        I_xi = a ** 2 * (polygamma(1, a) - polygamma(1, a + b))
+        return {"phi": float(I_phi), "xi": float(I_xi)}
 
-        return {"phi": float(max(I_phi, 1e-8)), "xi": float(max(I_xi, 1e-8))}
+    def fisher_info_full(self, **params) -> np.ndarray:
+        """Full 2x2 Fisher information matrix for (phi, xi) in log-space.
+
+        The matrix is:
+            I = [[I_phi_phi,  I_phi_xi ],
+                 [I_xi_phi,   I_xi_xi  ]]
+
+        Cross-term derivation (chain rule from natural-parameter FI):
+            I_{phi,xi} = I_{sigma,a} * sigma * a
+                       = [-p/(sigma) * b/(a+b+1)] * sigma * a
+                       = -p * a * b / (a+b+1)
+
+        where I_{sigma,a} in natural space comes from MODELS.md:
+            I_{phi_nat, xi_nat} = -1/(gamma_nat * phi_nat) * zeta_nat/(xi_nat+zeta_nat+1)
+        with phi_nat = sigma, gamma_nat = 1/p, xi_nat = a, zeta_nat = b.
+
+        Returns
+        -------
+        2x2 ndarray  [[I_pp, I_px], [I_xp, I_xx]] where p=phi, x=xi.
+        """
+        phi, xi, gamma, zeta = self._unpack(params)
+        a = np.exp(xi)
+        b = np.exp(zeta)
+        p = np.exp(-gamma)
+        denom = a + b + 1.0
+
+        I_pp = p ** 2 * a * b / denom
+        I_xi_xi = a ** 2 * (polygamma(1, a) - polygamma(1, a + b))
+        I_px = -p * a * b / denom   # cross-term in log-space
+
+        mat = np.array([[I_pp, I_px],
+                        [I_px, I_xi_xi]])
+        return mat
+
+    def fisher_info_submatrix(self, tv_names: List[str], **params) -> np.ndarray:
+        """Return the FI submatrix restricted to the requested tv_names.
+
+        Parameters
+        ----------
+        tv_names : subset of ["phi", "xi"] in the order they appear in the
+                   GAS parameter vector.
+
+        Returns
+        -------
+        ndarray of shape (n, n) where n = len(tv_names).
+        """
+        all_names = ["phi", "xi"]
+        full = self.fisher_info_full(**params)
+        idx = [all_names.index(n) for n in tv_names]
+        return full[np.ix_(idx, idx)]
 
     def cdf(self, y: float, **params) -> float:
         phi, xi, gamma, zeta = self._unpack(params)

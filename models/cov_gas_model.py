@@ -24,6 +24,7 @@ results remain backward-compatible.
 """
 
 from __future__ import annotations
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -37,6 +38,14 @@ from pi_dynamics.base import PiDynamics
 from models.gas_filter import GASFilter
 from models.lags import SEASONAL_LAGS
 from models.za_gas_model import ZAGASModel
+
+# Numba fast path — compiled covariate filter functions
+_NB_AVAIL_COV = False
+try:
+    from models._nb_gb2_filter import nb_filter_phi_only_cov, nb_filter_phi_xi_cov
+    _NB_AVAIL_COV = True
+except ImportError:
+    pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,23 +70,29 @@ class CovZAGASModel:
         distribution: Distribution,
         pi_dynamics: PiDynamics,
         seasonal: str = "daily",
+        gas_lags: Optional[List[int]] = None,
+        scaling: str = "diagonal_inverse_fisher",
         cov_names: Optional[List[str]] = None,
         cov_target: Optional[List[str]] = None,
-        scale_score: bool = True,
+        # Legacy alias kept for backward compat
+        scale_score: Optional[bool] = None,
         static_params: Optional[List[str]] = None,
     ):
         self.dist = distribution
         self.pi_dyn = pi_dynamics
         self.seasonal = seasonal
-        self.lags = SEASONAL_LAGS[seasonal]
-        self.max_lag = max(self.lags)
 
         self.gas = GASFilter(
             distribution=distribution,
             seasonal=seasonal,
+            gas_lags=gas_lags,
+            scaling=scaling,
             scale_score=scale_score,
             static_params=static_params,
         )
+
+        self.lags    = self.gas.lags
+        self.max_lag = self.gas.max_lag
 
         self._pi_names = pi_dynamics.param_names(seasonal)
         self.tv_names = distribution.tv_param_names
@@ -141,6 +156,176 @@ class CovZAGASModel:
         return gas_names + pi_names + cov_names_flat
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Numba fast path
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Maps scaling name to the integer code expected by the Numba functions.
+    _SCALING_INT = {"unit": 0, "diagonal_inverse_fisher": 1, "inverse_fisher": 2}
+
+    @property
+    def _use_nb_filter(self) -> bool:
+        """True when the Numba covariate filter covers this model configuration."""
+        if not _NB_AVAIL_COV:
+            return False
+        # Numba filter only supports ARLogistic pi dynamics (hardcoded recursion)
+        from pi_dynamics.ar_logistic import ARLogisticPiDynamics
+        if not isinstance(self.pi_dyn, ARLogisticPiDynamics):
+            return False
+        # Numba filter only supports GB2LogLink / GB2LogLinkPhiOnly distributions
+        from distributions.gb2_log_link import GB2LogLink
+        from distributions.gb2_phi_only import GB2LogLinkPhiOnly
+        return isinstance(self.dist, (GB2LogLink, GB2LogLinkPhiOnly))
+
+    def _nb_cov_dispatch(
+        self,
+        y:            np.ndarray,
+        X_safe:       np.ndarray,
+        gp:           dict,
+        pi_params:    dict,
+        gamma:        dict,
+        pre_penalty:  float,
+        T:            int,
+        return_paths: bool,
+    ):
+        """
+        Dispatch to the Numba covariate filter.
+
+        pre_penalty: sum of all parameter-level penalties already computed in
+                     _run_filter (persistence, score, static, covariate bounds).
+        The Numba function adds per-step state/eta penalties internally and
+        returns them as loop_pen.  Total = -loglik + pre_penalty + loop_pen.
+
+        C_phi[t] = X_t @ gamma_phi  and  C_xi[t] = X_t @ gamma_xi are computed
+        here via NumPy before entering nopython mode.
+        """
+        L          = self.lags
+        eff        = self.max_lag
+        scaling_i  = self._SCALING_INT.get(self.gas.scaling, 0)
+
+        lags_gas  = np.array(list(L), dtype=np.int64)
+        pi_lags_py = SEASONAL_LAGS[self.seasonal]
+        lags_pi   = np.array(pi_lags_py, dtype=np.int64)
+        pi_wy     = np.array([pi_params[f"omega_y_{l}"] for l in pi_lags_py],
+                              dtype=np.float64)
+        pi_omega0 = float(pi_params["omega0"])
+        pi_rho    = float(pi_params["rho"])
+
+        LAM_STATE   = 1e3
+        LAM_ETA     = 1e2
+        STATE_LIMIT = 15.0
+        ETA_LIMIT   = 30.0
+
+        y_f64     = np.asarray(y, dtype=np.float64)
+        gamma_s   = float(gp["gamma"])
+        zeta_s    = float(gp["zeta"])
+
+        # Precompute covariate contributions: C_j[t] = X_t @ gamma_j
+        zeros_T = np.zeros(T, dtype=np.float64)
+        C_phi = (X_safe @ gamma["phi"].astype(np.float64)
+                 if "phi" in self.cov_target else zeros_T)
+        C_xi  = (X_safe @ gamma["xi"].astype(np.float64)
+                 if "xi" in self.cov_target else zeros_T)
+
+        n_tv = len(self.tv_names)
+
+        if n_tv == 1:
+            # phi-only distribution
+            out = nb_filter_phi_only_cov(
+                y_f64,
+                f0=float(gp["f0_phi"]),
+                omega=float(gp["omega_phi"]),
+                A=np.array([gp[f"A_phi_{l}"] for l in L], dtype=np.float64),
+                B=np.array([gp[f"B_phi_{l}"] for l in L], dtype=np.float64),
+                lags_gas=lags_gas,
+                xi_s=float(gp["xi"]), gamma_s=gamma_s, zeta_s=zeta_s,
+                pi_omega0=pi_omega0, pi_rho=pi_rho,
+                pi_wy=pi_wy, lags_pi=lags_pi,
+                max_lag=eff, scaling=scaling_i,
+                lam_state=LAM_STATE, state_lim=STATE_LIMIT,
+                lam_eta=LAM_ETA,    eta_lim=ETA_LIMIT,
+                C_phi=C_phi,
+            )
+            loglik_nb, loop_pen, f1d, s1d, eta1d, pi1d = out
+
+            if loglik_nb == -1e12:
+                return (1e12 + pre_penalty) if not return_paths else {}
+
+            total_pen = pre_penalty + loop_pen
+            obj       = -loglik_nb + total_pen
+
+            if not return_paths:
+                return obj
+
+            n_eff = T - eff
+            return {
+                "f_arr":     f1d[eff:T].reshape(n_eff, 1),
+                "s_arr":     s1d[eff:T].reshape(n_eff, 1),
+                "eta":       eta1d[:n_eff],
+                "pi":        pi1d[:n_eff],
+                "tv_names":  self.tv_names,
+                "static":    {s: gp[s] for s in self.gas.static_names},
+                "eff_start": eff,
+                "loglik":    float(loglik_nb),
+                "penalty":   float(total_pen),
+                "objective": float(obj),
+                "y_eff":     y[eff:T],
+                "gamma":     {j: gamma.get(j, np.zeros(self.n_cov))
+                              for j in self.tv_names},
+            }
+
+        else:
+            # phi + xi distribution
+            out = nb_filter_phi_xi_cov(
+                y_f64,
+                f0_phi=float(gp["f0_phi"]),
+                f0_xi=float(gp["f0_xi"]),
+                omega_phi=float(gp["omega_phi"]),
+                omega_xi=float(gp["omega_xi"]),
+                A_phi=np.array([gp[f"A_phi_{l}"] for l in L], dtype=np.float64),
+                A_xi =np.array([gp[f"A_xi_{l}"]  for l in L], dtype=np.float64),
+                B_phi=np.array([gp[f"B_phi_{l}"] for l in L], dtype=np.float64),
+                B_xi =np.array([gp[f"B_xi_{l}"]  for l in L], dtype=np.float64),
+                lags_gas=lags_gas,
+                gamma_s=gamma_s, zeta_s=zeta_s,
+                pi_omega0=pi_omega0, pi_rho=pi_rho,
+                pi_wy=pi_wy, lags_pi=lags_pi,
+                max_lag=eff, scaling=scaling_i,
+                lam_state=LAM_STATE, state_lim=STATE_LIMIT,
+                lam_eta=LAM_ETA,    eta_lim=ETA_LIMIT,
+                C_phi=C_phi,
+                C_xi=C_xi,
+            )
+            loglik_nb, loop_pen, f_phi, f_xi, s_phi, s_xi, eta1d, pi1d = out
+
+            if loglik_nb == -1e12:
+                return (1e12 + pre_penalty) if not return_paths else {}
+
+            total_pen = pre_penalty + loop_pen
+            obj       = -loglik_nb + total_pen
+
+            if not return_paths:
+                return obj
+
+            n_eff    = T - eff
+            f_arr_2d = np.column_stack([f_phi[eff:T], f_xi[eff:T]])
+            s_arr_2d = np.column_stack([s_phi[eff:T], s_xi[eff:T]])
+            return {
+                "f_arr":     f_arr_2d,
+                "s_arr":     s_arr_2d,
+                "eta":       eta1d[:n_eff],
+                "pi":        pi1d[:n_eff],
+                "tv_names":  self.tv_names,
+                "static":    {s: gp[s] for s in self.gas.static_names},
+                "eff_start": eff,
+                "loglik":    float(loglik_nb),
+                "penalty":   float(total_pen),
+                "objective": float(obj),
+                "y_eff":     y[eff:T],
+                "gamma":     {j: gamma.get(j, np.zeros(self.n_cov))
+                              for j in self.tv_names},
+            }
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Core filter
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -179,10 +364,14 @@ class CovZAGASModel:
         LAM_STATIC  = 1e5
         LAM_COV     = 1e2
 
-        gamma_v = gp.get("gamma", 1.0)
-        zeta_v  = gp.get("zeta", 3.0)
-        static_excess = max(0.0, gamma_v - zeta_v + 1e-6)
-        penalty += LAM_STATIC * static_excess**2
+        gamma_v = gp.get("gamma")
+        zeta_v  = gp.get("zeta")
+        if gamma_v is not None and zeta_v is not None:
+            if gamma_v >= zeta_v:   # bp ≤ 1: E[Y] infinite
+                return (1e12 + penalty) if not return_paths else {}
+            bp_log = zeta_v - gamma_v
+            if bp_log < 0.5:        # soft push away from boundary
+                penalty += LAM_STATIC * (0.5 - bp_log) ** 2
         for s in self.gas.static_names:
             excess = max(0.0, abs(gp[s]) - 20.0)
             penalty += LAM_STATIC * excess**2
@@ -202,10 +391,19 @@ class CovZAGASModel:
             excess = max(0.0, np.sum(g_arr**2)**0.5 - 20.0)
             penalty += LAM_COV * excess**2
 
+        # ── Numba fast path ──────────────────────────────────────────────────
+        # All pre-loop penalties are now accumulated in `penalty`.  The Numba
+        # function adds per-step state/eta penalties and returns them separately.
+        if self._use_nb_filter:
+            return self._nb_cov_dispatch(
+                y, X_safe, gp, pi_params, gamma, penalty, T, return_paths
+            )
+
         # ── Allocate arrays ───────────────────────────────────────────────────
         f_arr   = np.zeros((T + 1, n_tv))
         s_arr   = np.zeros((T,     n_tv))
-        eta_arr = np.zeros(T)
+        eta_arr = np.zeros(T)   # t-indexed: for return paths and log-lik
+        eta_eff = np.zeros(T)   # i-indexed: AR history for compute_eta (i = t−max_lag)
         pi_arr  = np.zeros(T)
 
         for j, name in enumerate(self.tv_names):
@@ -225,20 +423,24 @@ class CovZAGASModel:
                 state_excess = max(0.0, abs(f_arr[t, j]) - 15.0)
                 penalty += LAM_STATE * state_excess**2
 
-            # Pi recursion
-            eta_arr[t] = self.pi_dyn.compute_eta(
-                i=t - self.max_lag,
-                eta_hist=eta_arr,
+            # Pi recursion — eta_eff is i-indexed so compute_eta's AR access
+            # eta_eff[i-1] gives the immediately-preceding step (matches Numba).
+            i = t - self.max_lag
+            eta_t = self.pi_dyn.compute_eta(
+                i=i,
+                eta_hist=eta_eff,
                 y_full=y,
                 t=t,
                 params=pi_params,
                 seasonal=self.seasonal,
             )
-            penalty += LAM_ETA * max(0.0, abs(eta_arr[t]) - 30.0) ** 2
-            pi_arr[t] = float(expit(eta_arr[t]))
+            eta_eff[i]  = eta_t   # i-indexed history for next step's AR term
+            eta_arr[t]  = eta_t   # t-indexed for return paths
+            penalty += LAM_ETA * max(0.0, abs(eta_t) - 30.0) ** 2
+            pi_arr[t] = float(expit(eta_t))
 
-            log_pi   = log_expit(eta_arr[t])
-            log_1mpi = log_expit(-eta_arr[t])
+            log_pi   = log_expit(eta_t)
+            log_1mpi = log_expit(-eta_t)
 
             if y[t] == 0:
                 ll_t = log_1mpi
@@ -252,16 +454,12 @@ class CovZAGASModel:
                 return 1e12 + penalty if not return_paths else {}
             loglik += ll_t
 
-            # Score
+            # Score — use gas._scaled_score to support all 3 scaling modes
             if y[t] > 0:
                 raw_score = self.dist.score(y[t], **call_params)
-                if self.gas.scale_score:
-                    fi = self.dist.fisher_info_diag(**call_params)
-                    for j, name in enumerate(self.tv_names):
-                        s_arr[t, j] = raw_score[name] / max(fi[name], 1e-8)
-                else:
-                    for j, name in enumerate(self.tv_names):
-                        s_arr[t, j] = raw_score[name]
+                scaled = self.gas._scaled_score(raw_score, call_params)
+                for j, name in enumerate(self.tv_names):
+                    s_arr[t, j] = scaled[name]
                 if not np.all(np.isfinite(s_arr[t, :])):
                     return 1e12 + penalty if not return_paths else {}
 
@@ -359,44 +557,141 @@ class CovZAGASModel:
         verbose: bool = False,
         theta0: Optional[np.ndarray] = None,
         options: Optional[dict] = None,
+        polish: bool = True,
     ) -> dict:
         """
-        Estimate all parameters by maximum likelihood (unbounded BFGS).
+        Estimate all parameters by unbounded BFGS maximum likelihood.
 
-        Parameters
-        ----------
-        y      : training observations (T,)
-        X      : covariate matrix (T, n_cov), already standardised
-        theta0 : optional starting values
+        Includes a polish step and convergence classification per
+        OPTIMIZATION.md §11.
+
+        Returns
+        -------
+        dict with keys:
+            theta, loglik, validity, success, message,
+            n_iter, n_fev, grad, grad_norm_inf, grad_norm_2,
+            hess_inv, std_errors, se_quality,
+            runtime_s, peak_mem_mb, polish_improvement, param_names
         """
+        import tracemalloc
+
         if theta0 is None:
             theta0 = self.initial_theta(y)
         else:
             theta0 = np.asarray(theta0, dtype=float)
 
-        opt_options = {"maxiter": 5000, "gtol": 1e-5, "disp": verbose}
+        opt_options = {"maxiter": 1000, "gtol": 1e-3, "disp": verbose}
         if options:
             opt_options.update(options)
+
+        t_start = time.time()
+        tracemalloc.start()
 
         def obj(theta):
             return self._run_filter(theta, y, X, return_paths=False)
 
-        result = minimize(
-            fun=obj,
-            x0=theta0,
-            method="BFGS",
-            options=opt_options,
-        )
+        res = minimize(fun=obj, x0=theta0, method="BFGS", options=opt_options)
+
+        # Polish step capped at 200 iterations
+        polish_improvement = 0.0
+        if polish:
+            polish_opts = {**opt_options, "maxiter": 200}
+            res2 = minimize(fun=obj, x0=res.x, method="BFGS", options=polish_opts)
+            polish_improvement = abs(res.fun - res2.fun) / (1.0 + abs(res.fun))
+            if res2.fun < res.fun:
+                res = res2
+
+        runtime_s = time.time() - t_start
+        _, peak_mem = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        # Gradient norms
+        grad          = getattr(res, "jac", None)
+        grad_norm_inf = float(np.max(np.abs(grad))) if grad is not None else float("nan")
+        grad_norm_2   = float(np.linalg.norm(grad)) if grad is not None else float("nan")
+
+        # Convergence classification
+        paths     = self._run_filter(res.x, y, X, return_paths=True)
+        ll_final  = float(paths["loglik"]) if paths else float(-res.fun)
+        finite_p  = bool(np.all(np.isfinite(res.x)))
+        finite_ll = bool(np.isfinite(ll_final))
+        states_ok = bool(paths) and bool(np.all(np.isfinite(paths.get("f_arr", [[0]]))))
+        grad_ok   = (grad_norm_inf < 1e-2) if not np.isnan(grad_norm_inf) else False
+
+        if res.success and finite_p and finite_ll and states_ok and grad_ok:
+            validity = "valid_converged"
+        elif finite_p and finite_ll and states_ok:
+            validity = "valid_with_warning"
+        else:
+            validity = "failed"
+
+        # Standard errors from inverse Hessian
+        hess_inv   = np.array(res.hess_inv) if hasattr(res, "hess_inv") else None
+        std_errors = None
+        se_quality = "unavailable"
+        if hess_inv is not None and hess_inv.ndim == 2:
+            diag_h = np.diag(hess_inv)
+            if np.all(diag_h > 0) and np.all(np.isfinite(diag_h)):
+                std_errors = np.sqrt(diag_h)
+                se_quality = "approximate"
+            else:
+                se_quality = "unreliable"
+
+        # Bound diagnostics
+        B_LIMIT     = 0.98
+        A_LIMIT     = 2.0
+        RHO_LIMIT   = 0.98
+        STATE_LIMIT = 15.0
+        ETA_LIMIT   = 30.0
+        STATIC_LIMIT = 20.0
+
+        gas_th_fin, pi_th_fin, _ = self._split_theta(res.x)
+        gp_fin    = self.gas.codec.decode(gas_th_fin)
+        pi_fin    = {name: float(pi_th_fin[i]) for i, name in enumerate(self._pi_names)}
+
+        bound_diags: dict = {}
+        for name in self.tv_names:
+            b_sum = float(np.sum(np.abs([gp_fin[f"B_{name}_{l}"] for l in self.lags])))
+            a_sum = float(np.sum(np.abs([gp_fin[f"A_{name}_{l}"] for l in self.lags])))
+            bound_diags[f"{name}_B_sum"]        = b_sum
+            bound_diags[f"{name}_B_near_limit"] = bool(b_sum > 0.9 * B_LIMIT)
+            bound_diags[f"{name}_A_sum"]        = a_sum
+            bound_diags[f"{name}_A_near_limit"] = bool(a_sum > 0.9 * A_LIMIT)
+        rho = float(pi_fin.get("rho", 0.0))
+        bound_diags["pi_rho"]           = rho
+        bound_diags["pi_rho_near_limit"] = bool(abs(rho) > 0.9 * RHO_LIMIT)
+        for s in self.gas.static_names:
+            v = float(gp_fin.get(s, 0.0))
+            bound_diags[f"static_{s}"]            = v
+            bound_diags[f"static_{s}_near_limit"] = bool(abs(v) > 0.9 * STATIC_LIMIT)
+        if paths:
+            f_max   = float(np.max(np.abs(paths.get("f_arr", np.zeros((1, 1))))))
+            eta_max = float(np.max(np.abs(paths.get("eta",   np.zeros(1)))))
+            bound_diags["max_state_magnitude"] = f_max
+            bound_diags["state_near_limit"]    = bool(f_max   > 0.9 * STATE_LIMIT)
+            bound_diags["max_eta_magnitude"]   = eta_max
+            bound_diags["eta_near_limit"]      = bool(eta_max > 0.9 * ETA_LIMIT)
+        bound_diags["scaling_fallback_count"] = int(self.gas._fallback_count)
 
         return {
-            "theta":    result.x,
-            "loglik":   -result.fun,
-            "success":  result.success,
-            "message":  result.message,
-            "n_iter":   result.nit,
-            "grad":     result.jac if hasattr(result, "jac") else None,
-            "hess_inv": result.hess_inv if hasattr(result, "hess_inv") else None,
-            "result":   result,
+            "theta":              res.x,
+            "loglik":             ll_final,
+            "validity":           validity,
+            "success":            bool(res.success),
+            "message":            str(res.message),
+            "n_iter":             int(res.nit),
+            "n_fev":              int(res.nfev),
+            "grad":               grad,
+            "grad_norm_inf":      grad_norm_inf,
+            "grad_norm_2":        grad_norm_2,
+            "hess_inv":           hess_inv,
+            "std_errors":         std_errors,
+            "se_quality":         se_quality,
+            "runtime_s":          runtime_s,
+            "peak_mem_mb":        peak_mem / 1e6,
+            "polish_improvement": polish_improvement,
+            "param_names":        self.parameter_names(),
+            "bound_diagnostics":  bound_diags,
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -452,14 +747,10 @@ class CovZAGASModel:
             pi_arr[t] = float(expit(eta_arr[t]))
 
             if y_full[t] > 0:
-                raw = self.dist.score(y_full[t], **call_params)
-                if self.gas.scale_score:
-                    fi = self.dist.fisher_info_diag(**call_params)
-                    for j, name in enumerate(self.tv_names):
-                        s_arr[t, j] = raw[name] / max(fi[name], 1e-8)
-                else:
-                    for j, name in enumerate(self.tv_names):
-                        s_arr[t, j] = raw[name]
+                raw    = self.dist.score(y_full[t], **call_params)
+                scaled = self.gas._scaled_score(raw, call_params)
+                for j, name in enumerate(self.tv_names):
+                    s_arr[t, j] = scaled[name]
 
             x_t = X_full[t]
             for j, name in enumerate(self.tv_names):
@@ -502,22 +793,39 @@ class CovZAGASModel:
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-        names = self.parameter_names()
+        names = result.get("param_names", self.parameter_names())
         theta = result["theta"]
         pd.DataFrame({"parameter": names, "value": theta}).to_csv(
             cache_dir / "estimated_parameters.csv", index=False
         )
 
+        if result.get("std_errors") is not None:
+            pd.DataFrame({
+                "parameter": names,
+                "std_error":  result["std_errors"],
+                "se_quality": result["se_quality"],
+            }).to_csv(cache_dir / "standard_errors.csv", index=False)
+
         meta = {
-            "n_params":   self.n_params,
-            "cov_names":  self.cov_names,
-            "cov_target": self.cov_target,
-            "tv_names":   list(self.tv_names),
-            "seasonal":   self.seasonal,
-            "loglik":     float(result["loglik"]),
-            "success":    bool(result["success"]),
-            "message":    str(result.get("message", "")),
-            "n_iter":     int(result.get("n_iter", 0)),
+            "model_type":         "CovZAGASModel",
+            "n_params":           self.n_params,
+            "cov_names":          self.cov_names,
+            "cov_target":         self.cov_target,
+            "tv_names":           list(self.tv_names),
+            "seasonal":           self.seasonal,
+            "loglik":             float(result["loglik"]),
+            "validity":           result.get("validity", "unknown"),
+            "success":            bool(result.get("success", False)),
+            "message":            str(result.get("message", "")),
+            "n_iter":             int(result.get("n_iter", 0)),
+            "n_fev":              int(result.get("n_fev", 0)),
+            "grad_norm_inf":      float(result.get("grad_norm_inf", float("nan"))),
+            "grad_norm_2":        float(result.get("grad_norm_2",   float("nan"))),
+            "runtime_s":          float(result.get("runtime_s",     float("nan"))),
+            "peak_mem_mb":        float(result.get("peak_mem_mb",   float("nan"))),
+            "se_quality":         result.get("se_quality", "unavailable"),
+            "polish_improvement": float(result.get("polish_improvement", 0.0)),
+            "bound_diagnostics":  result.get("bound_diagnostics", {}),
         }
         (cache_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
 
@@ -526,7 +834,6 @@ class CovZAGASModel:
                 cache_dir / "gradients.csv", index=False
             )
 
-        # Save BFGS inverse Hessian approximation if available
         if result.get("hess_inv") is not None:
             hi = np.array(result["hess_inv"])
             if hi.ndim == 2:

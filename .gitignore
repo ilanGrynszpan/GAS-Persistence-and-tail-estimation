@@ -44,11 +44,17 @@ data/input/
 input/
 
 # claude
+*.md
 claude.md
 docs/
 
 # artifacts
 artifacts/
+reports/
+report/
 
 # nb
 nb_run_log.txt
+
+# logs
+*.log
