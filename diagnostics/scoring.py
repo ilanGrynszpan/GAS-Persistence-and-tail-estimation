@@ -368,6 +368,284 @@ def compute_all_metrics(
     }
 
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Log Score  (per-observation predictive log-likelihood)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def log_score(
+    model,
+    paths_oos_style: dict,
+    y: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute per-observation predictive log-density.
+
+    For y_t = 0:  LS_t = log(1 - pi_t)
+    For y_t > 0:  LS_t = log(pi_t) + log g(y_t ; f_t)
+
+    Lower (more negative) values indicate worse fit.  Convention here:
+    we return NEGATIVE log-score so that lower = better, matching CRPS.
+
+    Parameters
+    ----------
+    model           : fitted ZA model with model.dist.logpdf
+    paths_oos_style : dict with pi_oos, f_arr_oos, tv_names, static
+    y               : observations
+
+    Returns
+    -------
+    ndarray of length len(y), NaN for non-finite contributions
+    """
+    n       = len(y)
+    ls_vals = np.full(n, np.nan)
+
+    for i in range(n):
+        pi_t = float(paths_oos_style["pi_oos"][i])
+        if y[i] <= 0:
+            log_p = np.log(max(1.0 - pi_t, 1e-300))
+        else:
+            call = {
+                nm: float(paths_oos_style["f_arr_oos"][i, j])
+                for j, nm in enumerate(paths_oos_style["tv_names"])
+            }
+            call.update(paths_oos_style["static"])
+            log_p = np.log(max(pi_t, 1e-300)) + model.dist.logpdf(y[i], **call)
+
+        ls_vals[i] = -log_p if np.isfinite(log_p) else np.nan   # negative = worse
+
+    return ls_vals
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Extended OOS metrics — all quantile levels, log score, regime-aware
+# ──────────────────────────────────────────────────────────────────────────────
+
+#: Standard 10-quantile level set from prompt.md
+EXTENDED_QUANTILE_LEVELS = (
+    0.50, 0.75, 0.90, 0.95, 0.975, 0.99, 0.995, 0.999, 0.9995, 0.9999
+)
+
+#: twCRPS threshold levels
+EXTENDED_TWCRPS_LEVELS = (0.90, 0.95, 0.99)
+
+#: Brier score threshold levels (same as QS levels)
+EXTENDED_BRIER_LEVELS = EXTENDED_QUANTILE_LEVELS
+
+
+def compute_extended_oos_metrics(
+    model,
+    paths_oos: dict,
+    y_test: np.ndarray,
+    quantile_levels: Sequence[float] = EXTENDED_QUANTILE_LEVELS,
+    twcrps_levels: Sequence[float] = EXTENDED_TWCRPS_LEVELS,
+    brier_levels: Sequence[float] = EXTENDED_QUANTILE_LEVELS,
+    n_draws: int = 1000,
+    seed: int = 42,
+) -> dict:
+    """
+    Comprehensive extended OOS evaluation.
+
+    Computes for each observation:
+        - CRPS (MC approximation)
+        - twCRPS at 90%, 95%, 99%
+        - Quantile Score at 10 quantile levels
+        - Log Score (negative log-likelihood per observation)
+        - Brier Score at 10 quantile levels
+        - Kupiec and Christoffersen tests at all 10 quantile levels
+        - RMSE, MAD (all / wet / dry)
+        - PIT / QR statistics
+
+    All at 1000 MC draws for high-quantile precision.
+
+    Parameters
+    ----------
+    model       : fitted ZA model
+    paths_oos   : OOS paths dict with pi_oos, f_arr_oos, tv_names, static
+    y_test      : test observations
+    ...
+
+    Returns
+    -------
+    dict with flattened metric keys
+    """
+    from diagnostics.residuals import pit_values, quantile_residuals
+    from diagnostics.tests import kupiec_test, christoffersen_test
+
+    rng = np.random.default_rng(seed)
+    n   = len(y_test)
+
+    crps_vals   = np.zeros(n)
+    twcrps_vals = {lv: np.zeros(n) for lv in twcrps_levels}
+    qs_vals     = {q: np.zeros(n) for q in quantile_levels}
+    brier_vals  = {lv: np.zeros(n) for lv in brier_levels}
+    pit_vals    = np.zeros(n)
+
+    # Pre-compute wet quantiles for twCRPS thresholds and Brier thresholds
+    wet_y = y_test[y_test > 0]
+    twcrps_thresholds = {
+        lv: float(np.quantile(wet_y, lv)) if len(wet_y) > 0 else 0.0
+        for lv in twcrps_levels
+    }
+    brier_thresholds = {
+        lv: float(np.quantile(wet_y, lv)) if len(wet_y) > 0 else 0.0
+        for lv in brier_levels
+    }
+
+    tv_names  = paths_oos["tv_names"]
+    static    = paths_oos["static"]
+    has_ppf   = hasattr(model.dist, "ppf")
+    has_cdf   = hasattr(model.dist, "cdf")
+
+    for i in range(n):
+        pi_t      = float(paths_oos["pi_oos"][i])
+        zero_mass = max(0.0, 1.0 - pi_t)
+        call = {nm: float(paths_oos["f_arr_oos"][i, j])
+                for j, nm in enumerate(tv_names)}
+        call.update(static)
+        obs = float(y_test[i])
+
+        # Monte Carlo draws
+        is_pos = rng.binomial(1, pi_t, size=n_draws)
+        draws  = np.zeros(n_draws)
+        n_pos  = int(is_pos.sum())
+        if n_pos > 0 and has_ppf:
+            try:
+                draws[is_pos == 1] = model.dist.ppf(
+                    rng.uniform(1e-8, 1 - 1e-8, size=n_pos), **call
+                )
+            except Exception:
+                pass
+
+        # CRPS
+        s = np.sort(draws)
+        crps_vals[i] = float(np.mean(np.abs(draws - obs)) - 0.5 * np.mean(np.abs(s - s[::-1])))
+
+        # twCRPS
+        for lv, thr in twcrps_thresholds.items():
+            w  = (draws > thr).astype(float)
+            e1 = float(np.mean(w * np.abs(draws - obs)))
+            ws = (s > thr).astype(float)
+            e2 = float(np.mean(ws * np.abs(s - s[::-1])))
+            twcrps_vals[lv][i] = e1 - 0.5 * e2
+
+        # Quantile Scores
+        for q in quantile_levels:
+            if q <= zero_mass:
+                q_hat = 0.0
+            elif has_ppf:
+                q_pos = np.clip((q - zero_mass) / max(pi_t, 1e-12), 1e-12, 1 - 1e-12)
+                try:
+                    q_hat = float(model.dist.ppf(q_pos, **call))
+                except Exception:
+                    q_hat = float(np.quantile(draws, q))
+            else:
+                q_hat = float(np.quantile(draws, q))
+            qs_vals[q][i] = float((obs - q_hat) * (q - float(obs < q_hat)))
+
+        # Brier Score
+        for lv, thr in brier_thresholds.items():
+            if has_cdf and obs > 0:
+                try:
+                    G_thr  = model.dist.cdf(thr, **call)
+                    p_exc  = pi_t * (1.0 - G_thr)
+                except Exception:
+                    p_exc = float(np.mean(draws > thr))
+            else:
+                p_exc = float(np.mean(draws > thr))
+            brier_vals[lv][i] = float((p_exc - float(obs > thr)) ** 2)
+
+        # PIT (non-randomised, for coverage tests)
+        if obs <= 0:
+            pit_vals[i] = zero_mass
+        elif has_cdf:
+            try:
+                pit_vals[i] = float(zero_mass + pi_t * model.dist.cdf(obs, **call))
+            except Exception:
+                pit_vals[i] = float(np.mean(draws <= obs))
+        else:
+            pit_vals[i] = float(np.mean(draws <= obs))
+
+    # Log Score
+    ls_arr = log_score(model, paths_oos, y_test)
+
+    # Means
+    dry_mask = y_test == 0
+    wet_mask = y_test > 0
+
+    # Predictive means for RMSE/MAD
+    from scipy.special import beta as beta_fn
+    pred_means = np.zeros(n)
+    for i in range(n):
+        pi_t = float(paths_oos["pi_oos"][i])
+        call = {nm: float(paths_oos["f_arr_oos"][i, j])
+                for j, nm in enumerate(tv_names)}
+        call.update(static)
+        phi   = call.get("phi", 0.0)
+        xi    = call.get("xi", np.log(1.2))
+        gamma = call.get("gamma", 1.0)
+        zeta  = call.get("zeta", 3.0)
+        a = np.exp(xi); b_v = np.exp(zeta); p_v = np.exp(-gamma)
+        sigma = np.exp(phi)
+        try:
+            gb2_mean = sigma * beta_fn(a + p_v, b_v - p_v) / beta_fn(a, b_v)
+        except Exception:
+            gb2_mean = sigma
+        pred_means[i] = pi_t * gb2_mean
+
+    rmse     = float(np.sqrt(np.mean((pred_means - y_test) ** 2)))
+    mad      = float(np.mean(np.abs(pred_means - y_test)))
+    rmse_wet = float(np.sqrt(np.mean((pred_means[wet_mask] - y_test[wet_mask]) ** 2))) if wet_mask.any() else np.nan
+    rmse_dry = float(np.sqrt(np.mean((pred_means[dry_mask] - y_test[dry_mask]) ** 2))) if dry_mask.any() else np.nan
+    mad_wet  = float(np.mean(np.abs(pred_means[wet_mask] - y_test[wet_mask]))) if wet_mask.any() else np.nan
+    mad_dry  = float(np.mean(np.abs(pred_means[dry_mask] - y_test[dry_mask]))) if dry_mask.any() else np.nan
+
+    # Kupiec + Christoffersen for all quantile levels
+    kup_result  = {}
+    chrf_result = {}
+    for q in quantile_levels:
+        alpha  = 1.0 - q     # exceedance probability
+        # violation indicator: I_t = 1 if y_t > F_t^{-1}(q), i.e. PIT_t > q
+        pit_det = pit_vals.copy()
+        kup  = kupiec_test(pit_det, alpha=alpha)
+        chrf = christoffersen_test(pit_det, alpha=alpha)
+        key  = int(q * 10000)
+        kup_result[f"kup_{key}_stat"]    = kup["stat"]
+        kup_result[f"kup_{key}_pvalue"]  = kup["pvalue"]
+        kup_result[f"kup_{key}_reject"]  = kup["reject_5pct"]
+        chrf_result[f"chrf_{key}_LRcc"]   = chrf["LR_cc"]
+        chrf_result[f"chrf_{key}_pvalue"] = chrf["pvalue_cc"]
+        chrf_result[f"chrf_{key}_reject"] = chrf["reject_5pct_cc"]
+
+    result = {
+        "crps_mean":   float(np.mean(crps_vals)),
+        "crps_std":    float(np.std(crps_vals)),
+        "log_score_mean":  float(np.nanmean(ls_arr)),
+        "log_score_std":   float(np.nanstd(ls_arr)),
+        "rmse":  rmse,   "mad":  mad,
+        "rmse_wet": rmse_wet, "rmse_dry": rmse_dry,
+        "mad_wet":  mad_wet,  "mad_dry":  mad_dry,
+        "n":      n,
+        "n_wet":  int(wet_mask.sum()),
+        "pit_mean": float(np.mean(pit_vals)),
+        "pit_std":  float(np.std(pit_vals)),
+    }
+
+    for lv in twcrps_levels:
+        result[f"twcrps_{int(lv*100)}"] = float(np.mean(twcrps_vals[lv]))
+
+    for q in quantile_levels:
+        result[f"qs_{int(q*10000):05d}"] = float(np.mean(qs_vals[q]))
+
+    for lv in brier_levels:
+        result[f"brier_{int(lv*10000):05d}"] = float(np.mean(brier_vals[lv]))
+
+    result.update(kup_result)
+    result.update(chrf_result)
+
+    return result
+
+
 def metrics_to_frame(
     metrics_by_model: Dict[str, dict],
     sample: str = "oos",

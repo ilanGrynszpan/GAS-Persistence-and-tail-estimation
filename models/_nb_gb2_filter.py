@@ -216,11 +216,18 @@ def _gb2_fi_cross(xi: float, gamma: float, zeta: float) -> float:
     Derived from Cov(∂ℓ/∂phi, ∂ℓ/∂xi) = sigma·a·(p/sigma)·b/(a+b)
     using u = (y/sigma)^p/(1+(y/sigma)^p) ~ Beta(a,b) and
     Cov(u, log u) = b/(a+b)^2.  Note denominator is (a+b), not (a+b+1).
+
+    Guard: if both a and b underflow to 0.0 (xi, zeta << -745), the
+    denominator is 0/0 → ZeroDivisionError in Numba's Python-compatible
+    float division.  The limit as a,b→0⁺ is 0, so return 0.0.
     """
     a = math.exp(xi)
     b = math.exp(zeta)
+    denom = a + b
+    if denom <= 0.0:
+        return 0.0
     p = math.exp(-gamma)
-    return p * a * b / (a + b)
+    return p * a * b / denom
 
 
 # ─────────────────────────────────────────────────────────────────────────────

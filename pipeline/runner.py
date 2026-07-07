@@ -455,6 +455,7 @@ def run_stage_parallel(
     logger:        logging.Logger,
     workers:       int   = 4,
     force_rerun:   bool  = False,
+    model_timeout: int | None = None,  # per-model wall-clock timeout in seconds
 ) -> List[dict]:
     """
     Run a list of independent model specs in parallel using a ProcessPoolExecutor.
@@ -502,7 +503,10 @@ def run_stage_parallel(
         f"(parallel=True)"
     )
 
-    futures_map: Dict[_cf.Future, int] = {}
+    futures_map:   Dict[_cf.Future, int]    = {}
+    future_start:  Dict[_cf.Future, float]  = {}
+
+    import time as _time
 
     with _cf.ProcessPoolExecutor(max_workers=effective_workers) as pool:
         for i, (model_id, model, fit_kw, oos_kw) in enumerate(pending_specs):
@@ -517,34 +521,82 @@ def run_stage_parallel(
                 force_rerun=force_rerun,
             )
             futures_map[fut] = pending_indices[i]
+            future_start[fut] = _time.time()
 
-        for fut in _cf.as_completed(futures_map):
-            idx = futures_map[fut]
-            model_id = specs[idx][0]
-            try:
-                res = fut.result()
-            except Exception as exc:
-                logger.error(f"[FAIL]  {model_id}  worker exception: {exc}")
-                res = {
-                    "model_id":    model_id,
-                    "status":      "failed",
-                    "validity":    "failed",
-                    "loglik":      float("nan"),
-                    "n_params":    0,
-                    "oos_metrics": {},
-                    "result":      None,
-                    "_log_events": [{"model_id": model_id, "event": "worker_exception",
-                                     "msg": str(exc)}],
-                }
-            # Write log events collected inside the worker
-            for event in res.pop("_log_events", []):
-                _log_event(log_path, event)
+        pending_futs = set(futures_map.keys())
+        while pending_futs:
+            # Wait up to 30 s for any future to complete
+            done_now, pending_futs = _cf.wait(
+                pending_futs, timeout=30, return_when=_cf.FIRST_COMPLETED
+            )
 
-            results[idx] = res
-            ll  = res.get("loglik", float("nan"))
-            val = res.get("validity", "?")
-            logger.info(f"[DONE]  {model_id}  validity={val}  loglik={ll:.2f}" if ll == ll
-                        else f"[DONE]  {model_id}  validity={val}  loglik=NaN")
+            # Cancel any futures that have exceeded the wall-clock timeout
+            if model_timeout is not None:
+                now = _time.time()
+                timed_out = [
+                    f for f in pending_futs
+                    if (now - future_start[f]) > model_timeout
+                ]
+                for f in timed_out:
+                    f.cancel()
+                    idx      = futures_map[f]
+                    model_id = specs[idx][0]
+                    elapsed  = int(now - future_start[f])
+                    logger.warning(
+                        f"[TIMEOUT] {model_id}  exceeded {model_timeout}s "
+                        f"(elapsed {elapsed}s) — marking as failed"
+                    )
+                    res = {
+                        "model_id":    model_id,
+                        "status":      "timeout",
+                        "validity":    "failed",
+                        "loglik":      float("nan"),
+                        "n_params":    0,
+                        "oos_metrics": {},
+                        "result":      None,
+                        "_log_events": [{"model_id": model_id, "event": "timeout",
+                                         "elapsed_s": elapsed}],
+                    }
+                    for event in res.pop("_log_events", []):
+                        _log_event(log_path, event)
+                    results[idx] = res
+                    pending_futs.discard(f)
+
+            # Process completed futures
+            for fut in done_now:
+                idx      = futures_map[fut]
+                model_id = specs[idx][0]
+                try:
+                    res = fut.result(timeout=1)
+                except _cf.TimeoutError:
+                    res = {
+                        "model_id": model_id, "status": "timeout",
+                        "validity": "failed", "loglik": float("nan"),
+                        "n_params": 0, "oos_metrics": {}, "result": None,
+                        "_log_events": [],
+                    }
+                except Exception as exc:
+                    logger.error(f"[FAIL]  {model_id}  worker exception: {exc}")
+                    res = {
+                        "model_id":    model_id,
+                        "status":      "failed",
+                        "validity":    "failed",
+                        "loglik":      float("nan"),
+                        "n_params":    0,
+                        "oos_metrics": {},
+                        "result":      None,
+                        "_log_events": [{"model_id": model_id, "event": "worker_exception",
+                                         "msg": str(exc)}],
+                    }
+                # Write log events collected inside the worker
+                for event in res.pop("_log_events", []):
+                    _log_event(log_path, event)
+
+                results[idx] = res
+                ll  = res.get("loglik", float("nan"))
+                val = res.get("validity", "?")
+                logger.info(f"[DONE]  {model_id}  validity={val}  loglik={ll:.2f}" if ll == ll
+                            else f"[DONE]  {model_id}  validity={val}  loglik=NaN")
 
     return results
 
@@ -1031,6 +1083,36 @@ def run_pipeline(
     winner_scaling  = scaling_decode.get(parts[-1], "diagonal_inverse_fisher")
     winner_lag      = parts[-2]                      # "short" or "seasonal"
     winner_tv       = "phi_xi" if "phixi" in mid1 else "phi"
+
+    # If the fullfi Stage-1 winner has NaN CRPS (GB2 ppf overflow in OOS
+    # simulation), Stage 2/3 would inherit fullfi and also produce NaN CRPS,
+    # making the 2% improvement test permanently unresolvable.  Fall back to
+    # the best Stage-1 model with *valid* CRPS and the same TV spec for the
+    # scaling passed downstream.  The reported Stage-1 winner is unchanged.
+    if winner_scaling == "inverse_fisher":
+        w1_crps = float(
+            w1.get("oos_metrics", {}).get("crps_mean", float("nan"))
+        )
+        if not np.isfinite(w1_crps):
+            _is_phixi = winner_tv == "phi_xi"
+            valid_r1 = [
+                r for r in r1
+                if r.get("validity", "failed") not in ("failed",)
+                and ("phixi" in r.get("model_id", "")) == _is_phixi
+                and np.isfinite(float(
+                    r.get("oos_metrics", {}).get("crps_mean", float("nan"))
+                ))
+            ]
+            fallback = select_winner(valid_r1) if valid_r1 else None
+            if fallback:
+                fb_parts  = fallback["model_id"].split("_")
+                fb_sc     = scaling_decode.get(fb_parts[-1], "diagonal_inverse_fisher")
+                logger.info(
+                    f"  Stage-1 winner {mid1} has NaN CRPS (fullfi instability); "
+                    f"using scaling='{fb_sc}' from {fallback['model_id']} "
+                    f"for Stage 2/3 inheritance."
+                )
+                winner_scaling = fb_sc
 
     from constants import GAS_SHORT_LAGS, GAS_SEASONAL_LAGS
     winner_gas_lags = (GAS_SHORT_LAGS["daily"] if winner_lag == "short"
