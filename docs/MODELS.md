@@ -771,23 +771,6 @@ These are rolling ENSO features, not simply repeated daily lags.
 
 The Harvey long-short model replaces the single standard GAS recursion with two score-driven latent components.
 
-Do not implement the active Harvey model as:
-
-$$
-f_t
-=
-
-\omega
-+
-GAS_t
-+
-L_t
-+
-S_t.
-$$
-
-That is not the intended model.
-
 The intended model is:
 
 $$

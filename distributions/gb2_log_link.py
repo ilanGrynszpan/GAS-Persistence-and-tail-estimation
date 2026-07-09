@@ -193,6 +193,34 @@ class GB2LogLink(Distribution):
         y = sigma * (u / (1.0 - u)) ** (1.0 / p)
         return float(y) if np.ndim(q) == 0 else y
 
+    def raw_moment(self, k: int, **params) -> float:
+        """
+        k-th raw moment of the positive GB2 component:
+
+            E[Y^k] = sigma^k * B(a + k/p, b - k/p) / B(a, b)
+
+        which only exists (is finite) for b > k/p, i.e. k < b*p. Returns
+        NaN rather than a spurious huge/negative value when this condition
+        fails, so that a genuinely non-existent moment (heavy enough tail)
+        is distinguishable from a normal finite one -- this matters because
+        b - k/p appears as a Beta-function argument and scipy's beta_fn
+        silently returns a large-magnitude or non-finite value once that
+        argument crosses zero, rather than raising.
+        """
+        phi, xi, gamma, zeta = self._unpack(params)
+        a = np.exp(xi)
+        b = np.exp(zeta)
+        p = np.exp(-gamma)
+        sigma = np.exp(phi)
+        arg2 = b - k / p
+        if not (arg2 > 0):
+            return float("nan")
+        return float(sigma ** k * beta_fn(a + k / p, arg2) / beta_fn(a, b))
+
+    def mean(self, **params) -> float:
+        """E[Y] for the positive GB2 component (see raw_moment)."""
+        return self.raw_moment(1, **params)
+
     def rvs(self, n: int = 1, **params) -> np.ndarray:
         phi, xi, gamma, zeta = self._unpack(params)
         a = np.exp(xi)

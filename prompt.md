@@ -6,169 +6,79 @@ Follow the existing repository architecture and reuse existing modules whenever 
 
 More than anything, dont change current modelling unless something is actually wrong or requested in this document.
 
+Input data file paths should be in docs/data.md
+
 ---
 
 # Objective
 
-Extend the current experimental pipeline so that it evaluates every available location, performs comprehensive probabilistic and tail-focused evaluation, and generates publication-quality diagnostics demonstrating the behaviour of the dynamic predictive distribution.
+We have to implement some fixes to the existing pipeline. The last execution was from run_all_location.iynb and generated the report in reports/multi_location. We need the same locations that were used for that report but with the following changes:
 
-The goal is not only to determine which model achieves the lowest CRPS, but also to demonstrate whether dynamic scale, dynamic tail shape, and the Harvey long-short decomposition produce meaningful improvements in the modelling of precipitation extremes.
+1. You do not have to reestimate these models but the evaluation criteria is different: 
 
-The implementation should remain fully modular and report generation should continue to be artifact-driven.
+1a. phi-only tv models should be evaluated against thhemselves according to OOS RMSE criterion. This means, stages 1, 2 and 3 comparing only phi with only phi.
 
----
+1b. 2 tvp (phi and xi) models should be compared within and between stages against themselves too, using CRPS and the main criterion, and also twCRPS at 95% and 98%.
 
-# Model estimation
+2. Stage 3 models used the wrong data, somehow you were not able to catch that the input CSV had Nino SST, not anomalies, and the range did not even include key values like 0.5. This caused an evaluation as if the whole time series was under El Nino, which is obviously not correct, and should have been questioned before optimization even started. Therefore, all stage 3 models need to be reestimated. But, I will introduce some changes:
 
-Run the complete three-stage pipeline for **every location** available in the precipitation dataset. YOU SHOULD NOT HAVE TO RUN FOR **BELO HORIZONTE** AGAIN, YOU ALREADY DID, I TESTED AND APPROVED. YOU SHOULD ONLY RUN IT AGAIN IF IT IS NOT POSSIBLE TO OBTAIN THE METRICS AND DIAGNOSTICS I AM ASKING WITHOUT RUNNING AGAIN, BUT THIS SHOULD NOT BE NECESSARY IF YOU DID WHAT I TOLD YOU TO DO AND SAVED THE OPTIMIZED PARAMETERS.
+2a. The important for the slow moving part (Long) is not the ENSO anomalies themselves, but if we are in El Nino, La Nina, or neutral times. Therefore, we will rather work with dummies to capture such behavior, as in:
 
-RESULTS,CHARTS, DIAGNOSTICS, ... SHOULD SEPARATE BETWEEN LOCATIONS, NOT BE GROUPED.
+L^θ_t    =  α^θ_L · L^θ_{t-1}  +  β^θ_L' · X^long_t
 
-The files for these locations should be found in the locations described inside the data.md folder. You will see that inside those folders there are numerous location files, and inside the precipitation folder, they are also divided in train/test sets. You should follow this division for all files and modelling.
+where vector $\beta$ contains multipliers to orthogonal dummies that represent each of these states, and possibly their lags.
 
-For every location:
+2b. The input tables should be evaluated if the refering data corresponds (makes sense) to the observed variable, do not use data that does not make sense, activelly question it.
 
-1. Estimate every Stage 1 baseline ZA-GAS specification.
+3. Stage 4 (regime sensitive GAS) only makes sense as tail sensitive dynamics. Therefore, it will only be used with xi, not with the scale parameter phi. The dynamics of phi within these models will follow the best calibration for phi and xi tvps from earlier stages, and therefore, the same scalling should be used. Phi dynamics here should not be reestimated, as that model already works. I know that xi dynamics will impact phi more or less depending on the scalling, but computational cost and margin for errors increases with phi reestimation unnecessarily.
 
-2. Select the Stage 1 winner using **out-of-sample CRPS**.
+3a. Stage 4 models will be evaluated on twCRPS agains their best of preivous stages counterparts.
 
-3. Use that winning specification as the base model for Stage 2.
+3b. Stage 4 models should only be sensitive to different dynamics for q95 and q98, therefore, models with q90 or other quatile differentiation lss than q95 should be terminated.
 
-4. Estimate every Stage 2 covariate specification.
+4. Current reporting as of reports/multi_location is a bit confusing and hard to read. I need the following structure:
 
-5. Accept Stage 2 only if OOS CRPS improves by at least **2%** relative to the selected Stage 1 model. Otherwise continue with the Stage 1 winner.
+4a. For all models in all stages the following metrics: log-likelihood, AIC, BIC.
 
-6. Use the selected Stage 1/Stage 2 model as the base for Stage 3.
+4b. For only-phi tvp models, all stages and all models, OOS RMSE and MAD.
 
-7. Estimate every Harvey long-short specification.
+4c. For both phi and xi tvp models, all stages and all models, OOS CRPS and twCRPS for q95 and q98.
 
-8. Accept Stage 3 only if OOS CRPS improves by at least **2%** relative to the currently selected model.
+4d. For all stages, the in-stage winner according to these metrics for the corresponding set of tvp, with the winner being the best key metric or metrics for that set of tvp, or, if improvement is less than 2% in key metric(s), the simplest model. This smae logic should be used for inter-stage decision.
 
-Produce both per-location summaries and an overall summary comparing all locations.
+4e. For winner model in each stage: IS PIT histogram, IS ACF wih 400 lags.
 
----
+4f. For winner model of all stages for both sets of tvp: table with OOS RMSE, MAD, CRPS, AIC, BIC. Another table with twCRPS for q95 and q98, christopherssen and kupiec at q95.
 
-# NOTE
+4g. Climatological return levels for 
 
-The requests below DO NOT replace the reporting style and information you are already producing, and that resulted in file reports/report.*. Nor do they replace REPORTING.md, I like that report style, the explanations, everything. Everything described below is addition to what has already been done. That is why I am saying, do not delete or change unnecessary working things.
+- 2-year
+- 5-year
+- 10-year
+- 25-year
+- 50-year
+- 75-year
+- 100-year
+- 500-year
+- 1000-year
 
-Pay attention to everything, including how you are generating the PIT, it has to be IS and as you are already doing. The ACF has to be with 400 lags. Every metrics you are using, report in the PDF and tex in prior sections, including all the mathematics as in your code, report the mathematics of the models as in the code, you can use the current report as basis for styling, indexing, formatting, ... but the content HAS TO BE faithful to what you did in the code, I want to know what was done.
+in separate charts of OOS time series, against time series. Below the chart it should show the rate of theoretical and empirical violations.
 
----
+4f.
 
-# Out-of-sample evaluation
+For each quantile level (q50, q75, q90, q95, q98, q99) compute empirical exceedance frequencies.
 
-Compute every evaluation metric using the **time-varying predictive distribution** produced by the model.
+Evaluate exceedance calibration:
 
-Do not evaluate static fitted distributions.
+- overall;
+- by month;
+- by ENSO regime;
+- by wet season;
+- by dry season.
 
-Retain existing metrics.
+Compare observed exceedance frequencies against theoretical exceedance probabilities for each model, comparing their only-phi, and phi and xi counterpart, and the stage 4 vs the best in preivous stages.
 
-Additionally compute:
-
-- CRPS
-- Threshold-weighted CRPS (twCRPS)
-- Quantile Score (pinball loss)
-- Log Score
-- RMSE
-- MAD
-- Brier Score
-- Kupiec unconditional coverage
-- Christoffersen conditional coverage / independence
-- PIT diagnostics
-- Quantile residual diagnostics
-
-For Quantile Score, Kupiec and Christoffersen evaluate the following quantiles:
-
-- 0.50
-- 0.75
-- 0.90
-- 0.95
-- 0.975
-- 0.99
-- 0.995
-- 0.999
-- 0.9995
-- 0.9999
-
-For twCRPS compute versions emphasising at least:
-
-- upper 90%
-- upper 95%
-- upper 99%
-
-using appropriate threshold weighting functions.
-
----
-
-# Dynamic quantile diagnostics
-
-The defining characteristic of these models is that the predictive distribution changes through time.
-
-Therefore diagnostics should evaluate the evolution of conditional quantiles rather than treating the model as a single fitted distribution.
-
-For every selected model generate dynamic conditional quantiles for:
-
-- 0.50
-- 0.75
-- 0.90
-- 0.95
-- 0.975
-- 0.99
-- 0.995
-- 0.999
-- 0.9995
-- 0.9999
-
-Generate figures showing:
-
-- observed rainfall
-- dynamic conditional quantiles
-
-through time.
-
-These figures should clearly illustrate how the predictive distribution adapts to changing meteorological and climatic conditions.
-
----
-
-# Return-level diagnostics
-
-Compute two complementary families of return levels.
-
-## Daily rarity / return-level diagnostics
-
-For a return period of \(T\) days, the corresponding conditional return level is the rainfall amount expected to be exceeded with probability \(1/T\) on a given day.
-
-For each day \(t\), the model produces a conditional predictive CDF:
-
-\[
-F_t(y) = P(Y_t \le y \mid \mathcal{F}_{t-1})
-\]
-
-The \(T\)-day conditional return level is therefore:
-
-\[
-RL_{T,t} = F_t^{-1}\left(1-\frac{1}{T}\right)
-\]
-
-Compute this for:
-
-- \(T=30\)
-- \(T=60\)
-- \(T=90\)
-- \(T=100\)
-- \(T=500\)
-- \(T=1000\)
-
-So, for example:
-
-\[
-RL_{100,t} = F_t^{-1}(0.99)
-\]
-
-is the model-implied rainfall amount on day \(t\) that should be exceeded with probability 1% under the predictive distribution for that day.
-
-These are not stationary climatological return levels. They are dynamic conditional return levels, changing over time because \(F_t\) changes over time.
+4g. For time series OOS, shade in light red the El Nino moments, and in light blue the La Nina ones.
 
 ---
 
@@ -194,77 +104,6 @@ These should be interpreted as dynamic conditional return levels rather than ass
 
 ---
 
-# Tail calibration
-
-For every quantile level compute empirical exceedance frequencies.
-
-Evaluate exceedance calibration:
-
-- overall;
-- by month;
-- by ENSO regime;
-- by wet season;
-- by dry season.
-
-Compare observed exceedance frequencies against theoretical exceedance probabilities.
-
----
-
-# Seasonal decomposition
-
-For every location compute diagnostics grouped by calendar month.
-
-Generate:
-
-- monthly boxplots of dynamic quantiles;
-- monthly boxplots of dynamic return levels;
-- monthly exceedance frequencies;
-- monthly Quantile Scores;
-- monthly twCRPS.
-
-These should demonstrate whether the model correctly adapts to seasonal rainfall behaviour.
-
----
-
-# ENSO decomposition
-
-Evaluate the behaviour of the predictive distribution as a function of ENSO using two complementary approaches.
-
-## 1. Standard ENSO regimes
-
-Classify each day using the Niño 3.4 index according to the standard NOAA thresholds:
-
-- El Niño: Niño 3.4 ≥ +0.5°C
-- Neutral: -0.5°C < Niño 3.4 < +0.5°C
-- La Niña: Niño 3.4 ≤ -0.5°C
-
-For each regime compute:
-
-- dynamic conditional quantiles;
-- dynamic return levels;
-- Quantile Scores;
-- twCRPS;
-- empirical exceedance frequencies.
-
-## 2. ENSO intensity
-
-Rather than only using discrete categories, also analyse ENSO continuously.
-
-Divide the observed Niño 3.4 values into approximately equal-frequency bins (e.g. deciles or quintiles).
-
-For each bin compute:
-
-- mean and distribution of the estimated shape parameter (xi or its equivalent eexponentiated version in the distribution);
-- mean dynamic conditional quantiles;
-- mean dynamic return levels;
-- Quantile Scores;
-- twCRPS;
-- empirical exceedance frequencies.
-
-This analysis should determine whether increasing ENSO intensity is associated with systematically increasing extreme rainfall risk, providing direct evidence for the effectiveness of the Harvey long-short decomposition.
-
----
-
 # Wet and dry season decomposition
 
 Compute average rainfall for every calendar month.
@@ -279,28 +118,7 @@ For each location, you should list which months were categorized as wet or dry. 
 
 If its not possible to clearly distinguish wet and dry seasons (for instance, if all months hover within an interval of +-2% of the average), say that this analysis is not even possible for the location.
 
----
-
-# Signature diagnostic figures
-
-Generate publication-quality figures showing:
-
-1. observed rainfall;
-2. dynamic 95% quantile;
-3. dynamic 99% quantile;
-4. dynamic 99.9% quantile;
-
-through time.
-
-Shade El Niño and La Niña periods in the background with different colors: a light red representing El Nino, and light blue La Nina.
-
-On a second aligned panel, plot the estimated dynamic tail parameter (and long/short components where applicable).
-
-The objective is to visually demonstrate the chain:
-
-climate conditions → latent dynamics → tail parameter → predictive distribution → observed extremes.
-
-These figures should become the primary visual evidence supporting the contribution of the thesis.
+This should be ehxibited by location, and used to interpret results within the objectives section.
 
 ---
 
@@ -325,12 +143,10 @@ ALSO, INCLUDE IN THE APPENDIX OF THE REPORT ALL TABLES, THIS ONES AND OTHER ONES
 
 ---
 
-# Regime models
+# IMPORTANT
 
-Implement if not implemented yet, and run the regime sensitive models specified in MODELS.md sections 22 and 23. Use as covariates the best version between stages 1 to 3, you can even implement it as a long short decomposition if stage 3 was the best call. Put this as a last chapter in the end of the report, separated from everything elese, and run all diagnostics and metrics you ran for all else for these models.
+YOU SHOULD NOT HAVE TO RUN EVERY SINGLE MODEL TO DO WHAT I ASKED YOU HERE. MOST MODELS I PREVIOUSLY ASKED YOU ALREADY RAN AND SHOULD HAVE DOCUMENTED ALL OUTPUTS INCLUDING OPTIMIZED PARAMETERS, SO ONLY RUN THEM AGAIN IF THERE WAS AN ERROR THE FIRST TIME. AS FAR AS I AM CONCERNED YOU WILL ONLY HAVE TO RUN AGAIN STAGES 3 AND 4.
 
----
+MONITOR IT ALL WHILE RUNNING, KEEP ME INFORMED OF WHAT IS HAPPENING OF RELEVANCE.
 
-# Inspection
-
-Make necessary code alterations if necessary, but ask me before you run. Dont make me run things, you will run, and dont make me prompt again to run, just ask me within this same prompt something like "I finished, here is all I did, answer yes if I should run". After you generate the report, tell me what is the tex file generating it and how to regenerate pdf from it without asking you. Tell me too what notebook or python file you are running to run evereything in the background, in case later I have to run it with changes without wasting prompts.
+YOU DID NOT RUN ALL LOCATIONS IN THE FOLDERS AND FILES FOR THE REPORT YOU ARE BASING YOURSELF ON. FOR THIS RUN, SINCE YOU ARE NOT RE-RUNNING ALL MODELS, USE THE SAME LOCATIONS YOU ALREADY RAN, IGNORE THE ONES YOU DIDNT.

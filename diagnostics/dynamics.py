@@ -63,8 +63,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 
-# Standard quantile levels requested in prompt.md
-QUANTILE_LEVELS = [0.50, 0.75, 0.90, 0.95, 0.975, 0.99, 0.995, 0.999, 0.9995, 0.9999]
+# Standard quantile levels requested in prompt.md (0.98 added 2026-07-08:
+# objective 4f explicitly requests q50/q75/q90/q95/q98/q99, and 0.975 alone
+# does not cover q98).
+QUANTILE_LEVELS = [0.50, 0.75, 0.90, 0.95, 0.975, 0.98, 0.99, 0.995, 0.999, 0.9995, 0.9999]
 
 # Daily return periods (days)
 DAILY_RETURN_PERIODS = [30, 60, 90, 100, 500, 1000]

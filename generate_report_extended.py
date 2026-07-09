@@ -74,7 +74,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -97,7 +96,7 @@ if str(ROOT) not in sys.path:
 
 PRECIP_DIR  = Path(r"C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\data\output")
 ERA5_DIR    = ROOT / "data" / "input" / "ERA5"
-NINO34_PATH = ROOT / "data" / "processed" / "pacific" / "NINO34_daily.csv"
+ENSO_PATH   = ROOT / "data" / "processed" / "pacific" / "ENSO_clean.csv"
 ARTIFACTS_DIR = ROOT / "artifacts"
 
 from data.station_loader import STATION_REGISTRY, StationDataLoader
@@ -120,7 +119,9 @@ from diagnostics.decomposition import (
 from diagnostics.scoring import compute_extended_oos_metrics, EXTENDED_QUANTILE_LEVELS
 from diagnostics.residuals import pit_values, quantile_residuals
 
-# Locations to process — ALL locations including BH
+# The six locations actually run (round 2, 2026-07-07): SAO PAULO and
+# TORONTO are registered in STATION_REGISTRY but were never estimated, per
+# prompt.md's instruction to reuse only the already-run locations.
 ALL_STATIONS_ORDERED = [
     "BELO HORIZONTE",
     "CRUZEIRO DO SUL (ACRE)",
@@ -128,8 +129,6 @@ ALL_STATIONS_ORDERED = [
     "GARANHUNS (PERNAMBUCO)",
     "MANAUS",
     "SALVADOR",
-    "SÃO PAULO",
-    "TORONTO",
 ]
 
 SKIP_STATIONS = {"RIYADH OBS. (O.A.P."}
@@ -215,7 +214,18 @@ def _bold(s: str) -> str:
 
 
 def _fmt(v, digits: int = 4) -> str:
-    """Format a numeric value for a LaTeX table cell."""
+    """Format a numeric value for a LaTeX table cell.
+
+    +inf is rendered as "$\\infty$" rather than "--": the Kupiec/
+    Christoffersen LR statistics are defined as +inf precisely when there
+    are zero exceedances in the OOS sample (a degenerate but meaningful
+    result, common at high quantile levels with ~730-day test windows) --
+    collapsing that to the same "--" used for genuinely missing/NaN values
+    would hide the distinction between "not computed" and "test statistic
+    is infinite because the model had zero violations".
+    """
+    if isinstance(v, float) and np.isposinf(v):
+        return r"$\infty$"
     if v is None or (isinstance(v, float) and not np.isfinite(v)):
         return "--"
     try:
@@ -265,6 +275,20 @@ def _load_winners(run_dir: Path) -> dict:
     return _load_json_safe(p) if p.exists() else {}
 
 
+# Round-1 Stage-3 model ids built from the mislabelled raw-SST ENSO source
+# (see data/station_loader.py header) -- confirmed scientifically wrong, not
+# merely outdated. Their artifact directories are left on disk (nothing is
+# deleted -- ARCHITECTURE.md §9), but must never appear in any report table,
+# selection, or figure. The live pipeline itself never reconsiders these (it
+# only ever builds the 4 current-named Stage-3 specs -- see
+# pipeline.runner.build_stage3_specs), so this filter only matters here,
+# where _all_model_ids() otherwise blindly lists every subdirectory.
+_STALE_MODEL_IDS = {
+    "stage3_harvey_enso_90d", "stage3_harvey_enso_90d_30d",
+    "stage3_harvey_enso_90d_30d_daily",
+}
+
+
 def _all_model_ids(run_dir: Path, stage: str) -> List[str]:
     stage_dir = run_dir / stage
     if not stage_dir.exists():
@@ -272,6 +296,7 @@ def _all_model_ids(run_dir: Path, stage: str) -> List[str]:
     return sorted(
         d.name for d in stage_dir.iterdir()
         if d.is_dir() and (d / "metadata.json").exists()
+        and d.name not in _STALE_MODEL_IDS
     )
 
 
@@ -279,96 +304,60 @@ def _all_model_ids(run_dir: Path, stage: str) -> List[str]:
 # Model reconstruction from artifacts
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _infer_gas_lags(params_df: pd.DataFrame, tv: str = "phi") -> List[int]:
-    """Infer GAS lag set from parameter names, e.g. A_phi_364 → 364."""
-    pat  = re.compile(rf"^[AB]_{tv}_(\d+)$")
-    lags = {int(m.group(1)) for p in params_df.get("parameter", [])
-            if (m := pat.match(str(p)))}
-    return sorted(lags) if lags else [1, 2, 3]
+from pipeline.artifact_utils import (
+    infer_gas_lags as _infer_gas_lags,
+    infer_tv_from_params as _infer_tv_from_params,
+    build_model_from_meta as _build_model_from_meta,
+    get_theta as _get_theta,
+)
+# NOTE (2026-07-08): these four used to be defined locally in this file, with
+# a bug where model reconstruction checked meta["model_class"] -- a key no
+# model class actually saves (every one saves "model_type"). That silently
+# reconstructed every Harvey/CovZAGASModel artifact as a plain ZAGASModel
+# whenever the model_id fallback wasn't threaded through, producing wrong
+# IS PIT/ACF diagnostics for those winners without any error. Fixed and
+# consolidated into pipeline/artifact_utils.py (also used by Stage 4).
 
 
-def _infer_tv_from_params(params_df: pd.DataFrame) -> List[str]:
+def _patch_meta_for_reconstruction(meta: dict, params_df) -> dict:
     """
-    Infer which parameters are time-varying from estimated_parameters.csv.
+    Patch metadata for older/inconsistent artifact key names before it is
+    used to reconstruct a model or its OOS paths.
 
-    Falls back gracefully when metadata does not store tv_param_names.
-    Checks for omega_phi / A_phi_* (phi dynamic) and omega_xi / A_xi_* (xi dynamic).
+    Older code paths read "tv_param_names" / static scalars ("gamma",
+    "zeta", "xi") directly off meta, but current artifacts save these under
+    "tv_names" (metadata.json) and inside bound_diagnostics or
+    estimated_parameters.csv respectively. Without this patch,
+    _reconstruct_oos_paths silently falls back to the ["phi"]-only default,
+    dropping any TV "xi" column from f_arr_oos entirely -- which makes
+    dist.ppf() raise KeyError('xi') (caught and turned into NaN) for every
+    quantile level whose q exceeds the zero-mass threshold. Only q=0.50
+    partially survives because roughly half its evaluations fall below
+    zero-mass and short-circuit to 0.0 before ever needing 'xi'.
     """
-    if params_df is None or params_df.empty:
-        return ["phi"]
-    names: set = set()
-    if "parameter" in params_df.columns:
-        names = set(str(p) for p in params_df["parameter"])
-    tv: List[str] = []
-    if any(n.startswith("omega_phi") or n.startswith("A_phi_") for n in names):
-        tv.append("phi")
-    if any(n.startswith("omega_xi") or n.startswith("A_xi_") for n in names):
-        tv.append("xi")
-    return tv if tv else ["phi"]
-
-
-def _build_model_from_meta(meta: dict, params_df: pd.DataFrame):
-    """Reconstruct a model instance from metadata (for cdf_series calls)."""
-    from distributions.gb2_log_link import GB2LogLink
-    from distributions.gb2_phi_only import GB2LogLinkPhiOnly
-    from pi_dynamics.factory import make_pi_dynamics
-
-    tv = meta.get("tv_param_names", ["phi"])
-    dist = GB2LogLink() if len(tv) > 1 else GB2LogLinkPhiOnly()
-    pi_dyn = make_pi_dynamics("ar_logistic", seasonal="daily")
-
-    model_class = meta.get("model_class", "ZAGASModel")
-
-    if model_class in ("ZAGASModel", "RegimeZAGASModel"):
-        from models.za_gas_model import ZAGASModel
-        lags = _infer_gas_lags(params_df, tv[0]) if not params_df.empty else [1, 2, 3]
-        scaling_raw = meta.get("scaling", "diagonal_inverse_fisher")
-        scaling_map = {"diagfi": "diagonal_inverse_fisher", "fullfi": "inverse_fisher"}
-        scaling = scaling_map.get(scaling_raw, scaling_raw)
-        return ZAGASModel(
-            distribution=dist, pi_dynamics=pi_dyn,
-            seasonal="daily", gas_lags=lags, scaling=scaling,
+    if meta is None:
+        return meta
+    meta = dict(meta)
+    if not meta.get("tv_param_names"):
+        tv_from_artifact = meta.get("tv_names")
+        meta["tv_param_names"] = (
+            tv_from_artifact if tv_from_artifact
+            else _infer_tv_from_params(params_df)
         )
-
-    if "CovZAGASModel" in model_class or "stage2" in meta.get("model_id", ""):
-        from models.cov_gas_model import CovZAGASModel
-        lags    = _infer_gas_lags(params_df, tv[0]) if not params_df.empty else [1, 2, 3]
-        scaling_raw = meta.get("scaling", "diagonal_inverse_fisher")
-        scaling_map = {"diagfi": "diagonal_inverse_fisher", "fullfi": "inverse_fisher"}
-        scaling = scaling_map.get(scaling_raw, scaling_raw)
-        cov_names = meta.get("cov_names", [])
-        return CovZAGASModel(
-            distribution=dist, pi_dynamics=pi_dyn,
-            seasonal="daily", gas_lags=lags, scaling=scaling,
-            cov_names=cov_names,
-        )
-
-    if "HarveyZAGASModel" in model_class or "harvey" in meta.get("model_id", ""):
-        from models.harvey_gas import HarveyZAGASModel
-        long_names  = meta.get("long_names", [])
-        short_names = meta.get("short_names", [])
-        scaling_raw = meta.get("scaling", "diagonal_inverse_fisher")
-        scaling_map = {"diagfi": "diagonal_inverse_fisher", "fullfi": "inverse_fisher"}
-        scaling = scaling_map.get(scaling_raw, scaling_raw)
-        return HarveyZAGASModel(
-            distribution=dist, pi_dynamics=pi_dyn, seasonal="daily",
-            long_names=long_names, short_names=short_names, scaling=scaling,
-        )
-
-    # Fallback
-    from models.za_gas_model import ZAGASModel
-    return ZAGASModel(
-        distribution=dist, pi_dynamics=pi_dyn,
-        seasonal="daily", gas_lags=[1, 2, 3],
-    )
-
-
-def _get_theta(params_df: pd.DataFrame) -> Optional[np.ndarray]:
-    if params_df.empty:
-        return None
-    if "value" in params_df.columns:
-        return params_df["value"].to_numpy(dtype=float)
-    return None
+    bd = meta.get("bound_diagnostics", {})
+    for key in ("gamma", "zeta", "xi"):
+        if key not in meta:
+            bd_key = f"static_{key}"
+            if bd_key in bd:
+                meta[key] = float(bd[bd_key])
+    if params_df is not None and not params_df.empty:
+        if "parameter" in params_df.columns and "value" in params_df.columns:
+            for key in ("gamma", "zeta", "xi"):
+                if key not in meta:
+                    row = params_df[params_df["parameter"] == key]
+                    if not row.empty:
+                        meta[key] = float(row.iloc[0]["value"])
+    return meta
 
 
 def _reconstruct_oos_paths(paths_npz: dict, meta: dict) -> Optional[dict]:
@@ -479,6 +468,31 @@ def _plot_is_diagnostics(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Stage-directory resolution (2026-07-07 layout: stage1/2/3 = phi+xi branch,
+# stage2_phi/stage3_phi = phi-only branch, stage4_xi_regime = Stage 4).
+# Order matters: check the more specific phi-only/Stage-4 prefixes first, or
+# e.g. "stage3_phi_harvey_no_enso" would incorrectly match "stage3_" and
+# resolve to the phi+xi directory (a real bug in the pre-2026-07-07 version
+# of this function, which only knew about "stage3"/"stage2"/"stage1"/
+# "stage4_regime" and silently looked in the wrong directory for every
+# phi-only-branch and Stage-4 model).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_stage_dir(model_id: str) -> str:
+    if model_id.startswith("stage4_xi_regime"):
+        return "stage4_xi_regime"
+    if model_id.startswith("stage3_phi_harvey"):
+        return "stage3_phi"
+    if model_id.startswith("stage2_phi_"):
+        return "stage2_phi"
+    if model_id.startswith("stage3_"):
+        return "stage3"
+    if model_id.startswith("stage2_"):
+        return "stage2"
+    return "stage1"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-model extended metrics computation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -493,12 +507,7 @@ def _compute_extended_metrics_for_model(
 
     Returns dict of metrics or None if paths unavailable.
     """
-    # Determine stage
-    stage = "stage1"
-    for s in ("stage3", "stage4_regime", "stage2", "stage1"):
-        if model_id.startswith(s):
-            stage = s
-            break
+    stage = _resolve_stage_dir(model_id)
 
     meta      = _load_meta(run_dir, stage, model_id)
     params_df = _load_params_df(run_dir, stage, model_id)
@@ -507,31 +516,7 @@ def _compute_extended_metrics_for_model(
     if paths_npz is None:
         return None
 
-    # Patch metadata for older artifact format where key names differ
-    if meta is not None:
-        meta = dict(meta)
-        # 1. tv_param_names: stored as "tv_names" in current artifacts
-        if not meta.get("tv_param_names"):
-            tv_from_artifact = meta.get("tv_names")  # current format
-            meta["tv_param_names"] = (
-                tv_from_artifact if tv_from_artifact
-                else _infer_tv_from_params(params_df)
-            )
-        # 2. static params gamma/zeta: stored inside bound_diagnostics or in params_df
-        bd = meta.get("bound_diagnostics", {})
-        for key in ("gamma", "zeta", "xi"):
-            if key not in meta:
-                bd_key = f"static_{key}"
-                if bd_key in bd:
-                    meta[key] = float(bd[bd_key])
-        # 3. Fallback: read static params from estimated_parameters.csv
-        if params_df is not None and not params_df.empty:
-            if "parameter" in params_df.columns and "value" in params_df.columns:
-                for key in ("gamma", "zeta", "xi"):
-                    if key not in meta:
-                        row = params_df[params_df["parameter"] == key]
-                        if not row.empty:
-                            meta[key] = float(row.iloc[0]["value"])
+    meta = _patch_meta_for_reconstruction(meta, params_df)
 
     oos_paths = _reconstruct_oos_paths(paths_npz, meta)
     if oos_paths is None:
@@ -540,7 +525,7 @@ def _compute_extended_metrics_for_model(
     # Get model instance (cached)
     if model_id not in model_cache:
         try:
-            m = _build_model_from_meta(meta, params_df)
+            m = _build_model_from_meta(meta, params_df, model_id=model_id)
             model_cache[model_id] = m
         except Exception as exc:
             print(f"  [WARN] Could not reconstruct model {model_id}: {exc}")
@@ -565,21 +550,104 @@ def _compute_extended_metrics_for_model(
 # IS diagnostics for winner models
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _stage4_is_cdfs(model_id: str, run_dir: Path, data: dict, winners: dict) -> Optional[np.ndarray]:
+    """
+    IS CDF series for a Stage-4 RegimeXiOnlyModel winner.
+
+    RegimeXiOnlyModel has no cdf_series() (unlike the other model classes)
+    because its predictive distribution needs the frozen phi/pi trajectory
+    from its base model, which isn't recoverable from theta+y_train alone.
+    Reconstructs that frozen base exactly as run_all_locations.py::run_stage4
+    did at fit time, using only saved artifacts (stage_winners.json +
+    metadata.json) -- no re-optimization.
+    """
+    from run_all_locations import _stage_dir_for_model_id, _base_covariate_kwargs
+    from models.regime_gas import build_regime_xi_only_from_frozen_phi
+
+    s4_info = winners.get("stage4_xi_regime", {})
+    base_id = s4_info.get("base_model")
+    if not base_id:
+        return None
+    stage2_phi_id = winners.get("stage2_phi_only", {}).get("winner")
+    stage2_phi_stub = {"model_id": stage2_phi_id} if stage2_phi_id else None
+
+    y_train, y_test = data["y_train"], data["y_test"]
+    fit_kw, oos_kw = _base_covariate_kwargs({"model_id": base_id}, stage2_phi_stub, data)
+    base_dir = _stage_dir_for_model_id(run_dir, base_id)
+    bt, bv, cn = data["covariate_blocks_train"], data["covariate_blocks_test"], data["covariate_col_names"]
+
+    meta = _load_meta(run_dir, "stage4_xi_regime", model_id)
+    params_df = _load_params_df(run_dir, "stage4_xi_regime", model_id)
+    theta = _get_theta(params_df)
+    if theta is None or meta.get("threshold_quantile") is None:
+        return None
+
+    model, frozen = build_regime_xi_only_from_frozen_phi(
+        base_model_dir=base_dir, y_train=y_train, y_test=y_test,
+        xi_cov_train=bt["dewtemp_seasonal"], xi_cov_test=bv["dewtemp_seasonal"],
+        xi_cov_names=cn["dewtemp_seasonal"],
+        threshold_quantile=meta["threshold_quantile"],
+        base_extra_fit_kwargs=fit_kw, base_extra_oos_kwargs=oos_kw,
+    )
+    model._threshold_c = meta.get("threshold_c")  # skip fit()'s recompute; use the saved value
+    paths = model.filter(
+        theta, y_train, frozen["phi_full"], frozen["pi_full"],
+        frozen["X_train"], frozen["gamma_v"], frozen["zeta_v"], frozen["warmup"],
+    )
+    if not paths:
+        return None
+
+    eff = paths["eff_start"]
+    n = len(paths["xi"])
+    cdfs = np.zeros(n)
+    for i in range(n):
+        t = eff + i
+        phi_t, xi_t = paths["phi"][i], paths["xi"][i]
+        pi_t = paths["pi"][i]
+        if y_train[t] <= 0:
+            cdfs[i] = 1.0 - pi_t
+        else:
+            G_t = model.dist.cdf(y_train[t], phi=phi_t, xi=xi_t,
+                                  gamma=frozen["gamma_v"], zeta=frozen["zeta_v"])
+            cdfs[i] = (1.0 - pi_t) + pi_t * G_t
+    return cdfs
+
+
 def _compute_is_diagnostics_for_winner(
     model_id: str,
     run_dir: Path,
     data: dict,
     col_name_dict: dict,
     fig_dir: Path,
+    winners: Optional[dict] = None,
 ) -> Optional[dict]:
     """
     Compute IS PIT / QR for a winner model.  Returns dict with pit, qr, paths.
     """
-    stage = "stage1"
-    for s in ("stage3", "stage4_regime", "stage2", "stage1"):
-        if model_id.startswith(s):
-            stage = s
-            break
+    if model_id.startswith("stage4_xi_regime"):
+        try:
+            cdfs = _stage4_is_cdfs(model_id, run_dir, data, winners or {})
+        except Exception as exc:
+            print(f"  [WARN] Stage-4 IS cdf_series failed for {model_id}: {exc}")
+            return None
+        if cdfs is None or len(cdfs) == 0:
+            return None
+        y_train = data["y_train"]
+        rng = np.random.default_rng(0)
+        n = len(cdfs)
+        y_eff = y_train[len(y_train) - n:]
+        pit = pit_values(cdfs, y_eff, randomise_zeros=True, rng=rng)
+        qr = quantile_residuals(cdfs, y_eff, randomise_zeros=True, rng=rng)
+        pit_path, qq_path, acf_path = _plot_is_diagnostics(
+            model_id=model_id, pit=pit, qr=qr, fig_dir=fig_dir
+        )
+        return {
+            "pit": pit, "qr": qr,
+            "pit_mean": float(np.nanmean(pit)), "pit_std": float(np.nanstd(pit)),
+            "pit_path": pit_path, "qq_path": qq_path, "acf_path": acf_path,
+        }
+
+    stage = _resolve_stage_dir(model_id)
 
     meta      = _load_meta(run_dir, stage, model_id)
     params_df = _load_params_df(run_dir, stage, model_id)
@@ -593,8 +661,8 @@ def _compute_is_diagnostics_for_winner(
     cn      = data["covariate_col_names"]
 
     try:
-        model = _build_model_from_meta(meta, params_df)
-        model_class = meta.get("model_class", "ZAGASModel")
+        model = _build_model_from_meta(meta, params_df, model_id=model_id)
+        model_class = meta.get("model_type", "ZAGASModel")
 
         if "Harvey" in model_class or "harvey" in model_id:
             long_names  = meta.get("long_names", [])
@@ -657,6 +725,131 @@ def _find_block_arr(
 # Table builders
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _stage_decision_table_tex(
+    run_dir: Path, stage: str, model_ids: List[str], winner_id: Optional[str],
+    tvp_set: str, n_train: int, data: dict, model_cache: dict,
+    caption: str, label: str,
+) -> str:
+    """
+    One table per stage: every candidate model (not just the winner) with
+    its key decision metric(s) and AIC, winner row bolded. Nothing here
+    requires re-fitting -- loglik/n_params/lags come from metadata.json,
+    RMSE/MAE from metrics_core.json, and twCRPS is recomputed from the
+    already-saved paths.npz (Monte Carlo draws from the already-fit
+    predictive distribution, not re-optimization).
+
+    tvp_set="phi_only" -> key metrics are OOS RMSE, MAD (objective 1a/4b).
+    tvp_set="phi_xi"   -> key metrics are OOS CRPS, twCRPS@95, twCRPS@98
+                          (objective 1b/4c; "the main criterion" is CRPS).
+    """
+    from diagnostics.information import info_table
+
+    if not model_ids:
+        return f"% No models found for {stage}\n"
+
+    rows = []
+    for mid in model_ids:
+        meta = _load_meta(run_dir, stage, mid)
+        loglik, n_params = meta.get("loglik"), meta.get("n_params")
+        if loglik is None or n_params is None or not np.isfinite(float(loglik)):
+            continue
+        lags = meta.get("lags") or []
+        n_obs = n_train - (max(lags) + 1) if lags else n_train
+        info = info_table(float(loglik), int(n_params), max(int(n_obs), 1))
+        row = {"model": mid, "validity": meta.get("validity", "?"), **info}
+
+        if tvp_set == "phi_only":
+            mcore = _load_json_safe(run_dir / stage / mid / "metrics_core.json") \
+                if (run_dir / stage / mid / "metrics_core.json").exists() else {}
+            row["rmse"] = mcore.get("rmse")
+            row["mad"]  = mcore.get("mae")  # MAE == MAD of the forecast errors
+        else:
+            ext = _compute_extended_metrics_for_model(mid, run_dir, data, model_cache)
+            row["crps"]  = ext.get("crps_mean") if ext else None
+            row["tw95"]  = ext.get("twcrps_95") if ext else None
+            row["tw98"]  = ext.get("twcrps_98") if ext else None
+        rows.append(row)
+
+    if not rows:
+        return f"% No valid models for {stage}\n"
+
+    if tvp_set == "phi_only":
+        headers = r"\small Model & Validity & $k$ & loglik & AIC & RMSE & MAD \\"
+        col_fmt = "llrrrrr"
+        def _row(r):
+            return (f"{_fmt(r['n_params'],0)} & {_fmt(r['loglik'],1)} & {_fmt(r['aic'],1)} & "
+                    f"{_fmt(r['rmse'])} & {_fmt(r['mad'])}")
+    else:
+        headers = r"\small Model & Validity & $k$ & loglik & AIC & CRPS & twCRPS@95 & twCRPS@98 \\"
+        col_fmt = "llrrrrrr"
+        def _row(r):
+            return (f"{_fmt(r['n_params'],0)} & {_fmt(r['loglik'],1)} & {_fmt(r['aic'],1)} & "
+                    f"{_fmt(r['crps'])} & {_fmt(r['tw95'])} & {_fmt(r['tw98'])}")
+
+    body = []
+    for r in rows:
+        model_cell = r"\texttt{" + _tex(r["model"]) + "}"
+        if r["model"] == winner_id:
+            model_cell = r"\textbf{" + model_cell + " *}"
+        body.append(f"{model_cell} & {_tex(r['validity'])} & {_row(r)} \\\\")
+
+    return (
+        r"\begin{table}[ht]" + "\n\\centering\n\\footnotesize\n"
+        r"\resizebox{\ifdim\width>\textwidth\textwidth\else\width\fi}{!}{%" + "\n"
+        rf"\begin{{tabular}}{{{col_fmt}}}" + "\n\\hline\n"
+        + headers + "\n\\hline\n" + "\n".join(body) + "\n\\hline\n"
+        r"\end{tabular}" + "\n}" + "\n"
+        rf"\caption{{{caption} Winner marked with \textbf{{*}}.}}" + "\n"
+        rf"\label{{{label}}}" + "\n"
+        r"\end{table}" + "\n"
+    )
+
+
+def _inter_stage_progression_table_tex(
+    stage_winner_infos: List[Tuple[str, dict]], tvp_set: str,
+    caption: str, label: str,
+) -> str:
+    """
+    Objective (user, 2026-07-08): AIC + key decision metric for the WINNER
+    of each stage, side by side across stages, so added model complexity
+    can be checked against actual improvement (a parsimony/overfitting
+    sanity check, not needed for winner selection itself -- that already
+    happened via pipeline.selection -- but useful supporting evidence).
+
+    stage_winner_infos: list of (stage_label, meta_dict) for each stage's
+    winner, meta_dict must have loglik/n_params/aic and the relevant OOS
+    key metric(s) already merged in by the caller.
+    """
+    if not stage_winner_infos:
+        return f"% No stage winners for {label}\n"
+
+    if tvp_set == "phi_only":
+        headers = r"\small Stage & Model & $k$ & AIC & RMSE \\"
+        col_fmt = "llrrr"
+        def _row(m):
+            return f"{_fmt(m.get('n_params'),0)} & {_fmt(m.get('aic'),1)} & {_fmt(m.get('rmse'))}"
+    else:
+        headers = r"\small Stage & Model & $k$ & AIC & CRPS \\"
+        col_fmt = "llrrr"
+        def _row(m):
+            return f"{_fmt(m.get('n_params'),0)} & {_fmt(m.get('aic'),1)} & {_fmt(m.get('crps_mean'))}"
+
+    body = [
+        f"{_tex(stage_lbl)} & \\texttt{{{_tex(m.get('model',''))}}} & {_row(m)} \\\\"
+        for stage_lbl, m in stage_winner_infos
+    ]
+    return (
+        r"\begin{table}[ht]" + "\n\\centering\n\\footnotesize\n"
+        r"\resizebox{\ifdim\width>\textwidth\textwidth\else\width\fi}{!}{%" + "\n"
+        rf"\begin{{tabular}}{{{col_fmt}}}" + "\n\\hline\n"
+        + headers + "\n\\hline\n" + "\n".join(body) + "\n\\hline\n"
+        r"\end{tabular}" + "\n}" + "\n"
+        rf"\caption{{{caption}}}" + "\n"
+        rf"\label{{{label}}}" + "\n"
+        r"\end{table}" + "\n"
+    )
+
+
 def _stage_comparison_table_tex(
     run_dir: Path, stage: str,
     winners: dict, caption: str, label: str,
@@ -701,13 +894,14 @@ def _stage_comparison_table_tex(
         r"\begin{table}[ht]" + "\n"
         r"\centering" + "\n"
         r"\footnotesize" + "\n"
+        r"\resizebox{\ifdim\width>\textwidth\textwidth\else\width\fi}{!}{%" + "\n"
         r"\begin{tabular}{lllrrrr}" + "\n"
         r"\hline" + "\n"
         + cols_hdr + r" \\" + "\n"
         r"\hline" + "\n"
         + "\n".join(body_lines) + "\n"
         r"\hline" + "\n"
-        r"\end{tabular}" + "\n"
+        r"\end{tabular}" + "\n}" + "\n"
         rf"\caption{{{caption}}}" + "\n"
         rf"\label{{{label}}}" + "\n"
         r"\end{table}" + "\n"
@@ -766,29 +960,51 @@ def _extended_metrics_table_tex(
         r"\begin{table}[ht]" + "\n"
         r"\centering" + "\n"
         r"\footnotesize" + "\n"
+        r"\resizebox{\ifdim\width>\textwidth\textwidth\else\width\fi}{!}{%" + "\n"
         rf"\begin{{tabular}}{{{col_fmt}}}" + "\n"
         r"\hline" + "\n"
         + headers + "\n"
         r"\hline" + "\n"
         + "\n".join(body_lines) + "\n"
         r"\hline" + "\n"
-        r"\end{tabular}" + "\n"
+        r"\end{tabular}" + "\n}" + "\n"
         rf"\caption{{{caption}}}" + "\n"
         rf"\label{{{label}}}" + "\n"
         r"\end{table}" + "\n"
     )
 
 
+def _load_params_with_se(run_dir: Path, stage: str, model_id: str) -> pd.DataFrame:
+    """
+    estimated_parameters.csv (value) merged with standard_errors.csv
+    (std_error, se_quality) when the latter exists -- both are already
+    saved by every model's save_result(), no re-fitting needed. Per
+    prompt.md: standard errors belong in the appendix and were missing
+    from round 1's report despite already being on disk.
+    """
+    params_df = _load_params_df(run_dir, stage, model_id)
+    if params_df.empty:
+        return params_df
+    se_path = run_dir / stage / model_id / "standard_errors.csv"
+    if se_path.exists():
+        se_df = pd.read_csv(se_path)
+        params_df = params_df.merge(
+            se_df[["parameter", "std_error", "se_quality"]], on="parameter", how="left"
+        )
+    return params_df
+
+
 def _params_table_tex(params_df: pd.DataFrame, caption: str, label: str) -> str:
-    """LaTeX parameter table with value and standard error."""
+    """LaTeX parameter table with value, standard error, and SE quality."""
     if params_df.empty:
         return "% No parameters\n"
-    cols = [c for c in ["parameter", "value", "std_error"] if c in params_df.columns]
+    cols = [c for c in ["parameter", "value", "std_error", "se_quality"] if c in params_df.columns]
     if not cols:
         return "% No expected columns\n"
 
+    text_cols = {"parameter", "se_quality"}
     n_cols  = len(cols)
-    col_fmt = "l" + "r" * (n_cols - 1)
+    col_fmt = "".join("l" if c in text_cols else "r" for c in cols)
     headers = " & ".join(r"\small " + _tex(c) for c in cols) + r" \\"
     rows = []
     for _, row in params_df.iterrows():
@@ -797,6 +1013,8 @@ def _params_table_tex(params_df: pd.DataFrame, caption: str, label: str) -> str:
             v = row.get(c)
             if c == "parameter":
                 cells.append(r"\texttt{" + _tex(str(v)) + "}")
+            elif c == "se_quality":
+                cells.append(_tex(str(v)) if pd.notna(v) else "--")
             else:
                 cells.append(_fmt(v))
         rows.append(" & ".join(cells) + r" \\")
@@ -805,13 +1023,72 @@ def _params_table_tex(params_df: pd.DataFrame, caption: str, label: str) -> str:
         r"\begin{table}[ht]" + "\n"
         r"\centering" + "\n"
         r"\footnotesize" + "\n"
+        r"\resizebox{\ifdim\width>\textwidth\textwidth\else\width\fi}{!}{%" + "\n"
         rf"\begin{{tabular}}{{{col_fmt}}}" + "\n"
         r"\hline" + "\n"
         + headers + "\n"
         r"\hline" + "\n"
         + "\n".join(rows) + "\n"
         r"\hline" + "\n"
-        r"\end{tabular}" + "\n"
+        r"\end{tabular}" + "\n}" + "\n"
+        rf"\caption{{{caption}}}" + "\n"
+        rf"\label{{{label}}}" + "\n"
+        r"\end{table}" + "\n"
+    )
+
+
+def _exceedance_summary_table_tex(
+    quantile_levels: Sequence[float],
+    overall: dict,
+    wet: Optional[dict],
+    dry: Optional[dict],
+    enso_regimes: Optional[dict],
+    caption: str,
+    label: str,
+) -> str:
+    """
+    Objective 4f: empirical vs. theoretical exceedance frequency at each
+    quantile level, broken down overall / wet / dry / by ENSO regime, in one
+    compact table (monthly breakdown stays a figure -- 12 more columns would
+    not fit). All inputs are metric dicts already computed by
+    diagnostics.decomposition._group_metrics / dynamics.compute_exceedance_
+    frequencies (key format "exceed_emp_XXXXX") -- no recomputation.
+
+    Replaces the previous wet/dry table, which called
+    _extended_metrics_table_tex(cols_group="rmse") on data that has no rmse/
+    mad keys at all, silently degrading to a single model_id column.
+    """
+    groups = [("Overall", overall)]
+    if wet is not None and wet.get("n", 0) > 0:
+        groups.append(("Wet", wet))
+    if dry is not None and dry.get("n", 0) > 0:
+        groups.append(("Dry", dry))
+    if enso_regimes:
+        for label_r, mets in enso_regimes.items():
+            if mets and mets.get("n", 0) > 0:
+                groups.append((label_r, mets))
+
+    if len(groups) <= 1:
+        return "% Insufficient groups for exceedance summary\n"
+
+    headers = (r"\small $q$ & \small Theoretical & "
+               + " & ".join(rf"\small {_tex(g)} (emp.)" for g, _ in groups) + r" \\")
+    body = []
+    for q in quantile_levels:
+        key = f"exceed_emp_{int(q*10000):05d}"
+        theo = 1.0 - q
+        cells = [f"q{q*100:g}", _fmt(theo, 3)]
+        for _, mets in groups:
+            cells.append(_fmt(mets.get(key), 3))
+        body.append(" & ".join(cells) + r" \\")
+
+    col_fmt = "l" + "r" * (len(groups) + 1)
+    return (
+        r"\begin{table}[ht]" + "\n\\centering\n\\footnotesize\n"
+        r"\resizebox{\ifdim\width>\textwidth\textwidth\else\width\fi}{!}{%" + "\n"
+        rf"\begin{{tabular}}{{{col_fmt}}}" + "\n\\hline\n"
+        + headers + "\n\\hline\n" + "\n".join(body) + "\n\\hline\n"
+        r"\end{tabular}" + "\n}" + "\n"
         rf"\caption{{{caption}}}" + "\n"
         rf"\label{{{label}}}" + "\n"
         r"\end{table}" + "\n"
@@ -891,108 +1168,255 @@ def generate_location_section(
             rf"Wet months: {', '.join(wet_names)}. Dry months: {', '.join(dry_names)}." + "\n\n"
         )
 
-    # ── Stage 1 ───────────────────────────────────────────────────────────
-    tex_parts.append(r"\subsection{Stage 1 -- Baseline GAS}" + "\n")
-    tex_parts.append(_stage_comparison_table_tex(
-        run_dir, "stage1", winners,
-        caption=f"{display} -- Stage 1 model comparison (all 12 specifications, OOS metrics).",
-        label=f"tab:{station_short}_s1",
-    ))
+    # ── Stages 1-3, both branches: one decision table per stage, all models,
+    # key metric + AIC, winner bolded (2026-07-08 user instruction) ────────
+    n_train = data["summary"]["n_train"]
 
-    # ── Stage 2 ───────────────────────────────────────────────────────────
-    tex_parts.append(r"\subsection{Stage 2 -- Weather Covariates}" + "\n")
-    tex_parts.append(_stage_comparison_table_tex(
-        run_dir, "stage2", winners,
-        caption=f"{display} -- Stage 2 model comparison (weather covariates).",
-        label=f"tab:{station_short}_s2",
-    ))
+    def _candidates_for(stage_dir: str, prefix_filter=None) -> List[dict]:
+        """Rebuild lightweight candidate dicts from cached artifacts only
+        (metadata.json + metrics_core.json) -- no re-fitting -- suitable for
+        pipeline.selection (re-deriving the winner + its tie-break reason is
+        cheap arithmetic over already-saved numbers, not re-optimization)."""
+        ids = _all_model_ids(run_dir, stage_dir)
+        if prefix_filter:
+            ids = [m for m in ids if prefix_filter(m)]
+        out = []
+        for mid in ids:
+            meta = _load_meta(run_dir, stage_dir, mid)
+            mcore_p = run_dir / stage_dir / mid / "metrics_core.json"
+            mcore = _load_json_safe(mcore_p) if mcore_p.exists() else {}
+            out.append({
+                "model_id": mid, "validity": meta.get("validity", "failed"),
+                "loglik": meta.get("loglik"), "n_params": meta.get("n_params", 0),
+                "oos_metrics": mcore,
+            })
+        return out
 
-    # Stage advancement decision
-    fw_info = winners.get("final_winner", {})
-    s1_crps = fw_info.get("crps_s1", float("nan"))
-    s2_crps = fw_info.get("crps_s2", float("nan"))
-    s3_crps = fw_info.get("crps_s3", float("nan"))
-    # Treat astronomically large CRPS (Stage 2/3 divergence) as not-accepted
-    _s2_valid = np.isfinite(s2_crps) and abs(s2_crps) < 1e6
-    _s3_valid = np.isfinite(s3_crps) and abs(s3_crps) < 1e6
-    if np.isfinite(s1_crps) and _s2_valid:
-        impr = (s1_crps - s2_crps) / max(abs(s1_crps), 1e-12)
-        decision = "accepted" if impr >= 0.02 else "not accepted"
-        tex_parts.append(
-            rf"Stage 2 {decision} (CRPS improvement: {impr:.2%}, threshold 2\%)." + "\n\n"
+    def _stage_block(branch_label: str, tvp_set: str, stage_dir: str,
+                      subsection: str, model_ids: List[str], candidates: List[dict],
+                      station_tag: str, winners_key: str):
+        # Explain the ACTUAL saved winner (stage_winners.json, decided live
+        # during pipeline execution) rather than independently re-selecting
+        # one -- re-selection can disagree with what really happened if
+        # `candidates` isn't in the exact order the live run saw (ties
+        # broken by iteration order). See pipeline.selection.explain_winner.
+        from pipeline.selection import explain_winner
+        key_metric = "rmse" if tvp_set == "phi_only" else "crps_mean"
+        actual_winner_id = winners.get(winners_key, {}).get("winner")
+        winner = (
+            explain_winner(candidates, actual_winner_id, key_metric,
+                            higher_better=False, improvement_threshold=IMPROVEMENT_THRESHOLD)
+            if actual_winner_id else None
         )
-    elif np.isfinite(s2_crps) and not _s2_valid:
-        tex_parts.append(
-            r"Stage 2 not accepted (all Stage~2 models diverged; "
-            r"best OOS CRPS numerically degenerate)." + "\n\n"
-        )
-    elif not np.isfinite(s2_crps):
-        tex_parts.append(
-            r"Stage 2 not accepted (OOS CRPS is undefined --- "
-            r"all Stage~2 models produced NaN OOS CRPS, "
-            r"likely due to full inverse Fisher scaling instability)." + "\n\n"
-        )
-
-    # ── Stage 3 ───────────────────────────────────────────────────────────
-    tex_parts.append(r"\subsection{Stage 3 -- Harvey Long-Short}" + "\n")
-    tex_parts.append(_stage_comparison_table_tex(
-        run_dir, "stage3", winners,
-        caption=f"{display} -- Stage 3 Harvey long-short model comparison.",
-        label=f"tab:{station_short}_s3",
-    ))
-
-    # Stage 3 advancement decision — base is Stage 2 if accepted, else Stage 1
-    _s2_accepted = (
-        np.isfinite(s1_crps) and _s2_valid and s2_crps < 0.98 * s1_crps
-    )
-    if _s3_valid:
-        if _s2_accepted:
-            base3_crps, base3_lbl = s2_crps, "Stage~2"
-        elif np.isfinite(s1_crps):
-            base3_crps, base3_lbl = s1_crps, "Stage~1"
-        else:
-            base3_crps, base3_lbl = None, None
-        if base3_crps is not None:
-            impr3 = (base3_crps - s3_crps) / max(abs(base3_crps), 1e-12)
-            dec3  = "accepted" if impr3 >= 0.02 else "not accepted"
+        tex_parts.append(rf"\subsubsection{{{subsection}}}" + "\n")
+        tex_parts.append(_stage_decision_table_tex(
+            run_dir, stage_dir, model_ids, winner["model_id"] if winner else None,
+            tvp_set, n_train, data, model_cache,
+            caption=f"{display} ({branch_label}) -- {subsection}.",
+            label=f"tab:{station_tag}",
+        ))
+        if winner:
             tex_parts.append(
-                rf"Stage 3 {dec3} (CRPS improvement over {base3_lbl}: {impr3:.2%}, threshold 2\%)." + "\n\n"
+                rf"\textbf{{Winner}}: \texttt{{{_tex(winner['model_id'])}}} -- "
+                + _tex(winner.get("_tie_break", "")) + "." + "\n\n"
             )
-    elif not np.isfinite(s3_crps):
-        tex_parts.append(
-            r"Stage 3 not accepted (OOS CRPS is undefined --- "
-            r"Harvey long-short models produced NaN OOS CRPS)." + "\n\n"
-        )
-    elif not _s3_valid:
-        tex_parts.append(
-            r"Stage 3 not accepted (all Stage~3 Harvey models diverged; "
-            r"best OOS CRPS numerically degenerate)." + "\n\n"
-        )
+            # Lean image set (objective 4e, scoped per user 2026-07-08: PIT +
+            # 400-lag ACF only, one set per stage winner -- 3 phi-only + 4
+            # phi+xi(+Stage 4) = 7 sets per location, not per candidate model).
+            is_diag = _compute_is_diagnostics_for_winner(
+                model_id=winner["model_id"], run_dir=run_dir, data=data,
+                col_name_dict=data["covariate_col_names"], fig_dir=fig_dir,
+                winners=winners,
+            )
+            if is_diag:
+                pit_rel = os.path.relpath(is_diag["pit_path"], fig_dir.parent.parent).replace("\\", "/")
+                acf_rel = os.path.relpath(is_diag["acf_path"], fig_dir.parent.parent).replace("\\", "/")
+                tex_parts.append(
+                    f"PIT mean = {is_diag['pit_mean']:.3f} (ideal 0.5), "
+                    f"std = {is_diag['pit_std']:.3f} (ideal {1/12**0.5:.3f})." + "\n\n"
+                )
+                tex_parts.append(_fig_tex(
+                    pit_rel, f"{display} ({branch_label}, {subsection}): IS PIT histogram.",
+                    f"fig:{station_tag}_pit", width="0.55",
+                ))
+                tex_parts.append(_fig_tex(
+                    acf_rel, f"{display} ({branch_label}, {subsection}): IS quantile-residual ACF (400 lags).",
+                    f"fig:{station_tag}_acf", width="0.75",
+                ))
+        return winner
+
+    IMPROVEMENT_THRESHOLD = 0.02
+
+    # -- Phi-only branch (objective 1a: ranked by OOS RMSE throughout) ------
+    tex_parts.append(r"\subsection{Phi-only branch (ranked by OOS RMSE)}" + "\n")
+    w1_phi = _stage_block(
+        "phi-only", "phi_only", "stage1", "Stage 1 -- Baseline GAS",
+        [m for m in _all_model_ids(run_dir, "stage1") if "stage1_phi_" in m and "phixi" not in m],
+        _candidates_for("stage1", lambda m: "stage1_phi_" in m and "phixi" not in m),
+        f"{station_short}_s1_phi", "stage1_phi_only",
+    )
+    w2_phi = _stage_block(
+        "phi-only", "phi_only", "stage2_phi", "Stage 2 -- Weather Covariates",
+        _all_model_ids(run_dir, "stage2_phi"), _candidates_for("stage2_phi"),
+        f"{station_short}_s2_phi", "stage2_phi_only",
+    )
+    w3_phi = _stage_block(
+        "phi-only", "phi_only", "stage3_phi", "Stage 3 -- Harvey Long-Short",
+        _all_model_ids(run_dir, "stage3_phi"), _candidates_for("stage3_phi"),
+        f"{station_short}_s3_phi", "stage3_phi_only",
+    )
+    phi_progression = [
+        (lbl, {**w["oos_metrics"], "model": w["model_id"], "n_params": w["n_params"],
+               "aic": w["oos_metrics"].get("aic")})
+        for lbl, w in (("Stage 1", w1_phi), ("Stage 2", w2_phi), ("Stage 3", w3_phi)) if w
+    ]
+    # AIC isn't in oos_metrics; compute it directly for the progression table.
+    from diagnostics.information import aic as _aic_fn
+    for lbl, w in (("Stage 1", w1_phi), ("Stage 2", w2_phi), ("Stage 3", w3_phi)):
+        if w and w.get("loglik") is not None:
+            entry = next((e for l, e in phi_progression if l == lbl), None)
+            if entry is not None:
+                entry["aic"] = _aic_fn(float(w["loglik"]), int(w.get("n_params", 0)))
+    tex_parts.append(_inter_stage_progression_table_tex(
+        phi_progression, "phi_only",
+        caption=f"{display}: phi-only branch -- AIC and OOS RMSE across stage winners.",
+        label=f"tab:{station_short}_prog_phi",
+    ))
+
+    # -- Phi+xi branch (objective 1b: ranked by OOS CRPS throughout) --------
+    tex_parts.append(r"\subsection{Phi+xi branch (ranked by OOS CRPS)}" + "\n")
+    w1_xi = _stage_block(
+        "phi+xi", "phi_xi", "stage1", "Stage 1 -- Baseline GAS",
+        [m for m in _all_model_ids(run_dir, "stage1") if "phixi" in m],
+        _candidates_for("stage1", lambda m: "phixi" in m),
+        f"{station_short}_s1_xi", "stage1",
+    )
+    w2_xi = _stage_block(
+        "phi+xi", "phi_xi", "stage2", "Stage 2 -- Weather Covariates",
+        _all_model_ids(run_dir, "stage2"), _candidates_for("stage2"),
+        f"{station_short}_s2_xi", "stage2",
+    )
+    w3_xi = _stage_block(
+        "phi+xi", "phi_xi", "stage3", "Stage 3 -- Harvey Long-Short",
+        _all_model_ids(run_dir, "stage3"), _candidates_for("stage3"),
+        f"{station_short}_s3_xi", "stage3",
+    )
+    xi_progression = []
+    for lbl, w in (("Stage 1", w1_xi), ("Stage 2", w2_xi), ("Stage 3", w3_xi)):
+        if not w:
+            continue
+        entry = {"model": w["model_id"], "n_params": w["n_params"], **w["oos_metrics"]}
+        if w.get("loglik") is not None:
+            entry["aic"] = _aic_fn(float(w["loglik"]), int(w.get("n_params", 0)))
+        xi_progression.append((lbl, entry))
+    tex_parts.append(_inter_stage_progression_table_tex(
+        xi_progression, "phi_xi",
+        caption=f"{display}: phi+xi branch -- AIC and OOS CRPS across stage winners.",
+        label=f"tab:{station_short}_prog_xi",
+    ))
+
+    fw_info = winners.get("final_winner_phi_xi", {})
 
     # ── Final winner extended diagnostics ─────────────────────────────────
+    # NOTE: the deep diagnostic machinery below (IS PIT/ACF, extended OOS
+    # metrics, dynamic quantiles, return levels, seasonal/ENSO/wet-dry
+    # decomposition) currently runs once, for the phi+xi branch's final
+    # winner only. Objective 4e/4f ask for this for BOTH tvp-set winners;
+    # duplicating this ~350-line block for the phi-only branch is tracked as
+    # remaining work (see ROADMAP.md) rather than attempted as part of the
+    # 2026-07-07 pipeline-correctness pass. The phi-only branch's winner and
+    # its own OOS RMSE/MAD are still reported via the Stage 1-3 comparison
+    # tables and the global comparison chapter above.
+    fphi_info = winners.get("final_winner_phi_only", {})
+    if fphi_info.get("model_id"):
+        tex_parts.append(
+            rf"\textbf{{Phi-only branch final winner}} (objective 1a, ranked "
+            rf"by OOS RMSE): \texttt{{{_tex(fphi_info['model_id'])}}} "
+            rf"(OOS RMSE = {_fmt(fphi_info.get('rmse'))}). This is also the "
+            r"model whose $\phi$ dynamics are frozen for Stage 4 below." + "\n\n"
+        )
+
+    # ── Does adding xi help? phi-only vs phi+xi by CRPS/twCRPS ─────────────
+    # User request (2026-07-08): compare the two branches' final winners on
+    # the metrics that actually matter for distributional/tail performance,
+    # not just each branch's own ranking metric. Both models are already
+    # fitted; twCRPS/CRPS are recomputed from each one's saved OOS
+    # simulation paths (Monte Carlo draws from the already-fit predictive
+    # distribution) -- no re-optimization.
+    if fphi_info.get("model_id") and fw_info.get("model_id"):
+        phi_ext = _compute_extended_metrics_for_model(
+            fphi_info["model_id"], run_dir, data, model_cache
+        )
+        xi_ext = _compute_extended_metrics_for_model(
+            fw_info["model_id"], run_dir, data, model_cache
+        )
+        if phi_ext and xi_ext:
+            tex_parts.append(r"\subsection{Does Adding xi Help? Phi-only vs.\ Phi+xi}" + "\n")
+            tex_parts.append(
+                r"Both branches' final winners compared on CRPS and twCRPS@95/98 -- "
+                r"the phi-only winner is not re-fit, this is a diagnostic recomputation "
+                r"from its existing OOS simulation paths, exactly as for any other model "
+                r"in this report." + "\n\n"
+            )
+            rows = [
+                {"model_id": f"phi-only: {fphi_info['model_id']}",
+                 "crps_mean": phi_ext.get("crps_mean"),
+                 "twcrps_95": phi_ext.get("twcrps_95"),
+                 "twcrps_98": phi_ext.get("twcrps_98")},
+                {"model_id": f"phi+xi: {fw_info['model_id']}",
+                 "crps_mean": xi_ext.get("crps_mean"),
+                 "twcrps_95": xi_ext.get("twcrps_95"),
+                 "twcrps_98": xi_ext.get("twcrps_98")},
+            ]
+            pd.DataFrame(rows).to_csv(
+                csv_dir / f"{station_short}_phi_vs_phixi_crps.csv", index=False
+            )
+            headers = r"\small Model & CRPS & twCRPS@95 & twCRPS@98 \\"
+            body = " \\\\\n".join(
+                r"\texttt{" + _tex(r["model_id"]) + "} & "
+                + f"{_fmt(r['crps_mean'])} & {_fmt(r['twcrps_95'])} & {_fmt(r['twcrps_98'])}"
+                for r in rows
+            ) + r" \\"
+            tex_parts.append(
+                r"\begin{table}[ht]" + "\n\\centering\n\\footnotesize\n"
+                r"\begin{tabular}{lrrr}" + "\n\\hline\n"
+                + headers + "\n\\hline\n" + body + "\n\\hline\n"
+                r"\end{tabular}" + "\n"
+                rf"\caption{{{display}: phi-only vs.\ phi+xi final winners, CRPS and twCRPS.}}"
+                + "\n"
+                rf"\label{{tab:{station_short}_phi_vs_phixi}}" + "\n"
+                r"\end{table}" + "\n"
+            )
+            c_phi, c_xi = phi_ext.get("crps_mean"), xi_ext.get("crps_mean")
+            if c_phi is not None and c_xi is not None and np.isfinite(c_phi) and np.isfinite(c_xi):
+                impr = (c_phi - c_xi) / max(abs(c_phi), 1e-12)
+                verdict = (
+                    rf"adding $\xi$ improves CRPS by {impr:.1%}"
+                    if impr > 0 else
+                    rf"the phi-only model has {-impr:.1%} \emph{{lower}} (better) CRPS"
+                )
+                tex_parts.append(
+                    rf"CRPS: phi-only = {_fmt(c_phi)}, phi+xi = {_fmt(c_xi)} -- {verdict}."
+                    + "\n\n"
+                )
+            # Propagate to the global cross-location comparison chapter --
+            # already computed above, no recomputation needed there.
+            _section_meta["phi_crps"]      = phi_ext.get("crps_mean")
+            _section_meta["phi_twcrps_95"] = phi_ext.get("twcrps_95")
+            _section_meta["phi_twcrps_98"] = phi_ext.get("twcrps_98")
+            _section_meta["phixi_crps"]      = xi_ext.get("crps_mean")
+            _section_meta["phixi_twcrps_95"] = xi_ext.get("twcrps_95")
+            _section_meta["phixi_twcrps_98"] = xi_ext.get("twcrps_98")
+
     ext_mets = None   # will be set below; used by Stage 4 tail comparison
     final_mid = fw_info.get("model_id")
     if final_mid:
-        tex_parts.append(r"\subsection{Final Model Diagnostics}" + "\n")
+        tex_parts.append(r"\subsection{Final Model Diagnostics (phi+xi branch)}" + "\n")
         tex_parts.append(
-            rf"The final selected model is \texttt{{{_tex(final_mid)}}} "
-            rf"(OOS CRPS = {_fmt(fw_info.get('crps'))})." + "\n\n"
+            rf"The phi+xi branch's final selected model is "
+            rf"\texttt{{{_tex(final_mid)}}} "
+            rf"(OOS CRPS = {_fmt(fw_info.get('crps_mean'))})." + "\n\n"
         )
-        # If the loglik winner had NaN CRPS (fullfi instability), explain this
-        num_note = fw_info.get("numerical_note")
-        if num_note:
-            lw_id = fw_info.get("loglik_winner_id", "")
-            tex_parts.append(
-                r"\textbf{Numerical note:} "
-                r"The model selected by maximum log-likelihood, "
-                rf"\texttt{{{_tex(lw_id)}}}, produced \texttt{{NaN}} "
-                r"out-of-sample CRPS owing to full inverse Fisher (fullfi) "
-                r"score scaling generating numerically extreme GB2 distribution "
-                r"parameters during OOS rolling-window evaluation (see "
-                r"Section~\ref{sec:numerical_issues} for details). "
-                r"The reported final model is the best-CRPS model with "
-                r"a finite OOS score." + "\n\n"
-            )
 
         # IS diagnostics
         is_diag = _compute_is_diagnostics_for_winner(
@@ -1069,8 +1493,10 @@ def generate_location_section(
             if final_mid.startswith(s):
                 stage_m = s
                 break
-        paths_npz = _load_paths_npz(run_dir, stage_m, final_mid)
-        meta_m    = _load_meta(run_dir, stage_m, final_mid)
+        paths_npz   = _load_paths_npz(run_dir, stage_m, final_mid)
+        meta_m      = _load_meta(run_dir, stage_m, final_mid)
+        params_df_w = _load_params_df(run_dir, stage_m, final_mid)
+        meta_m      = _patch_meta_for_reconstruction(meta_m, params_df_w)
 
         if paths_npz is not None:
             oos_paths = _reconstruct_oos_paths(paths_npz, meta_m)
@@ -1081,8 +1507,7 @@ def generate_location_section(
             try:
                 model_w = model_cache.get(final_mid)
                 if model_w is None:
-                    params_df_w = _load_params_df(run_dir, stage_m, final_mid)
-                    model_w = _build_model_from_meta(meta_m, params_df_w)
+                    model_w = _build_model_from_meta(meta_m, params_df_w, model_id=final_mid)
                     model_cache[final_mid] = model_w
 
                 quants_oos = compute_dynamic_quantiles(model_w, oos_paths, QUANTILE_LEVELS)
@@ -1257,22 +1682,34 @@ def generate_location_section(
                         return_levels=daily_rl,
                         return_period_labels=rl_labels,
                     )
-                    # Build a simple table
-                    wd_rows = []
-                    for season in ["wet", "dry"]:
-                        r = wd_res.get(season, {})
-                        wd_rows.append({
-                            "model_id": season.capitalize(),
-                            "n": r.get("n", 0),
-                            "mean_y": r.get("mean_y", np.nan),
-                            f"exceed_emp_{int(0.99*10000):05d}": r.get(f"exceed_emp_{int(0.99*10000):05d}", np.nan),
-                            f"qs_{int(0.99*10000):05d}": r.get(f"qs_{int(0.99*10000):05d}", np.nan),
-                        })
-                    tex_parts.append(_extended_metrics_table_tex(
-                        wd_rows,
-                        caption=f"{display}: Wet/dry season decomposition of tail metrics.",
-                        label=f"tab:{station_short}_wetdry",
-                        cols_group="rmse",  # uses first available columns
+
+                    # Objective 4f: empirical vs theoretical exceedance,
+                    # overall / wet / dry / by ENSO regime, in one table --
+                    # all inputs already computed above (seas_res / enso_res /
+                    # wd_res / quants_oos), no re-fitting or recomputation of
+                    # the model itself.
+                    overall_exc = compute_exceedance_frequencies(
+                        y=y_test, dynamic_quantiles=quants_oos,
+                        quantile_levels=QUANTILE_LEVELS,
+                    )
+                    enso_regimes_for_table = (
+                        enso_res.get("standard_regimes")
+                        if nino34_test is not None else None
+                    )
+                    tex_parts.append(_exceedance_summary_table_tex(
+                        quantile_levels=QUANTILE_LEVELS,
+                        overall=overall_exc,
+                        wet=wd_res.get("wet"), dry=wd_res.get("dry"),
+                        enso_regimes=enso_regimes_for_table,
+                        caption=(
+                            f"{display}: exceedance calibration -- empirical vs.\\ "
+                            r"theoretical (1$-q$) exceedance frequency, overall, by "
+                            "wet/dry season, and by ENSO regime (monthly breakdown "
+                            "shown in Fig.~\\ref{fig:" + station_short + "_monthly}). "
+                            "A well-calibrated model has empirical values close to "
+                            "the theoretical column."
+                        ),
+                        label=f"tab:{station_short}_exceedance",
                     ))
 
                     # Save all decomposition CSVs
@@ -1303,178 +1740,168 @@ def generate_location_section(
                 print(f"  [WARN] Dynamic diagnostics failed for {station_name}: {exc}")
                 print(traceback.format_exc())
 
-    # ── Parameter table (appendix-style) ──────────────────────────────────
-    if final_mid:
-        params_df_w = _load_params_df(run_dir, stage_m, final_mid)
-        if not params_df_w.empty:
-            tex_parts.append(r"\subsection{Estimated Parameters}" + "\n")
-            tex_parts.append(_params_table_tex(
-                params_df_w,
-                caption=f"{display}: Estimated parameters for {_tex(final_mid)}.",
-                label=f"tab:{station_short}_params",
-            ))
+    # ── Stage 4: tail-sensitive xi-only regime (objective 3, 2026-07-07) ────
+    # Exactly 2 models (q95, q98) -- phi and pi are frozen at the phi-only
+    # branch's final winner, never re-estimated (objective item 4); only xi
+    # (GAS block + dewtemp_seasonal covariates + regime term) is fit fresh
+    # (item 5). Each threshold is accepted independently against the phi+xi
+    # branch's final winner ("counterpart") by twCRPS (objective 3a) -- this
+    # replaces round 1's 9-model phi+xi-joint regime design entirely.
+    s4_models = _all_model_ids(run_dir, "stage4_xi_regime")
+    s4_winner_id, best_q = None, None
+    if s4_models:
+        tex_parts.append(r"\subsection{Stage 4 -- Tail-Sensitive xi Regime}" + "\n")
+        s4_info = winners.get("stage4_xi_regime", {})
+        s4_base_id = s4_info.get("base_model", "")
+        s4_cp_id   = s4_info.get("counterpart", "")
+        s4_accept  = s4_info.get("accepted", {})
 
-    # ── Stage 4 Regime ────────────────────────────────────────────────────
-    regime_models = _all_model_ids(run_dir, "stage4_regime")
-    if regime_models:
-        tex_parts.append(r"\subsection{Stage 4 -- Regime-Sensitive GAS}" + "\n")
-        tex_parts.append(_stage_comparison_table_tex(
-            run_dir, "stage4_regime", winners,
-            caption=f"{display}: Stage 4 regime model results.",
-            label=f"tab:{station_short}_regime",
-        ))
-
-        # Stage 4 acceptance note
-        s4_info = winners.get("stage4_regime", {})
-        s4_accepted = s4_info.get("stage4_accepted")
-        s4_note     = s4_info.get("stage4_note") or s4_info.get("note", "")
-        s4_base_crps = s4_info.get("base_crps") or s4_info.get("baseline_crps")
-        s4_best_crps = s4_info.get("best_regime_crps") or s4_info.get("winner_crps")
-        # Fallback: compute best finite CRPS from models list if not stored
-        if s4_best_crps is None:
-            _s4_finite = [
-                float(m.get("crps_mean", float("nan")))
-                for m in s4_info.get("models", [])
-                if m.get("crps_mean") is not None
-                and np.isfinite(float(m.get("crps_mean", float("nan"))))
-                and abs(float(m.get("crps_mean", float("nan")))) < 1e6
-            ]
-            if _s4_finite:
-                s4_best_crps = min(_s4_finite)
-        if s4_accepted is True:
-            tex_parts.append(
-                r"\textbf{Stage 4 accepted}: regime-sensitive GAS reduces OOS CRPS "
-                rf"from {_fmt(s4_base_crps)} to {_fmt(s4_best_crps)} "
-                r"($\geq$2\% improvement threshold met)." + "\n\n"
-            )
-        elif s4_accepted is False:
-            tex_parts.append(
-                r"\textbf{Stage 4 not accepted}: no regime specification "
-                r"achieved the 2\% CRPS improvement threshold. "
-            )
-            if s4_base_crps is not None and s4_best_crps is not None:
-                tex_parts.append(
-                    rf"Best regime CRPS = {_fmt(s4_best_crps)}, "
-                    rf"base CRPS = {_fmt(s4_base_crps)}. "
-                )
-            if s4_note:
-                tex_parts.append(_tex(s4_note))
-            tex_parts.append("\n\n")
-
-        # Extended metrics for regime models
-        regime_mets = []
-        for rmid in regime_models:
-            m = _compute_extended_metrics_for_model(rmid, run_dir, data, model_cache)
-            if m:
-                regime_mets.append(m)
-        if regime_mets:
-            pd.DataFrame(regime_mets).to_csv(
-                csv_dir / f"{station_short}_regime_metrics.csv", index=False
-            )
-            tex_parts.append(_extended_metrics_table_tex(
-                regime_mets,
-                caption=f"{display}: Regime model CRPS and twCRPS metrics.",
-                label=f"tab:{station_short}_regime_ext",
-                cols_group="crps",
-            ))
-            tex_parts.append(_extended_metrics_table_tex(
-                regime_mets,
-                caption=f"{display}: Regime model tail quantile scores.",
-                label=f"tab:{station_short}_regime_tail",
-                cols_group="tail",
-            ))
-
-        # ── Stage 4 tail-metric acceptance ────────────────────────────────────
-        # Stage 4 is designed to improve extreme-event forecasts; evaluate on
-        # twCRPS@90 (threshold-weighted CRPS) and high quantile scores rather
-        # than overall CRPS alone.
-        tex_parts.append(r"\paragraph{Tail-metric evaluation of Stage 4}" + "\n")
         tex_parts.append(
-            r"The regime extension (Stage~4) is motivated by the hypothesis that "
-            r"extreme precipitation events carry a distinct score signal that warrants "
-            r"a separate, amplified updating step. Tail performance is therefore the "
-            r"primary evaluation criterion: threshold-weighted CRPS (twCRPS) at the "
-            r"90th, 95th, and 99th percentile thresholds, and the quantile score (QS) "
-            r"at the 95th and 99th percentiles." + "\n\n"
+            r"Per objective 3, Stage 4 tests tail-sensitive dynamics for "
+            rf"$\xi$ only. $\phi$ is frozen at the phi-only branch's final "
+            rf"winner (\texttt{{{_tex(s4_base_id)}}}) -- its GAS block, "
+            r"any covariates, and the occurrence probability $\pi_t$ are "
+            r"not re-estimated. Only $\xi$ (GAS(1,1) + short-term weather "
+            r"covariates + regime term $A^{ext}_\xi$) is fit fresh at each "
+            r"threshold. Each threshold is accepted only if its twCRPS beats "
+            rf"the phi+xi branch's final winner (\texttt{{{_tex(s4_cp_id)}}}, "
+            r"the ``best of previous stages counterpart'') by at least 2\%."
+            + "\n\n"
         )
 
-        # Gather base model tail metrics from the final-winner extended computation
-        s4_tail_base_tw90 = None
-        s4_tail_base_tw95 = None
-        if ext_mets is not None:
-            _v90 = ext_mets.get("twcrps_90")
-            _v95 = ext_mets.get("twcrps_95")
-            if _v90 is not None and np.isfinite(float(_v90)):
-                s4_tail_base_tw90 = float(_v90)
-            if _v95 is not None and np.isfinite(float(_v95)):
-                s4_tail_base_tw95 = float(_v95)
+        tex_parts.append(_stage_comparison_table_tex(
+            run_dir, "stage4_xi_regime", winners,
+            caption=f"{display}: Stage 4 tail-sensitive $\\xi$ regime models.",
+            label=f"tab:{station_short}_s4",
+        ))
 
-        # Find best regime model by twCRPS@90
-        s4_tail_accepted = False
-        s4_tail_best_mid = None
-        s4_tail_best_tw90 = None
-        s4_tail_impr90 = None
-        s4_tail_best_tw95 = None
-        if regime_mets and s4_tail_base_tw90 is not None:
-            _finite_r = [
-                r for r in regime_mets
-                if r.get("twcrps_90") is not None
-                and np.isfinite(float(r.get("twcrps_90", float("nan"))))
-            ]
-            if _finite_r:
-                _best_r = min(_finite_r, key=lambda r: float(r["twcrps_90"]))
-                s4_tail_best_tw90 = float(_best_r["twcrps_90"])
-                s4_tail_best_mid  = _best_r.get("model_id", "")
-                s4_tail_impr90 = (
-                    (s4_tail_base_tw90 - s4_tail_best_tw90)
-                    / max(abs(s4_tail_base_tw90), 1e-12)
-                )
-                s4_tail_accepted = s4_tail_impr90 >= 0.02
-                _v95r = _best_r.get("twcrps_95")
-                if _v95r is not None and np.isfinite(float(_v95r)):
-                    s4_tail_best_tw95 = float(_v95r)
+        s4_mets = []
+        for mid in s4_models:
+            m = _compute_extended_metrics_for_model(mid, run_dir, data, model_cache)
+            if m:
+                s4_mets.append(m)
+        if s4_mets:
+            pd.DataFrame(s4_mets).to_csv(
+                csv_dir / f"{station_short}_stage4_metrics.csv", index=False
+            )
+            tex_parts.append(_extended_metrics_table_tex(
+                s4_mets,
+                caption=f"{display}: Stage 4 OOS CRPS and twCRPS@95/98.",
+                label=f"tab:{station_short}_s4_ext",
+                cols_group="crps",
+            ))
 
-        if s4_tail_base_tw90 is not None and s4_tail_best_tw90 is not None:
-            if s4_tail_accepted:
+        for q_label in ("95", "98"):
+            dec = s4_accept.get(q_label, {})
+            winner = dec.get("winner")
+            key_metric = dec.get("key_metric", f"twcrps_{q_label}")
+            s4_val, base_val = dec.get("stage4_value"), dec.get("base_value")
+            rel_impr = dec.get("rel_improvement")
+            if winner == "stage4":
                 tex_parts.append(
-                    r"\textbf{Stage~4 tail accepted}: "
-                    rf"regime model \texttt{{{_tex(s4_tail_best_mid)}}} achieves a "
-                    rf"{s4_tail_impr90:.1%} improvement in twCRPS@90 over the base model "
-                    rf"(base: {_fmt(s4_tail_base_tw90)}, regime: {_fmt(s4_tail_best_tw90)}). "
-                    r"The 2\% threshold on the tail criterion is met, "
-                    r"confirming that the regime impulse corrects a systematic "
-                    r"under-response to extreme events." + "\n\n"
+                    rf"\textbf{{Stage 4 q{q_label} accepted}}: "
+                    rf"{_tex(key_metric)} improves from {_fmt(base_val)} "
+                    rf"({_tex(s4_cp_id)}) to {_fmt(s4_val)} "
+                    rf"(stage4\_xi\_regime\_q{q_label}), a "
+                    + (f"{rel_impr:.1%}" if rel_impr is not None and np.isfinite(rel_impr) else "--")
+                    + r" improvement ($\geq$2\% threshold met)." + "\n\n"
+                )
+            elif winner == "base":
+                reason = dec.get("reason", "")
+                tex_parts.append(
+                    rf"\textbf{{Stage 4 q{q_label} not accepted}}: "
+                    + (
+                        rf"{_tex(key_metric)} = {_fmt(s4_val)} vs.\ counterpart "
+                        rf"{_fmt(base_val)} ("
+                        + (f"{rel_impr:.1%}" if rel_impr is not None and np.isfinite(rel_impr) else "--")
+                        + r" change, below the 2\% threshold). "
+                        if not reason else _tex(reason) + ". "
+                    )
+                    + r"The phi+xi branch's final winner is retained for this threshold."
+                    + "\n\n"
                 )
             else:
-                _dir = "worse than" if s4_tail_impr90 < 0 else "below the threshold for"
                 tex_parts.append(
-                    r"\textbf{Stage~4 tail not accepted}: "
-                    r"no regime model achieves the 2\% improvement threshold on twCRPS@90. "
-                    rf"Best twCRPS@90 improvement = {s4_tail_impr90:.1%} "
-                    rf"(\textit{{{_dir}}} the 2\% threshold). "
-                    rf"Base twCRPS@90 = {_fmt(s4_tail_base_tw90)}, "
-                    rf"best regime twCRPS@90 = {_fmt(s4_tail_best_tw90)}"
-                    + (
-                        rf", twCRPS@95 = {_fmt(s4_tail_best_tw95)}"
-                        if s4_tail_best_tw95 is not None else ""
-                    )
-                    + r". The regime impulse does not improve extreme-event forecasting "
-                    r"beyond what the base GAS score update already captures." + "\n\n"
+                    rf"Stage 4 q{q_label}: acceptance decision unavailable "
+                    r"(missing metrics)." + "\n\n"
                 )
-        elif not regime_mets:
-            tex_parts.append(
-                r"No regime model extended metrics available for tail evaluation." + "\n\n"
-            )
-        else:
-            tex_parts.append(
-                r"Base model tail metrics not available; tail comparison cannot be computed." + "\n\n"
-            )
 
-        # Propagate tail acceptance to the global comparison
-        _section_meta["stage4_tail_accepted"] = s4_tail_accepted
-        _section_meta["stage4_tail_impr90"]   = s4_tail_impr90
-        _section_meta["stage4_tail_base_tw90"] = s4_tail_base_tw90
-        _section_meta["stage4_tail_best_tw90"] = s4_tail_best_tw90
+        # 7th (of 7) image set: the better-performing Stage-4 threshold,
+        # shown regardless of accept/reject (diagnostics are still
+        # informative for a rejected model -- e.g. Belo Horizonte/Darwin/
+        # Garanhuns above, where Stage 4 was legitimately not accepted).
+        # Ranked by *relative* improvement over each threshold's own
+        # counterpart, not raw twCRPS -- twcrps_98 is mechanically smaller
+        # than twcrps_95 for any model (a higher threshold weights a smaller
+        # tail region), so comparing raw values would always "prefer" q98
+        # regardless of which threshold actually fits better.
+        s4_candidates = [
+            (q_label, s4_accept.get(q_label, {}).get("rel_improvement"))
+            for q_label in ("95", "98")
+            if s4_accept.get(q_label, {}).get("rel_improvement") is not None
+            and np.isfinite(s4_accept[q_label]["rel_improvement"])
+        ]
+        if s4_candidates:
+            best_q, _ = max(s4_candidates, key=lambda t: t[1])
+            s4_winner_id = f"stage4_xi_regime_q{best_q}"
+            is_diag = _compute_is_diagnostics_for_winner(
+                model_id=s4_winner_id, run_dir=run_dir, data=data,
+                col_name_dict=data["covariate_col_names"], fig_dir=fig_dir,
+                winners=winners,
+            )
+            if is_diag:
+                pit_rel = os.path.relpath(is_diag["pit_path"], fig_dir.parent.parent).replace("\\", "/")
+                acf_rel = os.path.relpath(is_diag["acf_path"], fig_dir.parent.parent).replace("\\", "/")
+                tex_parts.append(
+                    rf"\paragraph{{IS diagnostics (q{best_q}, lower twCRPS of the two thresholds)}}"
+                    + "\n"
+                    + f"PIT mean = {is_diag['pit_mean']:.3f} (ideal 0.5), "
+                    f"std = {is_diag['pit_std']:.3f} (ideal {1/12**0.5:.3f})." + "\n\n"
+                )
+                tex_parts.append(_fig_tex(
+                    pit_rel, f"{display} (Stage 4, q{best_q}): IS PIT histogram.",
+                    f"fig:{station_short}_s4_pit", width="0.55",
+                ))
+                tex_parts.append(_fig_tex(
+                    acf_rel, f"{display} (Stage 4, q{best_q}): IS quantile-residual ACF (400 lags).",
+                    f"fig:{station_short}_s4_acf", width="0.75",
+                ))
+
+        _section_meta["stage4_q95_accepted"] = s4_accept.get("95", {}).get("winner") == "stage4"
+        _section_meta["stage4_q98_accepted"] = s4_accept.get("98", {}).get("winner") == "stage4"
+        _section_meta["stage4_q95_improvement"] = s4_accept.get("95", {}).get("rel_improvement")
+        _section_meta["stage4_q98_improvement"] = s4_accept.get("98", {}).get("rel_improvement")
+        _section_meta["stage4_base_model"] = s4_base_id
+        _section_meta["stage4_counterpart"] = s4_cp_id
+
+    # ── Appendix: parameter estimates + standard errors, all 7 winners ─────
+    # Per prompt.md: standard errors were saved (every model's save_result())
+    # but never shown in round 1's report. One table per winner, kept
+    # separate from every OOS/IS metric table above (REPORTING.md §10).
+    appendix_entries = [
+        ("Phi-only, Stage 1", "stage1", w1_phi),
+        ("Phi-only, Stage 2", "stage2_phi", w2_phi),
+        ("Phi-only, Stage 3", "stage3_phi", w3_phi),
+        ("Phi+xi, Stage 1", "stage1", w1_xi),
+        ("Phi+xi, Stage 2", "stage2", w2_xi),
+        ("Phi+xi, Stage 3", "stage3", w3_xi),
+    ]
+    if s4_winner_id:
+        appendix_entries.append((f"Stage 4 (q{best_q})", "stage4_xi_regime",
+                                  {"model_id": s4_winner_id}))
+    appendix_entries = [(lbl, sd, w) for lbl, sd, w in appendix_entries if w]
+
+    if appendix_entries:
+        tex_parts.append(r"\subsection{Appendix: Parameter Estimates and Standard Errors}" + "\n")
+        for lbl, stage_dir, w in appendix_entries:
+            pdf_se = _load_params_with_se(run_dir, stage_dir, w["model_id"])
+            if pdf_se.empty:
+                continue
+            tex_parts.append(_params_table_tex(
+                pdf_se,
+                caption=f"{display} ({lbl}): \\texttt{{{_tex(w['model_id'])}}} parameter estimates.",
+                label=f"tab:{station_short}_params_{stage_dir}_{lbl.split(',')[0].strip().lower().replace(' ', '')}",
+            ))
 
     return "\n".join(tex_parts), _section_meta
 
@@ -1495,156 +1922,158 @@ def generate_global_comparison(
     tex_parts.append(r"\chapter{Global Comparison}" + "\n")
     tex_parts.append(r"\label{chap:global}" + "\n")
 
-    rows = []
+    # Two independent tables (objective 4d/1a/1b): phi-only branch ranked by
+    # OOS RMSE, phi+xi branch ranked by OOS CRPS. Never mixed into one table
+    # (REPORTING.md §10: avoid mixing unrelated metrics).
+    rows_phi, rows_phixi, rows_s4, rows_xicompare = [], [], [], []
     for station, res in station_results.items():
-        fw   = res.get("final_winner")
-        if fw is None:
-            continue
         cfg = STATION_REGISTRY.get(station, {})
-        s4_acc  = res.get("stage4_accepted")
-        s4_str  = "Yes" if s4_acc is True else ("No" if s4_acc is False else "--")
-        s4t_acc = res.get("stage4_tail_accepted")
-        s4t_str = "Yes" if s4t_acc is True else ("No" if s4t_acc is False else "--")
-        rows.append({
-            "Station":        cfg.get("display", station),
-            "Final model":    fw.get("model_id", "?"),
-            "S1 CRPS":        res.get("crps_s1", float("nan")),
-            "S2 CRPS":        res.get("crps_s2", float("nan")),
-            "S3 CRPS":        res.get("crps_s3", float("nan")),
-            "Final CRPS":     res.get("crps_final", float("nan")),
-            "S4 (CRPS)":      s4_str,
-            "S4 (twCRPS@90)": s4t_str,
-        })
+        display = cfg.get("display", station)
+        if res.get("phi_model_id"):
+            rows_phi.append({
+                "Station": display, "Winner model": res["phi_model_id"],
+                "OOS RMSE": res.get("phi_rmse", float("nan")),
+            })
+        if res.get("phixi_model_id"):
+            rows_phixi.append({
+                "Station": display, "Winner model": res["phixi_model_id"],
+                "OOS CRPS": res.get("phixi_crps", float("nan")),
+            })
+        c_phi, c_xi = res.get("phi_crps"), res.get("phixi_crps")
+        if c_phi is not None and c_xi is not None and np.isfinite(c_phi) and np.isfinite(c_xi):
+            impr = (c_phi - c_xi) / max(abs(c_phi), 1e-12)
+            rows_xicompare.append({
+                "Station": display,
+                "phi-only CRPS": c_phi, "phi+xi CRPS": c_xi,
+                "phi-only twCRPS@95": res.get("phi_twcrps_95"),
+                "phi+xi twCRPS@95": res.get("phixi_twcrps_95"),
+                "xi improves CRPS": f"{impr:+.1%}",
+            })
+        if res.get("stage4_base_model"):
+            def _s4cell(acc, impr):
+                if acc is None:
+                    return "--"
+                arrow = "Yes" if acc else "No"
+                return arrow if impr is None or not np.isfinite(impr) else f"{arrow} ({impr:+.1%})"
+            rows_s4.append({
+                "Station": display,
+                "Phi base (frozen)": res["stage4_base_model"],
+                "phi+xi counterpart": res.get("stage4_counterpart", "?"),
+                "q95 accepted": _s4cell(res.get("stage4_q95_accepted"), res.get("stage4_q95_improvement")),
+                "q98 accepted": _s4cell(res.get("stage4_q98_accepted"), res.get("stage4_q98_improvement")),
+            })
 
-    if rows:
-        df_global = pd.DataFrame(rows)
-        df_global.to_csv(csv_dir / "global_comparison.csv", index=False)
-
-        # LaTeX table
-        tex_parts.append(r"\section{Stage Winner Comparison}" + "\n")
-        headers = " & ".join(r"\textbf{" + _tex(c) + "}" for c in df_global.columns) + r" \\"
-        body    = []
-        for _, row in df_global.iterrows():
-            cells = []
-            _text_cols = {"Station", "Final model", "S4 (CRPS)", "S4 (twCRPS@90)"}
-            for c in df_global.columns:
-                v = row[c]
-                if c in _text_cols:
-                    cells.append(_tex(str(v)))
-                else:
-                    cells.append(_fmt(v))
+    def _emit_table(rows, caption, label, numeric_cols):
+        if not rows:
+            return
+        df = pd.DataFrame(rows)
+        df.to_csv(csv_dir / f"{label.split(':')[-1]}.csv", index=False)
+        headers = " & ".join(r"\textbf{" + _tex(c) + "}" for c in df.columns) + r" \\"
+        body = []
+        for _, row in df.iterrows():
+            cells = [
+                _fmt(row[c]) if c in numeric_cols else _tex(str(row[c]))
+                for c in df.columns
+            ]
             body.append(" & ".join(cells) + r" \\")
-
-        n_cols  = len(df_global.columns)
-        # Station + Final model (left), CRPS cols (right), two S4 accept cols (center)
-        col_fmt = "l" * 2 + "r" * (n_cols - 4) + "c" * 2
+        n_cols = len(df.columns)
+        col_fmt = "l" * (n_cols - len(numeric_cols)) + "r" * len(numeric_cols)
         tex_parts.append(
-            r"\begin{table}[ht]" + "\n"
-            r"\centering" + "\n"
-            r"\footnotesize" + "\n"
-            rf"\begin{{tabular}}{{{col_fmt}}}" + "\n"
-            r"\hline" + "\n"
-            + headers + "\n"
-            r"\hline" + "\n"
-            + "\n".join(body) + "\n"
-            r"\hline" + "\n"
-            r"\end{tabular}" + "\n"
-            r"\caption{Global comparison: best model, OOS CRPS at each pipeline stage,"
-            r" and Stage~4 acceptance for all locations."
-            r" CRPS entries show \texttt{--} where OOS evaluation failed"
-            r" (fullfi instability or convergence failure)."
-            r" \emph{S4~(CRPS)} = Yes if any regime model achieves $\geq$2\% overall"
-            r" CRPS improvement; \emph{S4~(twCRPS@90)} = Yes if any regime model"
-            r" achieves $\geq$2\% improvement in threshold-weighted CRPS at the"
-            r" 90th-percentile threshold (the tail-focused criterion).}" + "\n"
-            r"\label{tab:global_comparison}" + "\n"
+            r"\begin{table}[ht]" + "\n\\centering\n\\footnotesize\n"
+            r"\resizebox{\ifdim\width>\textwidth\textwidth\else\width\fi}{!}{%" + "\n"
+            rf"\begin{{tabular}}{{{col_fmt}}}" + "\n\\hline\n"
+            + headers + "\n\\hline\n" + "\n".join(body) + "\n\\hline\n"
+            r"\end{tabular}" + "\n}" + "\n"
+            rf"\caption{{{caption}}}" + "\n"
+            rf"\label{{{label}}}" + "\n"
             r"\end{table}" + "\n"
         )
 
-    # Narrative (partially dynamic — Stage 4 block reflects actual acceptance)
-    tex_parts.append(r"\section{Cross-Location Patterns}" + "\n")
-    tex_parts.append(r"""
-\subsection*{Stage progression}
-Across all locations, Stage~1 (baseline GAS) provides the final model in
-the majority of cases.  Stage~2 weather covariates and Stage~3 Harvey
-long-short decomposition are accepted only where there is a clear
-meteorological signal: the Harvey model with ENSO component achieves
-meaningful CRPS reductions at Belo Horizonte and Darwin Airport, both of
-which experience pronounced ENSO-modulated seasonal regimes.
-Tropical locations (Manaus, Salvador) show no net improvement from
-external covariates, consistent with their rainfall being dominated by
-convective dynamics at sub-synoptic scales not captured by monthly ENSO
-or daily dew-point indices.
-""")
-
-    # Dynamic Stage 4 block
-    crps_accepted = [
-        STATION_REGISTRY.get(st, {}).get("display", st)
-        for st, res in station_results.items()
-        if res.get("stage4_accepted") is True
-    ]
-    tail_accepted = [
-        (STATION_REGISTRY.get(st, {}).get("display", st),
-         res.get("stage4_tail_impr90"))
-        for st, res in station_results.items()
-        if res.get("stage4_tail_accepted") is True
-    ]
-    tex_parts.append(r"\subsection*{Stage 4 regime extension}" + "\n")
-    if not crps_accepted and not tail_accepted:
-        tex_parts.append(
-            r"Stage~4 was not accepted at any location in this run on either "
-            r"the overall CRPS or the tail-focused (twCRPS@90) criterion. "
-        )
-    elif not crps_accepted:
-        tex_parts.append(
-            r"Stage~4 was not accepted at any location on the overall CRPS criterion. "
-        )
-    else:
-        locs = ", ".join(_tex(s) for s in crps_accepted)
-        tex_parts.append(
-            rf"Stage~4 was accepted on the overall CRPS criterion at: {locs}. "
-        )
-    if tail_accepted:
-        tail_lines = []
-        for display, impr in tail_accepted:
-            if impr is not None:
-                tail_lines.append(
-                    rf"\textit{{{_tex(display)}}} ({impr:.1%} twCRPS@90 improvement)"
-                )
-            else:
-                tail_lines.append(rf"\textit{{{_tex(display)}}}")
-        tail_str = "; ".join(tail_lines)
-        tex_parts.append(
-            r"However, the tail-focused criterion (twCRPS@90, $\geq$2\% improvement) "
-            rf"was met at: {tail_str}. "
-            r"This result is scientifically important: the regime impulse significantly "
-            r"improves the model's response to extreme precipitation even when the "
-            r"\emph{overall} CRPS --- which is dominated by the many non-extreme days "
-            r"--- does not improve enough to trigger formal acceptance. "
-            r"The per-location Stage~4 tail-metric paragraphs give the quantitative details. "
-        )
-    else:
-        tex_parts.append(
-            r"The per-location extended metrics tables (CRPS + twCRPS@90/95/99 columns) "
-            r"and the tail-metric acceptance paragraph within each Stage~4 subsection "
-            r"provide the quantitative evidence. "
-        )
+    tex_parts.append(r"\section{Stage Winner Comparison}" + "\n")
     tex_parts.append(
-        r"At locations whose Stage~1 winner uses unit score scaling (Darwin, Manaus, "
-        r"Salvador), the diagfi-scaled regime filter diverged catastrophically "
-        r"(Section~\ref{sec:numerical_issues}). "
-        r"The unit-scaling fallback triggered by Bug~6b produced well-converged "
-        r"unit-scaled regime models; none achieved the 2\% overall CRPS threshold." + "\n\n"
+        r"Per objective 1a/1b, the two tvp sets are never ranked against each "
+        r"other: phi-only models are compared by OOS RMSE only; phi+xi models "
+        r"by OOS CRPS only (the main criterion)." + "\n\n"
+    )
+    _emit_table(
+        rows_phi, "Phi-only branch final winners (objective 1a, ranked by OOS RMSE).",
+        "tab:global_phi", {"OOS RMSE"},
+    )
+    _emit_table(
+        rows_phixi, "Phi+xi branch final winners (objective 1b, ranked by OOS CRPS).",
+        "tab:global_phixi", {"OOS CRPS"},
     )
 
-    tex_parts.append(r"""
-\subsection*{Numerical reliability}
-At Garanhuns and Cruzeiro do Sul, the model selected by maximum
-log-likelihood in Stage~1 is a full inverse Fisher variant whose OOS CRPS
-is undefined due to GB2 PPF overflow.  The deployable best-CRPS Stage~1
-model is reported in the \emph{Final CRPS} column above.  Refer to
-Section~\ref{sec:numerical_issues} for a full explanation.
-""")
+    tex_parts.append(r"\section{Does Adding xi Help? Phi-only vs.\ Phi+xi, All Locations}" + "\n")
+    tex_parts.append(
+        r"Both branches' final winners compared on CRPS and twCRPS@95 at every "
+        r"location. Neither model is re-fit for this comparison -- both metrics "
+        r"are recomputed from each winner's existing OOS simulation paths." + "\n\n"
+    )
+    _emit_table(
+        rows_xicompare,
+        "CRPS and twCRPS@95 for the phi-only vs.\\ phi+xi final winner at each location.",
+        "tab:global_xicompare",
+        {"phi-only CRPS", "phi+xi CRPS", "phi-only twCRPS@95", "phi+xi twCRPS@95"},
+    )
+    if rows_xicompare:
+        n_improve = sum(1 for r in rows_xicompare if r["xi improves CRPS"].startswith("+"))
+        tex_parts.append(
+            rf"$\xi$ improved CRPS at {n_improve} of {len(rows_xicompare)} locations." + "\n\n"
+        )
+
+    tex_parts.append(r"\section{Stage 4 -- Tail-Sensitive xi Regime}" + "\n")
+    tex_parts.append(
+        r"Each threshold is accepted independently against the phi+xi "
+        r"branch's final winner (the ``counterpart'') by twCRPS, "
+        r"$\geq$2\% improvement required (objective 3a)." + "\n\n"
+    )
+    _emit_table(
+        rows_s4, "Stage 4 acceptance by location and threshold.",
+        "tab:global_s4", set(),
+    )
+
+    # Narrative: which locations accepted Stage 2/3 covariates, Stage 4.
+    tex_parts.append(r"\section{Cross-Location Patterns}" + "\n")
+    s2_accepted = [r["Station"] for r in rows_phixi if "stage2" in r["Winner model"]]
+    s3_accepted = [r["Station"] for r in rows_phixi if "stage3" in r["Winner model"]]
+    tex_parts.append(
+        r"\subsection*{Stage progression (phi+xi branch)}" + "\n"
+        + (
+            rf"Stage~2 weather covariates were accepted (beat the simpler model by "
+            rf"$\geq$2\% CRPS) at: {', '.join(_tex(s) for s in s2_accepted)}. "
+            if s2_accepted else
+            r"Stage~2 weather covariates were not accepted at any location "
+            r"(the simpler no-covariate model was within 2\% at every location, "
+            r"per the 4d tie-break rule). "
+        )
+        + (
+            rf"Stage~3 Harvey long-short (corrected ENSO dummies) was accepted at: "
+            rf"{', '.join(_tex(s) for s in s3_accepted)}. "
+            if s3_accepted else
+            r"Stage~3 Harvey long-short was not accepted at any location "
+            r"under the corrected ENSO dummy covariates. "
+        )
+        + "\n\n"
+    )
+
+    q95_ok = [r["Station"] for r in rows_s4 if str(r["q95 accepted"]).startswith("Yes")]
+    q98_ok = [r["Station"] for r in rows_s4 if str(r["q98 accepted"]).startswith("Yes")]
+    tex_parts.append(r"\subsection*{Stage 4 tail-sensitive xi regime}" + "\n")
+    if not q95_ok and not q98_ok:
+        tex_parts.append(
+            r"Stage~4 was not accepted at any location at either threshold: the "
+            r"frozen-phi tail-sensitive $\xi$ regime did not beat its phi+xi "
+            r"counterpart's twCRPS by the required 2\% margin. "
+        )
+    else:
+        tex_parts.append(
+            (rf"q95 accepted at: {', '.join(_tex(s) for s in q95_ok)}. "
+             if q95_ok else r"q95 accepted nowhere. ")
+            + (rf"q98 accepted at: {', '.join(_tex(s) for s in q98_ok)}. "
+               if q98_ok else r"q98 accepted nowhere. ")
+        )
+    tex_parts.append("\n\n")
 
     return "\n".join(tex_parts)
 
@@ -1673,6 +2102,11 @@ LATEX_PREAMBLE = r"""\documentclass[12pt,a4paper]{report}
 \usepackage{array}
 \usepackage{pdflscape}
 \hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+% Absorb the minor residual overflow from long unbreakable \texttt{} model
+% ids / file paths inside inline prose (tables are handled separately via
+% \resizebox in the table-builder functions).
+\emergencystretch=3em
+\sloppy
 \captionsetup{font=small}
 """
 
@@ -1695,24 +2129,33 @@ def build_latex_document(
         r"""
 This report presents a comprehensive evaluation of the Zero-Augmented Generalized
 Autoregressive Score (ZA-GAS) probabilistic model for daily precipitation across
-multiple locations. The pipeline consists of three estimation stages plus a
-regime-sensitive extension:
+multiple locations. Following the 2026-07-07 revision, the pipeline runs two
+independent tvp-set branches through Stages 1-3, plus a redesigned Stage 4:
 
 \begin{enumerate}
 \item \textbf{Stage 1 -- Baseline GAS}: 12 specifications varying the set of
       time-varying parameters ($\phi$ only vs.\ $\phi+\xi$), lag structure
       (short vs.\ seasonal), and score scaling (unit, diagonal inverse Fisher,
-      full inverse Fisher).
+      full inverse Fisher). The phi-only and phi+xi specifications are never
+      ranked against each other: phi-only models are compared by OOS RMSE,
+      phi+xi models by OOS CRPS (objective 1a/1b).
 \item \textbf{Stage 2 -- Weather covariates}: GAS filter augmented with lagged
-      ERA5 dew point and temperature. Accepted only if OOS CRPS improves by
-      at least 2\% over Stage~1.
+      ERA5 dew point and temperature, run independently for each branch.
+      Accepted only if the branch's key metric improves by at least 2\% over
+      Stage~1, otherwise the simpler Stage-1 model is kept.
 \item \textbf{Stage 3 -- Harvey long-short}: Decomposes the dynamic scale into
-      a slow long component driven by ENSO and a fast short component driven by
-      weather. Accepted only if OOS CRPS improves by at least 2\% over Stage~2.
-\item \textbf{Stage 4 -- Regime-sensitive GAS}: Adds an extreme-observation
-      indicator to the score response coefficient, allowing the model to respond
-      differently when the previous day's rainfall was extreme (per MODELS.md
-      \S22--23). Applied to the best model from Stages~1--3.
+      a slow long component and a fast short component driven by weather. The
+      long component uses El Nino/La Nina dummy tiers (current/+1mo/+3mo,
+      neutral as baseline) built from the NOAA ONI classification -- replacing
+      round 1's continuous ENSO covariate, which was built from mislabelled
+      raw sea-surface temperature (see data/station\_loader.py header).
+\item \textbf{Stage 4 -- Tail-sensitive $\xi$ regime}: Redesigned per
+      objective 3. Applies the regime-sensitive score extension to $\xi$
+      only; $\phi$ (and the occurrence probability $\pi_t$) are frozen at the
+      phi-only branch's final winner and never re-estimated. Tested at
+      $q_{0.95}$ and $q_{0.98}$ (MODELS.md \S22--23); each threshold is
+      accepted only if it beats the phi+xi branch's final winner
+      (the ``best of previous stages counterpart'') by $\geq$2\% twCRPS.
 \end{enumerate}
 
 In-sample (IS) diagnostics include randomised PIT histograms, normal QQ plots,
@@ -1927,7 +2370,7 @@ def main():
                 station_name=station,
                 precip_dir=PRECIP_DIR,
                 era5_dir=ERA5_DIR,
-                nino34_path=NINO34_PATH,
+                enso_path=ENSO_PATH,
             )
             data = loader.load_all()
         except Exception as exc:
@@ -1956,28 +2399,33 @@ def main():
 
         location_sections[station] = section_tex
 
-        # Collect global comparison data
-        winners = _load_winners(run_dir)
-        fw_info = winners.get("final_winner", {})
-        s4_info = winners.get("stage4_regime", {})
+        # Collect global comparison data (2026-07-07 schema: two independent
+        # tvp-set branches, each with its own final winner and key metric --
+        # see run_all_locations.py::run_location).
+        winners  = _load_winners(run_dir)
+        fxi_info = winners.get("final_winner_phi_xi", {})
+        fphi_info = winners.get("final_winner_phi_only", {})
+        s4_info  = winners.get("stage4_xi_regime", {})
+        s4_accept = s4_info.get("accepted", {})
         station_results[station] = {
-            "final_winner":   fw_info,
-            "crps_s1":        fw_info.get("crps_s1", float("nan")),
-            "crps_s2":        fw_info.get("crps_s2", float("nan")),
-            "crps_s3":        fw_info.get("crps_s3", float("nan")),
-            "crps_final":     fw_info.get("crps", float("nan")),
-            "stage4_accepted": s4_info.get("stage4_accepted"),
-            "stage4_best_crps": (
-                s4_info.get("best_regime_crps")
-                or s4_info.get("winner_crps")
-            ),
-            "stage4_note": (
-                s4_info.get("stage4_note") or s4_info.get("note", "")
-            ),
-            "numerical_note": fw_info.get("numerical_note"),
-            # Tail-metric Stage 4 acceptance (computed from extended metrics)
-            "stage4_tail_accepted": section_extra.get("stage4_tail_accepted"),
-            "stage4_tail_impr90":   section_extra.get("stage4_tail_impr90"),
+            "phixi_model_id": fxi_info.get("model_id"),
+            "phixi_crps":     fxi_info.get("crps_mean", float("nan")),
+            "phi_model_id":   fphi_info.get("model_id"),
+            "phi_rmse":       fphi_info.get("rmse", float("nan")),
+            # CRPS/twCRPS for BOTH branches' winners (section_extra was
+            # already computed once inside generate_location_section --
+            # reused here, not recalculated).
+            "phi_crps":         section_extra.get("phi_crps"),
+            "phi_twcrps_95":    section_extra.get("phi_twcrps_95"),
+            "phi_twcrps_98":    section_extra.get("phi_twcrps_98"),
+            "phixi_twcrps_95":  section_extra.get("phixi_twcrps_95"),
+            "phixi_twcrps_98":  section_extra.get("phixi_twcrps_98"),
+            "stage4_q95_accepted": s4_accept.get("95", {}).get("winner") == "stage4",
+            "stage4_q98_accepted": s4_accept.get("98", {}).get("winner") == "stage4",
+            "stage4_q95_improvement": s4_accept.get("95", {}).get("rel_improvement"),
+            "stage4_q98_improvement": s4_accept.get("98", {}).get("rel_improvement"),
+            "stage4_base_model": s4_info.get("base_model"),
+            "stage4_counterpart": s4_info.get("counterpart"),
         }
 
     # Global comparison

@@ -514,3 +514,504 @@ def build_regime_from_winner(
                 # A_ext_* params default to 0 (initial_theta() already provides 0)
 
     return model, theta0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Stage 4 (2026-07-07 redesign): xi-only tail-sensitive regime, frozen phi
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# prompt.md objective 3: "Stage 4 ... only makes sense as tail sensitive
+# dynamics. Therefore, it will only be used with xi, not with the scale
+# parameter phi. The dynamics of phi ... will follow the best calibration
+# for phi [...] from earlier stages ... Phi dynamics here should not be
+# reestimated."
+#
+# RegimeZAGASModel above (round 1) always re-optimizes BOTH phi and xi
+# jointly as a GAS(1,1) pair, which is exactly what objective 3 now
+# prohibits. RegimeXiOnlyModel replaces it for Stage 4: phi (and the
+# occurrence probability pi, which is architecturally independent of phi/xi
+# per MODELS.md §3/§24) are supplied as precomputed, fixed trajectories from
+# whichever phi-only model won Stages 1-3 (pipeline.artifact_utils);
+# they never appear in this model's theta and are never touched by the
+# optimizer. Only xi -- its own GAS(1,1) block, short-term weather
+# covariates (dew point + temperature; see run_all_locations.py for why
+# those specific covariates), and the regime extension A_ext_xi -- is
+# estimated (objective item 5: "xi ... requires its own optimization").
+
+
+class RegimeXiOnlyModel:
+    """
+    Tail-sensitive regime model for xi only, with phi and pi frozen.
+
+    f_xi,t = omega_xi + L(xi) via a plain GAS(1,1) recursion:
+        xi_{t+1} = omega_xi + (A_xi + A_ext_xi * R_t(c)) * s_{xi,t}
+                             + B_xi * xi_t + Gamma_xi' * X_t
+        R_t(c) = 1(y_t > c)
+
+    phi_t and pi_t are NOT part of theta -- they are read from precomputed
+    arrays (`phi_full`, `pi_full`) covering the whole y_train+y_test range,
+    built by pipeline.artifact_utils.build_full_path() from whichever
+    phi-only model won Stages 1-3. `warmup` is that base model's own
+    max_lag: phi_full/pi_full are only defined from index `warmup` onward
+    (matching the base model's own effective-sample convention), so this
+    model's recursion never starts before max(warmup, its own lag=1).
+
+    gamma, zeta (static GB2 shape parameters) are likewise frozen at the
+    base model's estimated values -- they describe the whole distribution,
+    not either dynamic parameter individually, so re-estimating them here
+    while phi is frozen would be statistically incoherent.
+    """
+
+    GAS_LAG = 1  # always GAS(1,1) for xi, matching RegimeZAGASModel's precedent
+
+    def __init__(
+        self,
+        distribution: Distribution,
+        scaling: str = "diagonal_inverse_fisher",
+        threshold_quantile: float = 0.95,
+        cov_names: Optional[List[str]] = None,
+    ):
+        self.dist = distribution
+        self.scaling = scaling
+        self.threshold_quantile = threshold_quantile
+        self.cov_names = list(cov_names) if cov_names else []
+        self.n_cov = len(self.cov_names)
+        self._threshold_c: Optional[float] = None
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Parameter vector: [omega_xi, f0_xi, A_xi, B_xi, A_ext_xi, gamma_xi(n_cov)]
+    # ──────────────────────────────────────────────────────────────────────
+
+    @property
+    def n_params(self) -> int:
+        return 5 + self.n_cov
+
+    def parameter_names(self) -> List[str]:
+        names = ["omega_xi", "f0_xi", "A_xi_1", "B_xi_1", "A_ext_xi"]
+        names += [f"gamma_xi_{c}" for c in self.cov_names]
+        return names
+
+    def _decode(self, theta: np.ndarray) -> dict:
+        d = {
+            "omega": float(theta[0]), "f0": float(theta[1]),
+            "A": float(theta[2]), "B": float(theta[3]), "A_ext": float(theta[4]),
+        }
+        d["gamma_cov"] = theta[5:5 + self.n_cov] if self.n_cov else np.zeros(0)
+        return d
+
+    def initial_theta(self) -> np.ndarray:
+        theta = np.zeros(self.n_params)
+        theta[3] = 0.90  # B_xi: start close to persistent-but-stable
+        return theta
+
+    def compute_threshold(self, y: np.ndarray) -> float:
+        """95th/98th (or configured) percentile of training wet-day observations."""
+        wet = y[y > 0]
+        return float(np.quantile(wet, self.threshold_quantile)) if len(wet) else 1.0
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Score scaling for a single dynamic parameter: with only xi dynamic,
+    # "diagonal_inverse_fisher" and "inverse_fisher" coincide (a 1x1 Fisher
+    # sub-matrix has no cross-parameter term to invert) -- both reduce to
+    # dividing the raw score by I_xixi. "unit" leaves the raw score as is.
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _scaled_score(self, raw_xi_score: float, phi_t: float, xi_t: float,
+                       gamma_v: float, zeta_v: float) -> float:
+        if self.scaling == "unit":
+            return raw_xi_score
+        fi = self.dist.fisher_info_diag(phi=phi_t, xi=xi_t, gamma=gamma_v, zeta=zeta_v)
+        i_xixi = fi.get("xi", np.nan)
+        if not np.isfinite(i_xixi) or i_xixi <= 1e-8:
+            return raw_xi_score  # fall back to unit scaling if FI is degenerate
+        return raw_xi_score / i_xixi
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Core recursion
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _align_frozen(raw: np.ndarray, warmup: int, T: int) -> np.ndarray:
+        """
+        `raw` is a build_full_path()-style array: raw[0] corresponds to
+        global index `warmup` (the base model's own effective-sample
+        start), covering indices [warmup, warmup + len(raw)). Return a
+        length-T array index-aligned with `y` (index t <-> global time t),
+        with NaN before `warmup` (never read -- the recursion always starts
+        at eff = max(GAS_LAG, warmup)).
+        """
+        out = np.full(T, np.nan)
+        n_avail = min(len(raw), T - warmup)
+        if n_avail > 0:
+            out[warmup: warmup + n_avail] = raw[:n_avail]
+        return out
+
+    def _run_filter(
+        self,
+        theta: np.ndarray,
+        y: np.ndarray,
+        phi_full: np.ndarray,
+        pi_full: np.ndarray,
+        X: np.ndarray,
+        gamma_v: float,
+        zeta_v: float,
+        warmup: int,
+        return_paths: bool = False,
+    ):
+        """
+        y and X have length T (the full y_train, or y_train+y_test for OOS
+        simulation). phi_full/pi_full must ALREADY be length-T, index-
+        aligned with y (see `_align_frozen`) -- callers (fit/simulate_oos)
+        perform that alignment before calling this. phi_full/pi_full are
+        only valid from index `warmup` onward (see class docstring); the
+        recursion starts at eff = max(GAS_LAG, warmup).
+        """
+        T = len(y)
+        eff = max(self.GAS_LAG, warmup)
+        if T <= eff:
+            return 1e12 if not return_paths else {}
+
+        d = self._decode(theta)
+        X_safe = np.nan_to_num(X, nan=0.0) if self.n_cov else np.zeros((T, 0))
+
+        penalty = 0.0
+        LAM_PERSIST, LAM_SCORE, LAM_STATE, LAM_COV = 1e5, 1e3, 1e3, 1e2
+        penalty += LAM_PERSIST * max(0.0, abs(d["B"]) - 0.98) ** 2
+        penalty += LAM_SCORE   * max(0.0, abs(d["A"]) - 2.0) ** 2
+        penalty += LAM_SCORE   * max(0.0, abs(d["A_ext"]) - 2.0) ** 2
+        if self.n_cov:
+            penalty += LAM_COV * max(0.0, np.linalg.norm(d["gamma_cov"]) - 20.0) ** 2
+
+        xi_arr = np.zeros(T + 1)
+        s_arr  = np.zeros(T)
+        xi_arr[: eff + 1] = d["f0"]
+        loglik = 0.0
+
+        for t in range(eff, T):
+            phi_t = float(phi_full[t])
+            xi_t  = xi_arr[t]
+            if not np.isfinite(phi_t):
+                return (1e12 + penalty) if not return_paths else {}
+
+            state_excess = max(0.0, abs(xi_t) - 15.0)
+            penalty += LAM_STATE * state_excess ** 2
+
+            pi_t = float(pi_full[t])
+            pi_t = min(max(pi_t, 1e-12), 1.0 - 1e-12)
+
+            if y[t] == 0:
+                ll_t = np.log(1.0 - pi_t)
+            else:
+                ll_dist = self.dist.logpdf(y[t], phi=phi_t, xi=xi_t, gamma=gamma_v, zeta=zeta_v)
+                if not np.isfinite(ll_dist):
+                    return (1e12 + penalty) if not return_paths else {}
+                ll_t = np.log(pi_t) + ll_dist
+            if not np.isfinite(ll_t):
+                return (1e12 + penalty) if not return_paths else {}
+            loglik += ll_t
+
+            if y[t] > 0:
+                raw = self.dist.score(y[t], phi=phi_t, xi=xi_t, gamma=gamma_v, zeta=zeta_v)
+                s_arr[t] = self._scaled_score(raw["xi"], phi_t, xi_t, gamma_v, zeta_v)
+                if not np.isfinite(s_arr[t]):
+                    return (1e12 + penalty) if not return_paths else {}
+
+            regime_t = float(y[t] > self.threshold_c)
+            A_eff = d["A"] + d["A_ext"] * regime_t
+            cov_term = float(np.dot(d["gamma_cov"], X_safe[t])) if self.n_cov else 0.0
+            xi_next = d["omega"] + A_eff * s_arr[t] + d["B"] * xi_t + cov_term
+            if not np.isfinite(xi_next):
+                return (1e12 + penalty) if not return_paths else {}
+            xi_arr[t + 1] = xi_next
+
+        objective = -loglik + penalty
+        if not return_paths:
+            return objective
+
+        return {
+            "xi": xi_arr[eff:T], "s_arr": s_arr[eff:T],
+            "pi": pi_full[eff:T], "phi": phi_full[eff:T],
+            "eff_start": eff, "loglik": loglik, "penalty": penalty,
+            "objective": objective, "y_eff": y[eff:T],
+            "threshold_c": self.threshold_c,
+        }
+
+    @property
+    def threshold_c(self) -> float:
+        if self._threshold_c is None:
+            raise RuntimeError("threshold_c not set -- call fit() first.")
+        return self._threshold_c
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Public interface
+    # ──────────────────────────────────────────────────────────────────────
+
+    # phi_full / pi_full accepted here in build_full_path()'s native
+    # (shortened, index-0-is-global-index-`warmup`) form -- aligned to
+    # length len(y) internally via _align_frozen before filtering.
+
+    def loglik(self, theta, y, phi_full, pi_full, X, gamma_v, zeta_v, warmup) -> float:
+        phi_a = self._align_frozen(phi_full, warmup, len(y))
+        pi_a  = self._align_frozen(pi_full,  warmup, len(y))
+        return -self._run_filter(theta, y, phi_a, pi_a, X, gamma_v, zeta_v,
+                                  warmup, return_paths=False)
+
+    def filter(self, theta, y, phi_full, pi_full, X, gamma_v, zeta_v, warmup) -> dict:
+        phi_a = self._align_frozen(phi_full, warmup, len(y))
+        pi_a  = self._align_frozen(pi_full,  warmup, len(y))
+        return self._run_filter(theta, y, phi_a, pi_a, X, gamma_v, zeta_v,
+                                 warmup, return_paths=True)
+
+    def fit(
+        self,
+        y: np.ndarray,
+        phi_full: np.ndarray,
+        pi_full: np.ndarray,
+        gamma_v: float,
+        zeta_v: float,
+        warmup: int,
+        X: Optional[np.ndarray] = None,
+        verbose: bool = False,
+        theta0: Optional[np.ndarray] = None,
+        options: Optional[dict] = None,
+        polish: bool = True,
+    ) -> dict:
+        """
+        Estimate xi's GAS(1,1) block + covariates + regime term by
+        unbounded BFGS. phi_full/pi_full/gamma_v/zeta_v are frozen inputs,
+        never optimized (objective 3/item 4).
+        """
+        import tracemalloc
+
+        X = X if X is not None else np.zeros((len(y), self.n_cov))
+        phi_a = self._align_frozen(phi_full, warmup, len(y))
+        pi_a  = self._align_frozen(pi_full,  warmup, len(y))
+        self._threshold_c = self.compute_threshold(y)
+        if verbose:
+            print(f"  Stage-4 xi regime threshold c = {self._threshold_c:.3f} mm "
+                  f"(q{self.threshold_quantile*100:.0f} wet-day)")
+
+        theta0 = self.initial_theta() if theta0 is None else np.asarray(theta0, dtype=float)
+        opt_options = {"maxiter": 1000, "gtol": 1e-3, "disp": verbose}
+        if options:
+            opt_options.update(options)
+
+        t_start = time.time()
+        tracemalloc.start()
+
+        def obj(theta):
+            return self._run_filter(theta, y, phi_a, pi_a, X, gamma_v, zeta_v,
+                                     warmup, return_paths=False)
+
+        res = minimize(fun=obj, x0=theta0, method="BFGS", options=opt_options)
+
+        polish_improvement = 0.0
+        if polish:
+            res2 = minimize(fun=obj, x0=res.x, method="BFGS",
+                             options={**opt_options, "maxiter": 200})
+            polish_improvement = abs(res.fun - res2.fun) / (1.0 + abs(res.fun))
+            if res2.fun < res.fun:
+                res = res2
+
+        runtime_s = time.time() - t_start
+        _, peak_mem = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        grad = getattr(res, "jac", None)
+        grad_norm_inf = float(np.max(np.abs(grad))) if grad is not None else float("nan")
+        grad_norm_2   = float(np.linalg.norm(grad)) if grad is not None else float("nan")
+
+        paths     = self._run_filter(res.x, y, phi_a, pi_a, X, gamma_v, zeta_v,
+                                      warmup, return_paths=True)
+        ll_final  = float(paths["loglik"]) if paths else float(-res.fun)
+        finite_p  = bool(np.all(np.isfinite(res.x)))
+        finite_ll = bool(np.isfinite(ll_final))
+        states_ok = bool(paths) and bool(np.all(np.isfinite(paths.get("xi", [0]))))
+        grad_ok   = (grad_norm_inf < 1e-2) if not np.isnan(grad_norm_inf) else False
+
+        if res.success and finite_p and finite_ll and states_ok and grad_ok:
+            validity = "valid_converged"
+        elif finite_p and finite_ll and states_ok:
+            validity = "valid_with_warning"
+        else:
+            validity = "failed"
+
+        hess_inv   = np.array(res.hess_inv) if hasattr(res, "hess_inv") else None
+        std_errors = None
+        se_quality = "unavailable"
+        if hess_inv is not None and hess_inv.ndim == 2:
+            diag_h = np.diag(hess_inv)
+            if np.all(diag_h > 0) and np.all(np.isfinite(diag_h)):
+                std_errors = np.sqrt(diag_h)
+                se_quality = "approximate"
+            else:
+                se_quality = "unreliable"
+
+        return {
+            "theta": res.x, "loglik": ll_final, "validity": validity,
+            "success": bool(res.success), "message": str(res.message),
+            "n_iter": int(res.nit), "n_fev": int(res.nfev),
+            "grad": grad, "grad_norm_inf": grad_norm_inf, "grad_norm_2": grad_norm_2,
+            "hess_inv": hess_inv, "std_errors": std_errors, "se_quality": se_quality,
+            "runtime_s": runtime_s, "peak_mem_mb": peak_mem / 1e6,
+            "polish_improvement": polish_improvement,
+            "param_names": self.parameter_names(),
+            "threshold_c": self._threshold_c,
+            # Frozen (not optimized) inputs, persisted so downstream metric
+            # recomputation (e.g. extended twCRPS) can rebuild the static
+            # distribution parameters without needing the base model artifact.
+            "gamma_frozen": gamma_v,
+            "zeta_frozen":  zeta_v,
+        }
+
+    def simulate_oos(
+        self,
+        theta: np.ndarray,
+        y_train: np.ndarray,
+        y_test: np.ndarray,
+        phi_full: np.ndarray,
+        pi_full: np.ndarray,
+        gamma_v: float,
+        zeta_v: float,
+        warmup: int,
+        X_train: Optional[np.ndarray] = None,
+        X_test: Optional[np.ndarray] = None,
+    ) -> dict:
+        """1-step-ahead rolling OOS evaluation over the concatenated series."""
+        y_full = np.concatenate([y_train, y_test])
+        X_train = X_train if X_train is not None else np.zeros((len(y_train), self.n_cov))
+        X_test  = X_test  if X_test  is not None else np.zeros((len(y_test),  self.n_cov))
+        X_full  = np.concatenate([X_train, X_test], axis=0)
+
+        phi_aligned = self._align_frozen(phi_full, warmup, len(y_full))
+        pi_aligned  = self._align_frozen(pi_full,  warmup, len(y_full))
+
+        paths = self._run_filter(theta, y_full, phi_aligned, pi_aligned, X_full,
+                                  gamma_v, zeta_v, warmup, return_paths=True)
+        if not paths:
+            return {"f_arr_oos": np.zeros((len(y_test), 1)),
+                    "pi_oos": np.zeros(len(y_test)),
+                    "static": {"gamma": gamma_v, "zeta": zeta_v},
+                    "tv_names": ["xi"], "y_test": y_test}
+
+        T_train = len(y_train)
+        eff = paths["eff_start"]
+        # Slice the OOS portion out of the effective-sample-truncated arrays.
+        oos_start_in_eff = max(T_train - eff, 0)
+        xi_oos  = paths["xi"][oos_start_in_eff:]
+        pi_oos  = paths["pi"][oos_start_in_eff:]
+        phi_oos = paths["phi"][oos_start_in_eff:]
+
+        return {
+            "f_arr_oos": np.column_stack([phi_oos, xi_oos]),
+            "pi_oos":    pi_oos,
+            "static":    {"gamma": gamma_v, "zeta": zeta_v},
+            "tv_names":  ["phi", "xi"],
+            "y_test":    y_test,
+        }
+
+    def save_result(self, result: dict, out_dir: "Path") -> None:
+        import json
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        names = result.get("param_names", self.parameter_names())
+        pd.DataFrame({"parameter": names, "value": result["theta"]}).to_csv(
+            out_dir / "estimated_parameters.csv", index=False
+        )
+        if result.get("std_errors") is not None:
+            pd.DataFrame({
+                "parameter": names, "std_error": result["std_errors"],
+                "se_quality": result["se_quality"],
+            }).to_csv(out_dir / "standard_errors.csv", index=False)
+
+        meta = {
+            "model_type": "RegimeXiOnlyModel",
+            "model_class": "RegimeXiOnlyModel",
+            "n_params": self.n_params,
+            # phi is frozen (exogenous), so the OOS predictive distribution
+            # is still phi+xi -- tv_param_names describes what simulate_oos()
+            # returns, not what this model's own theta optimizes (that is
+            # xi alone; see parameter_names()).
+            "tv_param_names": ["phi", "xi"],
+            "cov_names": self.cov_names,
+            "scaling": self.scaling,
+            "threshold_quantile": self.threshold_quantile,
+            "threshold_c": result.get("threshold_c"),
+            "gamma": result.get("gamma_frozen"),
+            "zeta":  result.get("zeta_frozen"),
+            "loglik": float(result["loglik"]),
+            "validity": result.get("validity", "unknown"),
+            "success": bool(result.get("success", False)),
+            "message": str(result.get("message", "")),
+            "n_iter": int(result.get("n_iter", 0)),
+            "n_fev": int(result.get("n_fev", 0)),
+            "grad_norm_inf": float(result.get("grad_norm_inf", float("nan"))),
+            "grad_norm_2": float(result.get("grad_norm_2", float("nan"))),
+            "runtime_s": float(result.get("runtime_s", float("nan"))),
+            "peak_mem_mb": float(result.get("peak_mem_mb", float("nan"))),
+            "se_quality": result.get("se_quality", "unavailable"),
+            "polish_improvement": float(result.get("polish_improvement", 0.0)),
+        }
+        (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+        if result.get("grad") is not None:
+            pd.DataFrame({"parameter": names, "gradient": result["grad"]}).to_csv(
+                out_dir / "gradients.csv", index=False
+            )
+        if result.get("hess_inv") is not None:
+            hi = np.array(result["hess_inv"])
+            if hi.ndim == 2:
+                np.save(out_dir / "hess_inv.npy", hi)
+
+
+def build_regime_xi_only_from_frozen_phi(
+    base_model_dir: "Path",
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    xi_cov_train: np.ndarray,
+    xi_cov_test: np.ndarray,
+    xi_cov_names: List[str],
+    threshold_quantile: float,
+    base_extra_fit_kwargs: Optional[dict] = None,
+    base_extra_oos_kwargs: Optional[dict] = None,
+) -> Tuple["RegimeXiOnlyModel", dict]:
+    """
+    Build a Stage-4 RegimeXiOnlyModel from a saved phi-only base artifact
+    (Stage 1, 2, or 3 winner -- ZAGASModel, CovZAGASModel, or
+    HarveyZAGASModel, whichever won by OOS RMSE per objective 1a).
+
+    Returns (model, frozen) where `frozen` carries everything the caller
+    needs to call model.fit()/simulate_oos(): phi_full, pi_full, gamma_v,
+    zeta_v, warmup.
+    """
+    from pipeline.artifact_utils import load_model_and_theta, build_full_path
+    from distributions.gb2_log_link import GB2LogLink
+
+    base_model, base_theta, base_meta, _ = load_model_and_theta(base_model_dir)
+    if base_model is None or base_theta is None:
+        raise RuntimeError(f"Could not reconstruct base model from {base_model_dir}")
+
+    full = build_full_path(
+        base_model, base_theta, y_train, y_test,
+        extra_fit_kwargs=base_extra_fit_kwargs, extra_oos_kwargs=base_extra_oos_kwargs,
+    )
+    phi_full = full["phi"]
+    pi_full  = full["pi"]
+    gamma_v  = float(full["static"].get("gamma"))
+    zeta_v   = float(full["static"].get("zeta"))
+    warmup   = full["offset"]
+
+    model = RegimeXiOnlyModel(
+        distribution=GB2LogLink(),
+        scaling=base_meta.get("scaling", "diagonal_inverse_fisher"),
+        threshold_quantile=threshold_quantile,
+        cov_names=xi_cov_names,
+    )
+
+    frozen = {
+        "phi_full": phi_full, "pi_full": pi_full,
+        "gamma_v": gamma_v, "zeta_v": zeta_v, "warmup": warmup,
+        "X_train": xi_cov_train, "X_test": xi_cov_test,
+        "base_model_id": base_meta.get("model_id", str(base_model_dir.name)),
+    }
+    return model, frozen

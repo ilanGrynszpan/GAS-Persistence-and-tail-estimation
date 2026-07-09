@@ -5,18 +5,41 @@ Multi-location pipeline runner.
 OVERVIEW
 =============================================================================
 
-Runs the complete ZA-GAS three-stage estimation pipeline for every location
-in STATION_REGISTRY, except:
-  - BELO HORIZONTE  (already estimated; artifacts in run_20260701_bh)
-  - RIYADH          (excluded: bad data file per user instruction)
+Runs the ZA-GAS estimation pipeline for the six locations already present
+in reports/multi_location/report.tex: BELO HORIZONTE, CRUZEIRO DO SUL,
+DARWIN AIRPORT, GARANHUNS, MANAUS, SALVADOR. (SAO PAULO and TORONTO are
+configured in STATION_REGISTRY but were never actually run in round 1 and
+stay out of scope for round 2, per prompt.md's explicit instruction to
+reuse only the already-run locations. RIYADH is excluded for bad data.)
 
-Then runs Stage 4 (regime-sensitive GAS) for every location using the
-best model from Stages 1-3.
+For each location, per prompt.md (2026-07-07 revision):
 
-Execution is SEQUENTIAL across locations to avoid RAM saturation
-(available RAM ≈ 6 GB; each stage uses up to 3-4 GB during optimisation).
-Within each location, Stage 1 and Stage 3 run in parallel (--workers workers).
-Stage 2 runs sequentially with warm starts (architecture requirement).
+  1. Stages 1-2 (phi+xi branch): reused from round-1 artifacts where valid
+     -- NOT re-estimated. Only the *winner selection* changes (objective
+     1b): OOS CRPS is now the ranking criterion (never log-likelihood),
+     with twCRPS@95/98 reported alongside.
+
+  2. Stage 3 (phi+xi branch): RE-ESTIMATED. Round 1's ENSO covariate was
+     built from mislabelled raw sea-surface temperature (see
+     data/station_loader.py header) and has been replaced with El Nino/La
+     Nina dummy tiers built from the correct NOAA ONI classification.
+
+  3. A parallel phi-only branch (objective 1a) is run through its OWN
+     Stage 1 (already exists) -> Stage 2 -> Stage 3, ranked throughout by
+     OOS RMSE, never CRPS or log-likelihood, and never mixed with the
+     phi+xi branch. This is new estimation round 1 did not include.
+
+  4. Stage 4 (objective 3) is redesigned: tail-sensitive dynamics for xi
+     ONLY. Phi (and the occurrence probability pi) are frozen at whichever
+     phi-only model won Stages 1-3 above -- never re-estimated. xi gets a
+     full fresh GAS(1,1) + short-term-weather-covariate + regime fit.
+     Thresholds: q95 and q98 only (q90 dropped per objective 3b). Each
+     Stage-4 model is accepted only if its twCRPS beats the phi+xi
+     branch's best-of-previous-stages counterpart by >=2% (objective 3a).
+
+Execution is SEQUENTIAL across locations to avoid RAM saturation. Within a
+location, independent models inside one stage run in parallel
+(--workers workers). Stage 2 runs sequentially with warm starts.
 
 =============================================================================
 USAGE
@@ -27,7 +50,7 @@ USAGE
 Options:
     --workers N       Number of parallel workers per stage (default 4)
     --force           Re-estimate even when valid artifacts exist
-    --skip-regime     Skip Stage 4 regime models
+    --skip-stage4     Skip Stage 4 (tail-sensitive xi regime)
     --location NAME   Run only one location (exact name from STATION_REGISTRY)
     --start-from NAME Skip all locations before NAME in the processing order
 
@@ -35,27 +58,21 @@ Options:
 ARTIFACT STRUCTURE
 =============================================================================
 
-artifacts/
-    run_20260701_bh/           (BH — already done)
-    run_20260705_cruzeiro/
-        stage1/ stage2/ stage3/ stage4_regime/
-        stage_winners.json
-        execution_log.jsonl
-    run_20260705_darwin/
-    ...  (one directory per location)
+artifacts/run_<id>/
+    stage1/                     phi+xi and phi-only Stage-1 models (12 total)
+    stage2/, stage3/            phi+xi branch (weather covariates, Harvey)
+    stage2_phi/, stage3_phi/    phi-only branch (objective 1a)
+    stage4_xi_regime/           tail-sensitive xi models (q95, q98)
+    stage_winners.json
+    execution_log.jsonl
 
 =============================================================================
 MONITORING
 =============================================================================
 
 Progress is written to:
-    pipeline_all_locations.log     — human-readable, tee'd to stdout
-    artifacts/<run_id>/execution_log.jsonl  — per-model machine-readable
-
-This script actively monitors each model's runtime and will log alerts for:
-    - Models taking more than 30 min (possibly stuck)
-    - Models that fail (failure isolation: pipeline continues)
-    - Stages with no valid winner
+    pipeline_all_locations.log     -- human-readable, tee'd to stdout
+    artifacts/<run_id>/execution_log.jsonl  -- per-model machine-readable
 """
 
 from __future__ import annotations
@@ -77,25 +94,32 @@ if str(ROOT) not in sys.path:
 # ── Paths ────────────────────────────────────────────────────────────────────
 PRECIP_DIR  = Path(r"C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\data\output")
 ERA5_DIR    = ROOT / "data" / "input" / "ERA5"
-NINO34_PATH = ROOT / "data" / "processed" / "pacific" / "NINO34_daily.csv"
+ENSO_PATH   = ROOT / "data" / "processed" / "pacific" / "ENSO_clean.csv"
 ARTIFACTS_DIR = ROOT / "artifacts"
 
-# Locations that skip this script (already estimated or excluded)
-SKIP_STATIONS = {"BELO HORIZONTE", "RIYADH OBS. (O.A.P."}
+# Locations excluded from every round of this script (bad source data)
+SKIP_STATIONS = {"RIYADH OBS. (O.A.P."}
 
-# Processing order (stable, alphabetical)
+# The six locations already reported in reports/multi_location/report.tex.
+# SAO PAULO and TORONTO are registered in STATION_REGISTRY but were never
+# run in round 1 -- prompt.md 2026-07-07 explicitly says to reuse only the
+# already-run locations, not add new ones.
 LOCATION_ORDER = [
+    "BELO HORIZONTE",
     "CRUZEIRO DO SUL (ACRE)",
     "DARWIN AIRPORT",
     "GARANHUNS (PERNAMBUCO)",
     "MANAUS",
     "SALVADOR",
-    "SÃO PAULO",
-    "TORONTO",
 ]
 
-# OOS CRPS improvement threshold to accept a higher stage (prompt §: 2%)
-CRPS_IMPROVEMENT_THRESHOLD = 0.02
+# Improvement threshold for every "best metric or simplest model" decision
+# (objective 4d): in-stage winners, inter-stage advancement, and Stage-4
+# acceptance all use this same 2% rule.
+IMPROVEMENT_THRESHOLD = 0.02
+
+# Stage-4 xi-only regime: thresholds retained per objective 3b (q90 dropped)
+STAGE4_THRESHOLDS = [("95", 0.95), ("98", 0.98)]
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log_file = ROOT / "pipeline_all_locations.log"
@@ -118,349 +142,275 @@ def alert(msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage-advancement logic
+# Inter-stage winner selection (prompt.md 4d, pipeline.selection)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _should_advance(
-    current_crps: float,
-    new_crps: float,
-    threshold: float = CRPS_IMPROVEMENT_THRESHOLD,
-    stage_name: str = "next",
-) -> bool:
+def _resolve_branch_final_winner(stage_winners: list, tvp_set: str, branch_label: str) -> dict | None:
     """
-    Return True if accepting the new stage reduces OOS CRPS by ≥ threshold.
+    Apply the best-metric-or-simplest rule (pipeline.selection) across a
+    branch's stage winners (e.g. [stage1_phi, stage2_phi, stage3_phi]) to
+    pick that branch's overall final winner. Logs the chain of decisions.
     """
-    if not np.isfinite(current_crps) or not np.isfinite(new_crps):
-        return False
-    improvement = (current_crps - new_crps) / max(abs(current_crps), 1e-12)
-    logger.info(f"  Stage advancement check ({stage_name}): "
-                f"current CRPS={current_crps:.4f}  new CRPS={new_crps:.4f}  "
-                f"improvement={improvement:.2%}  "
-                f"{'ACCEPT' if improvement >= threshold else 'REJECT'}")
-    return improvement >= threshold
+    from pipeline.selection import select_inter_stage_winner
 
+    candidates = [w for w in stage_winners if w is not None]
+    if not candidates:
+        logger.warning(f"  {branch_label}: no valid stage winner to select from.")
+        return None
 
-def _get_crps(winner: dict | None) -> float:
-    if winner is None:
-        return float("nan")
-    return float(winner.get("oos_metrics", {}).get("crps_mean", float("nan")))
+    final = select_inter_stage_winner(candidates, tvp_set, IMPROVEMENT_THRESHOLD)
+    if final:
+        key_metric = "rmse" if tvp_set == "phi_only" else "crps_mean"
+        logger.info(
+            f"  {branch_label} FINAL WINNER: {final['model_id']}  "
+            f"{key_metric}={final.get('oos_metrics', {}).get(key_metric, float('nan')):.4f}  "
+            f"({final.get('_tie_break', '')})"
+        )
+    return final
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 4: Regime models
+# Stage 4: tail-sensitive xi-only regime, frozen phi (objective 3)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _find_base_for_regime(
-    stage1_winner: dict | None,
-    stage2_winner: dict | None,
-    crps_s1: float,
-    crps_s2: float,
-) -> tuple[dict | None, str]:
-    """
-    Return the Stage 1 or 2 winner to use as the base for regime models.
-
-    Stage 2 is accepted only if it improved CRPS ≥ 2 % over Stage 1.
-    Stage 3 (Harvey) is never used as base — the regime model is always
-    GAS(1,1), which is incompatible with the Harvey long/short structure.
-
-    Returns (winner_dict, label) where label is "stage1" or "stage2".
-    """
-    if (
-        stage2_winner
-        and np.isfinite(crps_s1)
-        and np.isfinite(crps_s2)
-        and (crps_s1 - crps_s2) / max(abs(crps_s1), 1e-12) >= CRPS_IMPROVEMENT_THRESHOLD
-    ):
-        logger.info("  Stage 4: using Stage-2 winner as regime base (≥2% CRPS gain).")
-        return stage2_winner, "stage2"
-    logger.info("  Stage 4: using Stage-1 winner as regime base.")
-    return stage1_winner, "stage1"
+def _stage_dir_for_model_id(run_dir: Path, model_id: str) -> Path:
+    """Map a phi-only-branch model_id back to its artifact subdirectory."""
+    if model_id.startswith("stage3_phi_harvey_"):
+        return run_dir / "stage3_phi" / model_id
+    if model_id.startswith("stage2_phi_"):
+        return run_dir / "stage2_phi" / model_id
+    if model_id.startswith("stage1_phi_"):
+        return run_dir / "stage1" / model_id
+    raise ValueError(f"Cannot map phi-only model_id to a stage directory: {model_id}")
 
 
-def run_regime_stage(
+def _base_covariate_kwargs(
+    phi_final_winner: dict,
+    stage2_phi_winner: dict | None,
     data: dict,
-    stage1_winner: dict | None,
-    stage2_winner: dict | None,
-    crps_s1: float,
-    crps_s2: float,
+) -> tuple[dict, dict]:
+    """
+    Build (fit_kwargs, oos_kwargs) needed to replay the frozen phi-only
+    winner's own filter, dispatching on which stage it came from:
+    Stage 1 (no covariates), Stage 2 (weather X), or Stage 3 (Harvey
+    X_long/X_short -- X_short is inherited from the phi-only Stage-2
+    winner exactly as Stage 3 itself did during estimation).
+    """
+    mid = phi_final_winner["model_id"]
+    bt, bv = data["covariate_blocks_train"], data["covariate_blocks_test"]
+
+    if mid.startswith("stage1_phi_"):
+        return {}, {}
+
+    if mid.startswith("stage2_phi_"):
+        block = mid.replace("stage2_phi_", "")
+        return ({"X": bt[block]}, {"X_train": bt[block], "X_test": bv[block]})
+
+    if mid.startswith("stage3_phi_harvey_"):
+        enso_tier = mid.replace("stage3_phi_harvey_", "")
+        empty_tr = np.zeros((len(data["y_train"]), 0))
+        empty_te = np.zeros((len(data["y_test"]),  0))
+        Xl_tr = bt[enso_tier] if enso_tier != "no_enso" else empty_tr
+        Xl_te = bv[enso_tier] if enso_tier != "no_enso" else empty_te
+        if stage2_phi_winner is None:
+            raise RuntimeError(
+                f"Stage-3 phi-only winner {mid} needs its Stage-2 weather "
+                f"block, but no Stage-2 phi-only winner was recorded."
+            )
+        short_block = stage2_phi_winner.get(
+            "best_weather_block", stage2_phi_winner["model_id"].replace("stage2_phi_", "")
+        )
+        Xs_tr, Xs_te = bt[short_block], bv[short_block]
+        return (
+            {"X_long": Xl_tr, "X_short": Xs_tr},
+            {"X_long_train": Xl_tr, "X_long_test": Xl_te,
+             "X_short_train": Xs_tr, "X_short_test": Xs_te},
+        )
+
+    raise ValueError(f"Unrecognized phi-only model_id: {mid}")
+
+
+def run_stage4(
+    data: dict,
+    phi_final_winner: dict,
+    stage2_phi_winner: dict | None,
+    phixi_final_winner: dict | None,
     run_dir: Path,
-    log_path: Path,
-    workers: int = 4,
     force_rerun: bool = False,
-) -> list:
+) -> dict:
     """
-    Run Stage 4 regime-sensitive GAS models.
+    Estimate the tail-sensitive xi-only regime at q95 and q98 (objective 3),
+    with phi frozen at `phi_final_winner`. Each is accepted only if its
+    twCRPS beats `phixi_final_winner` (the phi+xi branch's best-of-
+    previous-stages counterpart, objective 3a) by >=2%.
 
-    Always estimates GAS(1,1) with phi+xi distribution.  Tests:
-        3 thresholds × 3 TV-regime combos = 9 models
-
-    Thresholds (wet-day quantile):  90 %, 95 %, 98 %
-    TV-regime combos:
-        phi_only   — only phi gets the A_ext regime term
-        xi_only    — only xi  gets the A_ext regime term
-        phi_xi     — both phi and xi get A_ext regime terms
-
-    The non-regime parameter still has full GAS(1,1) dynamics (omega, B, A).
-
-    The base configuration is taken from the best Stage-1/2 winner
-    (Stage 2 accepted iff CRPS improved ≥ 2 % over Stage 1).
-    Harvey Stage-3 winners are never used directly — the regime model
-    falls back to the best of Stage 1 / Stage 2 as described above.
-
-    Parameters
-    ----------
-    data           : output of StationDataLoader.load_all()
-    stage1_winner  : pipeline output dict for Stage-1 winner
-    stage2_winner  : pipeline output dict for Stage-2 winner (may be None)
-    crps_s1/s2     : OOS CRPS for stage 1 / 2 winners
-    run_dir        : location artifact directory
-    log_path       : jsonl log file
-    workers        : parallel workers (shared with Stage 1–3)
-    force_rerun    : re-estimate even when valid artifacts exist
+    xi's covariates are always the short-term weather block ("dewtemp_seasonal")
+    -- never Stage 3's ENSO covariates (item 3: "stages 3 and 4 for xi are
+    separate things"). Confirmed applicable at every one of the six
+    locations by inspecting the existing phi+xi Stage-2 winner's xi
+    coefficients before this round began (see audit/implementation_plan_07072026.tex).
     """
-    from models.regime_gas import build_regime_from_winner
-    from distributions.gb2_log_link import GB2LogLink
-    from pi_dynamics.factory import make_pi_dynamics
-    from pipeline.runner import run_single_model, run_stage_parallel
+    from models.regime_gas import build_regime_xi_only_from_frozen_phi
+    from pipeline.runner import run_single_model
+    from pipeline.selection import stage4_beats_base
 
-    import json as _json
-    import pandas as pd
-
-    stage_dir = run_dir / "stage4_regime"
+    stage_dir = run_dir / "stage4_xi_regime"
     stage_dir.mkdir(exist_ok=True)
 
-    dist_phixi = GB2LogLink()
-    pi_dyn     = make_pi_dynamics("ar_logistic", seasonal="daily")
+    if phi_final_winner is None:
+        logger.warning("  Stage 4: no phi-only final winner -- skipped.")
+        return {"models": [], "accepted": {}}
 
-    # ── Select base model ─────────────────────────────────────────────────
-    base_winner, base_stage_label = _find_base_for_regime(
-        stage1_winner, stage2_winner, crps_s1, crps_s2
-    )
-    if base_winner is None:
-        logger.info("  Stage 4: no Stage-1 winner — regime stage skipped.")
-        return []
+    base_model_dir = _stage_dir_for_model_id(run_dir, phi_final_winner["model_id"])
+    fit_kw_base, oos_kw_base = _base_covariate_kwargs(phi_final_winner, stage2_phi_winner, data)
 
-    # Load base winner parameters for warm-starting
-    base_model_id = base_winner.get("model_id", "")
-    base_dir      = run_dir / base_stage_label / base_model_id
-    base_params_df = None
-    try:
-        base_params_df = pd.read_csv(base_dir / "estimated_parameters.csv")
-    except Exception as exc:
-        logger.warning(f"  Stage 4: could not load base params ({exc}); using fresh init.")
+    y_train, y_test = data["y_train"], data["y_test"]
+    bt, bv, cn = data["covariate_blocks_train"], data["covariate_blocks_test"], data["covariate_col_names"]
 
-    y_train = data["y_train"]
-    y_test  = data["y_test"]
+    results = {}
+    for q_label, q_val in STAGE4_THRESHOLDS:
+        model_id = f"stage4_xi_regime_q{q_label}"
+        logger.info(f"STAGE 4  --  xi-only tail regime q{q_label}  "
+                    f"(phi frozen from {phi_final_winner['model_id']})")
 
-    # ── Build 9 specs: 3 thresholds × 3 TV-regime combos ─────────────────
-    THRESHOLDS = [("90", 0.90), ("95", 0.95), ("98", 0.98)]
-    TV_COMBOS  = [
-        ("phi_only", ["phi"]),
-        ("xi_only",  ["xi"]),
-        ("phi_xi",   ["phi", "xi"]),
-    ]
-
-    # 7200 s stage-level timeout.  All 9 futures are submitted simultaneously
-    # so future_start[] is effectively the stage start time for every future —
-    # this is a stage budget, not a per-model cap.  With maxiter=30 and ~2100 s
-    # max per model, 3 batches of 4 workers need ≤ 3 × 2100 = 6300 s < 7200 s.
-    REGIME_MODEL_TIMEOUT = 7200
-
-    # Scaling fallback: try diagfi first; if ALL models produce non-finite
-    # CRPS (divergence or numerical failure), retry with unit then fullfi.
-    # diagfi uses original model IDs (backward compatible with existing
-    # artifacts).  Fallback scalings use a prefix to avoid ID collisions.
-    SCALINGS_TO_TRY = [
-        ("",        "diagonal_inverse_fisher"),   # primary — no prefix
-        ("unit_",   "unit"),                       # fallback 1
-        ("fullfi_", "full_inverse_fisher"),        # fallback 2
-    ]
-
-    results = []
-    for sc_prefix, sc_name in SCALINGS_TO_TRY:
-        specs = []
-        for q_label, q_val in THRESHOLDS:
-            for tv_label, regime_tv in TV_COMBOS:
-                model_id = f"stage4_regime_{sc_prefix}{q_label}_{tv_label}"
-                model, theta0 = build_regime_from_winner(
-                    dist_phixi=dist_phixi,
-                    pi_dyn=pi_dyn,
-                    regime_tv_names=regime_tv,
-                    threshold_quantile=q_val,
-                    base_params_df=base_params_df,
-                    y_train=y_train,
-                    scaling=sc_name,
-                )
-                # Regime models use a Python-loop GAS filter (~1.8 s/eval on
-                # daily data of ~3000 obs).  maxiter=30 → ~27 min/model wall-
-                # clock which fits comfortably inside the 7200 s stage budget.
-                fit_kw = {
-                    "y":      y_train,
-                    "verbose": False,
-                    "options": {"maxiter": 30},
-                    "polish":  False,
-                }
-                if theta0 is not None:
-                    fit_kw["theta0"] = theta0
-                oos_kw = {"y_train": y_train, "y_test": y_test}
-                specs.append((model_id, model, fit_kw, oos_kw))
-
-        sc_display = sc_name.replace("diagonal_inverse_fisher", "diagfi")
-        logger.info(
-            f"STAGE 4  —  Regime-sensitive GAS ({len(specs)} models: "
-            f"3 thresholds × 3 TV combos, base={base_model_id}, scaling={sc_display})"
+        model, frozen = build_regime_xi_only_from_frozen_phi(
+            base_model_dir=base_model_dir,
+            y_train=y_train, y_test=y_test,
+            xi_cov_train=bt["dewtemp_seasonal"], xi_cov_test=bv["dewtemp_seasonal"],
+            xi_cov_names=cn["dewtemp_seasonal"],
+            threshold_quantile=q_val,
+            base_extra_fit_kwargs=fit_kw_base, base_extra_oos_kwargs=oos_kw_base,
         )
 
-        if workers > 1 and len(specs) > 1:
-            sc_results = run_stage_parallel(
-                specs=specs, y_test=y_test,
-                stage_dir=stage_dir, log_path=log_path, logger=logger,
-                workers=min(workers, len(specs)), force_rerun=force_rerun,
-                model_timeout=REGIME_MODEL_TIMEOUT,
+        fit_kwargs = {
+            "y": y_train, "phi_full": frozen["phi_full"], "pi_full": frozen["pi_full"],
+            "gamma_v": frozen["gamma_v"], "zeta_v": frozen["zeta_v"], "warmup": frozen["warmup"],
+            "X": frozen["X_train"], "verbose": False,
+            "options": {"maxiter": 60}, "polish": False,
+        }
+        oos_kwargs = {
+            "y_train": y_train, "y_test": y_test,
+            "phi_full": frozen["phi_full"], "pi_full": frozen["pi_full"],
+            "gamma_v": frozen["gamma_v"], "zeta_v": frozen["zeta_v"], "warmup": frozen["warmup"],
+            "X_train": frozen["X_train"], "X_test": frozen["X_test"],
+        }
+
+        r = run_single_model(
+            model_id=model_id, model=model,
+            fit_kwargs=fit_kwargs, oos_kwargs=oos_kwargs,
+            y_test=y_test, cache_dir=stage_dir,
+            log_path=run_dir / "execution_log.jsonl",
+            logger=logger, force_rerun=force_rerun,
+        )
+        results[q_label] = r
+
+    # ── Objective 3a: twCRPS vs. the phi+xi branch's best counterpart ─────
+    accepted = {}
+    if phixi_final_winner is None:
+        logger.warning("  Stage 4: no phi+xi final winner to compare twCRPS against.")
+    else:
+        base_ext = _extended_metrics_from_cached(
+            phixi_final_winner["model_id"], run_dir, y_test,
+        )
+        for q_label, _ in STAGE4_THRESHOLDS:
+            r = results[q_label]
+            if r.get("result") is None and r.get("status") != "cached":
+                accepted[q_label] = {"winner": "base", "reason": "stage4 fit failed"}
+                continue
+            s4_ext = _extended_metrics_from_cached(
+                f"stage4_xi_regime_q{q_label}", run_dir, y_test, stage_dir_name="stage4_xi_regime",
             )
-        else:
-            sc_results = []
-            for model_id, model, fit_kw, oos_kw in specs:
-                r = run_single_model(
-                    model_id=model_id, model=model,
-                    fit_kwargs=fit_kw, oos_kwargs=oos_kw,
-                    y_test=y_test,
-                    cache_dir=stage_dir, log_path=log_path,
-                    logger=logger, force_rerun=force_rerun,
-                )
-                sc_results.append(r)
-
-        results.extend(sc_results)
-
-        # Check whether any model in this scaling batch converged *well*.
-        # Two criteria must both hold:
-        #   (1) finite OOS CRPS;
-        #   (2) loglik not catastrophically worse than the base model.
-        # Criterion (2) catches scaling-mismatch divergence: when unit-scaling
-        # Stage-1 init params are fed into a diagfi Stage-4 filter, the
-        # optimizer finds a degenerate solution with finite-but-terrible CRPS
-        # and loglik 5-10× worse than Stage 1.  Without (2) the fallback would
-        # never trigger because (1) alone is satisfied.
-        # Threshold = 3× magnitude of base loglik (ratio 1.15 for Garanhuns
-        # where diagfi is consistent; ratio 8.18 for Manaus mismatch case).
-        base_loglik_abs = abs(float(base_winner.get("loglik", 0.0) or 0.0))
-
-        _good = [
-            r for r in sc_results
-            if r is not None
-            and np.isfinite(float(r.get("oos_metrics", {}).get("crps_mean", float("nan"))))
-            and (
-                base_loglik_abs <= 0
-                or abs(float(r.get("loglik", 0.0) or 0.0)) < 3.0 * base_loglik_abs
+            key_metric = f"twcrps_{q_label}"
+            decision = stage4_beats_base(
+                {key_metric: s4_ext.get(key_metric, float("nan"))},
+                {key_metric: base_ext.get(key_metric, float("nan"))},
+                key_metric=key_metric, improvement_threshold=IMPROVEMENT_THRESHOLD,
             )
-        ]
-        if _good:
+            accepted[q_label] = decision
             logger.info(
-                f"  Stage 4 ({sc_display}): {len(_good)}/{len(sc_results)} models "
-                f"converged well (finite CRPS + loglik < 3× base) "
-                f"— stopping scaling search."
+                f"  Stage 4 q{q_label} decision: {decision['winner']}  "
+                f"({key_metric}: stage4={decision['stage4_value']:.4f} vs "
+                f"base={decision['base_value']:.4f}, "
+                f"improvement={decision['rel_improvement']:.2%})"
             )
-            break
-        else:
-            _finite_bad = [
-                r for r in sc_results
-                if r is not None
-                and np.isfinite(float(r.get("oos_metrics", {}).get("crps_mean", float("nan"))))
-            ]
-            if _finite_bad:
-                logger.warning(
-                    f"  Stage 4 ({sc_display}): {len(_finite_bad)}/{len(sc_results)} "
-                    f"models have finite CRPS but loglik degradation exceeds 3× base "
-                    f"(scaling-mismatch divergence) — trying next scaling."
-                )
-            else:
-                logger.warning(
-                    f"  Stage 4 ({sc_display}): no model produced finite CRPS "
-                    f"— trying next scaling."
-                )
 
-    # ── Stage 4 acceptance decision ───────────────────────────────────────
-    # Compare the best well-converged regime CRPS against the base model CRPS.
-    # "Well-converged" = finite CRPS AND loglik not catastrophically worse than
-    # base (the same criterion used in the scaling-fallback loop above).
-    base_loglik_abs_accept = abs(float(base_winner.get("loglik", 0.0) or 0.0)) if base_winner else 0.0
-
-    finite_well_converged = [
-        r for r in results
-        if r is not None
-        and np.isfinite(float(r.get("oos_metrics", {}).get("crps_mean", float("nan"))))
-        and (
-            base_loglik_abs_accept <= 0
-            or abs(float(r.get("loglik", 0.0) or 0.0)) < 3.0 * base_loglik_abs_accept
-        )
-    ]
-
-    if finite_well_converged:
-        best_regime = min(
-            finite_well_converged,
-            key=lambda r: float(r.get("oos_metrics", {}).get("crps_mean", float("inf"))),
-        )
-        best_regime_crps = float(best_regime.get("oos_metrics", {}).get("crps_mean"))
-        best_regime_id   = best_regime.get("model_id", "?")
-    else:
-        best_regime_crps = float("nan")
-        best_regime_id   = None
-
-    # Base CRPS: prefer crps_s1 (Bug-1-corrected value) over base_winner.crps
-    # which may be NaN for fullfi winners.
-    base_crps_accept = crps_s1
-    if base_stage_label == "stage2" and np.isfinite(float(crps_s2 or float("nan"))):
-        base_crps_accept = crps_s2
-
-    if np.isfinite(base_crps_accept) and np.isfinite(best_regime_crps):
-        s4_improvement = (base_crps_accept - best_regime_crps) / max(abs(base_crps_accept), 1e-12)
-        stage4_accepted = s4_improvement >= CRPS_IMPROVEMENT_THRESHOLD
-        stage4_note = (
-            f"Best regime model: {best_regime_id} (CRPS={best_regime_crps:.4f}); "
-            f"base CRPS={base_crps_accept:.4f}; "
-            f"improvement={s4_improvement:.2%}; "
-            f"{'ACCEPTED' if stage4_accepted else 'NOT ACCEPTED (below 2% threshold)'}."
-        )
-    elif not np.isfinite(best_regime_crps):
-        stage4_accepted = False
-        stage4_note = (
-            "Stage 4 not accepted: no well-converged regime model found "
-            "(all models diverged or produced non-finite CRPS). "
-            "Likely cause: scaling mismatch between Stage-1 init params and regime filter."
-        )
-    else:
-        stage4_accepted = False
-        stage4_note = "Stage 4 not accepted: base CRPS not finite (fullfi instability)."
-
-    logger.info(f"  Stage 4 decision: {stage4_note}")
-
-    # ── Append results + decision to stage_winners.json ───────────────────
     winners_path = run_dir / "stage_winners.json"
     try:
-        existing = _json.loads(winners_path.read_text()) if winners_path.exists() else {}
+        existing = json.loads(winners_path.read_text()) if winners_path.exists() else {}
     except Exception:
         existing = {}
-
-    existing["stage4_regime"] = {
-        "base_model":       base_model_id,
-        "base_source":      base_stage_label,
-        "base_crps":        base_crps_accept if np.isfinite(base_crps_accept) else None,
-        "best_regime_crps": best_regime_crps if np.isfinite(best_regime_crps) else None,
-        "stage4_accepted":  stage4_accepted,
-        "stage4_note":      stage4_note,
+    existing["stage4_xi_regime"] = {
+        "base_model": phi_final_winner["model_id"],
+        "counterpart": phixi_final_winner["model_id"] if phixi_final_winner else None,
+        "accepted": accepted,
         "models": [
-            {
-                "model_id": r.get("model_id"),
-                "validity":  r.get("validity"),
-                "loglik":    r.get("loglik"),
-                "crps_mean": r.get("oos_metrics", {}).get("crps_mean"),
-            }
-            for r in results
+            {"model_id": r.get("model_id"), "validity": r.get("validity"),
+             "loglik": r.get("loglik"), "crps_mean": r.get("oos_metrics", {}).get("crps_mean")}
+            for r in results.values()
         ],
     }
-    winners_path.write_text(_json.dumps(existing, indent=2, default=str))
+    winners_path.write_text(json.dumps(existing, indent=2, default=str))
 
-    return results
+    return {"models": results, "accepted": accepted}
+
+
+def _extended_metrics_from_cached(model_id: str, run_dir: Path, y_test: np.ndarray,
+                                   stage_dir_name: str | None = None) -> dict:
+    """
+    Recompute twCRPS/quantile-score extended metrics from a model's saved
+    OOS paths -- no re-optimization (EXECUTION.md §22). Used for the
+    Stage-4-vs-counterpart twCRPS comparison (objective 3a).
+
+    Only `model.dist` (the GB2 distribution object, for ppf/cdf) is used by
+    compute_extended_oos_metrics -- the reconstructed model's own recursion
+    machinery is irrelevant here since `oos_paths` is supplied directly
+    from the cached paths.npz rather than recomputed via model.filter().
+    This is why build_model_from_meta's generic fallback path is safe to
+    use even for Stage-4 artifacts (RegimeXiOnlyModel is not one of its
+    explicit cases): any reconstructed wrapper has a correctly-configured
+    `.dist`, which is all that is actually read below.
+    """
+    from pipeline.artifact_utils import load_model_and_theta
+    from diagnostics.scoring import compute_extended_oos_metrics
+
+    search_dirs = [stage_dir_name] if stage_dir_name else \
+        ["stage1", "stage2", "stage3", "stage2_phi", "stage3_phi", "stage4_xi_regime"]
+    for d in search_dirs:
+        model_dir = run_dir / d / model_id
+        npz_path = model_dir / "paths.npz"
+        if not npz_path.exists():
+            continue
+        npz = np.load(npz_path)
+        model, _theta, meta, params_df = load_model_and_theta(model_dir)
+        if model is None:
+            continue
+
+        tv_names = meta.get("tv_param_names") or (
+            ["phi", "xi"] if npz["f_arr_oos"].shape[1] > 1 else ["phi"]
+        )
+        # gamma/zeta/xi (when static): top-level metadata first (Stage 4
+        # saves these explicitly since they're frozen, not part of its own
+        # theta); otherwise read them by name from estimated_parameters.csv
+        # (Stage 1-3 models keep them there since gamma/zeta are always
+        # static, and xi is static too for phi-only models).
+        pdict = (
+            dict(zip(params_df["parameter"], params_df["value"]))
+            if params_df is not None and not params_df.empty else {}
+        )
+        static = {}
+        for k in ("gamma", "zeta", "xi"):
+            if k in meta and meta[k] is not None:
+                static[k] = float(meta[k])
+            elif k in pdict:
+                static[k] = float(pdict[k])
+
+        oos_paths = {
+            "pi_oos": npz["pi_oos"], "f_arr_oos": npz["f_arr_oos"],
+            "tv_names": tv_names, "static": static,
+        }
+        return compute_extended_oos_metrics(model, oos_paths, y_test)
+    logger.warning(f"  Could not locate cached OOS paths for {model_id} -- twCRPS unavailable.")
+    return {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -471,19 +421,17 @@ def run_location(
     station_name: str,
     workers: int = 4,
     force_rerun: bool = False,
-    run_regime: bool = True,
+    run_stage4_flag: bool = True,
 ) -> dict:
     """
-    Run the full 3-stage (+ optional regime) pipeline for one station.
-
-    Returns dict with stage1_winner, stage2_winner, stage3_winner,
-    final_winner, regime_results, run_dir.
+    Run the full pipeline for one station: phi+xi branch (Stages 1-3),
+    phi-only branch (Stages 1-3, objective 1a), and Stage 4 (objective 3).
     """
     from data.station_loader import STATION_REGISTRY, StationDataLoader
     from distributions.gb2_log_link import GB2LogLink
     from distributions.gb2_phi_only import GB2LogLinkPhiOnly
     from pi_dynamics.factory import make_pi_dynamics
-    from pipeline.runner import run_pipeline, _save_stage_summary
+    from pipeline.runner import run_pipeline
 
     cfg      = STATION_REGISTRY[station_name]
     run_id   = cfg["run_id"]
@@ -499,7 +447,7 @@ def run_location(
         station_name=station_name,
         precip_dir=PRECIP_DIR,
         era5_dir=ERA5_DIR,
-        nino34_path=NINO34_PATH,
+        enso_path=ENSO_PATH,
     )
     data = loader.load_all()
     logger.info(f"  Data loaded in {time.time()-t_load:.1f}s: "
@@ -512,11 +460,9 @@ def run_location(
     dist_phixi = GB2LogLink()
     pi_dyn     = make_pi_dynamics("ar_logistic", seasonal="daily")
 
-    # ── Run 3-stage pipeline ───────────────────────────────────────────────
+    # ── Run dual-branch pipeline (Stages 1-3) ───────────────────────────────
     t_pipe = time.time()
-    run_dir    = ARTIFACTS_DIR / run_id
-    log_path   = run_dir / "execution_log.jsonl"
-
+    run_dir  = ARTIFACTS_DIR / run_id
     pipeline_out = run_pipeline(
         data          = data,
         pi_dyn        = pi_dyn,
@@ -528,144 +474,64 @@ def run_location(
         do_stage1     = True,
         do_stage2     = True,
         do_stage3     = True,
+        run_phi_only_branch = True,
         parallel      = True,
         workers       = workers,
     )
     elapsed_pipe = time.time() - t_pipe
-    logger.info(f"  3-stage pipeline completed in {elapsed_pipe/60:.1f} min")
+    logger.info(f"  Stages 1-3 (both branches) completed in {elapsed_pipe/60:.1f} min")
 
-    # ── Determine final winner using 2% CRPS threshold ────────────────────
-    w1 = pipeline_out.get("stage1_winner")
-    w2 = pipeline_out.get("stage2_winner")
-    w3 = pipeline_out.get("stage3_winner")
-
-    crps_s1 = _get_crps(w1)
-    crps_s2 = _get_crps(w2)
-    crps_s3 = _get_crps(w3)
-
-    # If the Stage-1 winner has NaN CRPS (fullfi instability), fall back to
-    # the best valid-CRPS Stage-1 result for comparison — avoids Stage 2 being
-    # permanently unacceptable due to a non-deployable Stage-1 winner.
-    if not np.isfinite(crps_s1):
-        r1_list = pipeline_out.get("stage1_results", [])
-        _valid_s1 = [
-            r for r in r1_list
-            if r.get("validity", "failed") != "failed"
-            and np.isfinite(float(r.get("oos_metrics", {}).get("crps_mean", float("nan"))))
-        ]
-        if _valid_s1:
-            from pipeline.runner import select_winner as _sw
-            _fb = _sw(_valid_s1)
-            if _fb:
-                _fb_crps = float(_fb.get("oos_metrics", {}).get("crps_mean", float("nan")))
-                logger.info(
-                    f"  Stage-1 winner ({w1['model_id']}) has NaN CRPS; "
-                    f"using {_fb['model_id']} (crps={_fb_crps:.4f}) "
-                    f"for stage-advancement comparison."
-                )
-                crps_s1 = _fb_crps
-
-    # Select stage 2 only if it improves ≥ 2% over stage 1
-    if w2 and _should_advance(crps_s1, crps_s2, stage_name="Stage2 vs Stage1"):
-        base_winner = w2
-        base_crps   = crps_s2
-    else:
-        base_winner = w1
-        base_crps   = crps_s1
-        if w2:
-            logger.info(f"  Stage 2 not accepted (insufficient CRPS improvement)")
-
-    # Select stage 3 only if it improves ≥ 2% over current base
-    if w3 and _should_advance(base_crps, crps_s3, stage_name="Stage3 vs Base"):
-        final_winner = w3
-    else:
-        final_winner = base_winner
-        if w3:
-            logger.info(f"  Stage 3 not accepted (insufficient CRPS improvement)")
-
-    # If the final winner has NaN CRPS (fullfi instability in Stage 1),
-    # substitute the best valid-CRPS Stage-1 model for diagnostics and
-    # reporting.  The original loglik winner is preserved in a note field.
-    final_winner_note = None
-    if final_winner is not None and not np.isfinite(_get_crps(final_winner)):
-        r1_list = pipeline_out.get("stage1_results", [])
-        _valid_s1_fw = [
-            r for r in r1_list
-            if r.get("validity", "failed") != "failed"
-            and np.isfinite(float(r.get("oos_metrics", {}).get("crps_mean", float("nan"))))
-        ]
-        if _valid_s1_fw:
-            from pipeline.runner import select_winner as _sw_fw
-            _fb_fw = _sw_fw(_valid_s1_fw)
-            if _fb_fw:
-                _fb_fw_crps = float(_fb_fw.get("oos_metrics", {}).get("crps_mean", float("nan")))
-                final_winner_note = (
-                    f"Nominal loglik winner {final_winner['model_id']} has NaN OOS CRPS "
-                    f"(fullfi Fisher-information scaling produces numerically unstable GB2 ppf() "
-                    f"during OOS evaluation). Best deployable model with finite OOS CRPS: "
-                    f"{_fb_fw['model_id']} (crps={_fb_fw_crps:.4f})."
-                )
-                logger.info(
-                    f"  Final winner {final_winner['model_id']} has NaN OOS CRPS "
-                    f"(fullfi instability); substituting {_fb_fw['model_id']} "
-                    f"(crps={_fb_fw_crps:.4f}) for diagnostics and reporting."
-                )
-                final_winner = _fb_fw
-
-    logger.info(
-        f"  Final winner: {final_winner['model_id'] if final_winner else 'none'}  "
-        f"CRPS={_get_crps(final_winner):.4f}"
+    # ── Inter-stage final winners, each within its own tvp set ─────────────
+    phixi_final = _resolve_branch_final_winner(
+        [pipeline_out.get("stage1_winner"), pipeline_out.get("stage2_winner"),
+         pipeline_out.get("stage3_winner")],
+        "phi_xi", f"{display} phi+xi branch",
+    )
+    phi_final = _resolve_branch_final_winner(
+        [pipeline_out.get("stage1_phi_winner"), pipeline_out.get("stage2_phi_winner"),
+         pipeline_out.get("stage3_phi_winner")],
+        "phi_only", f"{display} phi-only branch",
     )
 
-    # Persist advancement decision in stage_winners.json
     winners_path = run_dir / "stage_winners.json"
     try:
-        import json as _json
-        existing = _json.loads(winners_path.read_text()) if winners_path.exists() else {}
-        fw_entry = {
-            "model_id": final_winner["model_id"] if final_winner else None,
-            "crps":     _get_crps(final_winner),
-            "crps_s1":  crps_s1,
-            "crps_s2":  crps_s2,
-            "crps_s3":  crps_s3,
+        existing = json.loads(winners_path.read_text()) if winners_path.exists() else {}
+        existing["final_winner_phi_xi"] = {
+            "model_id": phixi_final["model_id"] if phixi_final else None,
+            "crps_mean": phixi_final.get("oos_metrics", {}).get("crps_mean") if phixi_final else None,
         }
-        if final_winner_note:
-            fw_entry["numerical_note"] = final_winner_note
-        existing["final_winner"] = fw_entry
-        winners_path.write_text(_json.dumps(existing, indent=2, default=str))
+        existing["final_winner_phi_only"] = {
+            "model_id": phi_final["model_id"] if phi_final else None,
+            "rmse": phi_final.get("oos_metrics", {}).get("rmse") if phi_final else None,
+        }
+        winners_path.write_text(json.dumps(existing, indent=2, default=str))
     except Exception as exc:
         logger.warning(f"  Could not update stage_winners.json: {exc}")
 
-    # ── Stage 4: Regime models ─────────────────────────────────────────────
-    regime_results = []
-    if run_regime:
-        t_regime = time.time()
-        regime_results = run_regime_stage(
+    # ── Stage 4: tail-sensitive xi regime (objective 3) ─────────────────────
+    stage4_out = {"models": {}, "accepted": {}}
+    if run_stage4_flag:
+        t_s4 = time.time()
+        stage4_out = run_stage4(
             data=data,
-            stage1_winner=w1,
-            stage2_winner=w2,
-            crps_s1=crps_s1,
-            crps_s2=crps_s2,
+            phi_final_winner=phi_final,
+            stage2_phi_winner=pipeline_out.get("stage2_phi_winner"),
+            phixi_final_winner=phixi_final,
             run_dir=run_dir,
-            log_path=log_path,
-            workers=workers,
             force_rerun=force_rerun,
         )
-        logger.info(f"  Stage 4 regime completed in {time.time()-t_regime:.1f}s")
-    else:
-        if not final_winner:
-            alert(f"{display}: no final winner — regime stage skipped.")
+        logger.info(f"  Stage 4 completed in {time.time()-t_s4:.1f}s")
+    elif not phi_final:
+        alert(f"{display}: no phi-only final winner -- Stage 4 skipped.")
 
     return {
-        "station":        station_name,
-        "run_id":         run_id,
-        "run_dir":        str(run_dir),
-        "stage1_winner":  w1,
-        "stage2_winner":  w2,
-        "stage3_winner":  w3,
-        "final_winner":   final_winner,
-        "regime_results": regime_results,
-        "pipeline_out":   pipeline_out,
+        "station":            station_name,
+        "run_id":             run_id,
+        "run_dir":            str(run_dir),
+        "phixi_final_winner": phixi_final,
+        "phi_final_winner":   phi_final,
+        "stage4_out":         stage4_out,
+        "pipeline_out":       pipeline_out,
     }
 
 
@@ -675,14 +541,14 @@ def run_location(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run full ZA-GAS pipeline for all precipitation stations."
+        description="Run the ZA-GAS pipeline for the six reported precipitation stations."
     )
     parser.add_argument("--workers",     type=int, default=4,
                         help="Parallel workers per stage (default 4)")
     parser.add_argument("--force",       action="store_true",
                         help="Re-estimate even when valid artifacts exist")
-    parser.add_argument("--skip-regime", action="store_true",
-                        help="Skip Stage 4 regime models")
+    parser.add_argument("--skip-stage4", action="store_true",
+                        help="Skip Stage 4 (tail-sensitive xi regime)")
     parser.add_argument("--location",    type=str, default=None,
                         help="Run only this location (exact name)")
     parser.add_argument("--start-from",  type=str, default=None,
@@ -691,9 +557,9 @@ def main() -> None:
 
     # Verify data paths
     for name, path in [
-        ("PRECIP_DIR",  PRECIP_DIR),
-        ("ERA5_DIR",    ERA5_DIR),
-        ("NINO34_PATH", NINO34_PATH),
+        ("PRECIP_DIR", PRECIP_DIR),
+        ("ERA5_DIR",   ERA5_DIR),
+        ("ENSO_PATH",  ENSO_PATH),
     ]:
         if not path.exists():
             alert(f"{name} not found: {path}")
@@ -717,7 +583,7 @@ def main() -> None:
     logger.info(f"Stations to process ({len(stations)}): {stations}")
     logger.info(f"Workers per stage:  {args.workers}")
     logger.info(f"Force rerun:        {args.force}")
-    logger.info(f"Run regime models:  {not args.skip_regime}")
+    logger.info(f"Run Stage 4:        {not args.skip_stage4}")
 
     all_results = {}
     t_total = time.time()
@@ -733,7 +599,7 @@ def main() -> None:
                 station_name=station,
                 workers=args.workers,
                 force_rerun=args.force,
-                run_regime=not args.skip_regime,
+                run_stage4_flag=not args.skip_stage4,
             )
             elapsed_loc = time.time() - t_loc
             logger.info(f"  Location completed in {elapsed_loc/60:.1f} min")
@@ -747,18 +613,19 @@ def main() -> None:
 
     total_elapsed = time.time() - t_total
     logger.info("=" * 72)
-    logger.info(f"ALL LOCATIONS COMPLETE — total wall time {total_elapsed/60:.1f} min")
+    logger.info(f"ALL LOCATIONS COMPLETE -- total wall time {total_elapsed/60:.1f} min")
     logger.info("=" * 72)
 
     # Summary table
     logger.info("Final winner summary:")
-    logger.info(f"  {'Location':<30} {'Winner model':<40} {'CRPS':>8}")
-    logger.info(f"  {'-'*30} {'-'*40} {'-'*8}")
+    logger.info(f"  {'Location':<30} {'phi-only winner (RMSE)':<32} {'phi+xi winner (CRPS)':<32}")
+    logger.info(f"  {'-'*30} {'-'*32} {'-'*32}")
     for station, res in all_results.items():
-        fw   = res.get("final_winner")
-        mid  = fw["model_id"] if fw else "(none)"
-        crps = f"{_get_crps(fw):.4f}" if fw else "  NaN"
-        logger.info(f"  {station:<30} {mid:<40} {crps:>8}")
+        pf  = res.get("phi_final_winner")
+        pxf = res.get("phixi_final_winner")
+        pf_s  = pf["model_id"] if pf else "(none)"
+        pxf_s = pxf["model_id"] if pxf else "(none)"
+        logger.info(f"  {station:<30} {pf_s:<32} {pxf_s:<32}")
 
 
 if __name__ == "__main__":

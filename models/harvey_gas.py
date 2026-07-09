@@ -31,18 +31,16 @@ Both components receive the SAME scaled score s_{j,t} at each time step.
 The score is computed from the current predictive distribution defined by f_{j,t}.
 
 =============================================================================
-IMPORTANT DIFFERENCES FROM models/long_short_gas.py
+THIS IS THE ONLY HARVEY IMPLEMENTATION
 =============================================================================
 
-The previous implementation (long_short_gas.py) combined:
-    f_{j,t+1} = ω + GAS_terms + L_t + S_t
-where L_t had only AR persistence (no score loading) and S_t was purely
-contemporaneous (no dynamics at all). That differs from the Harvey spec.
+f = ω + L + S with no separate GAS update on f itself; L and S are BOTH
+score-driven recursions with their own B and A; the persistence restriction
+is enforced by a penalty, not a hard bound (OPTIMIZATION.md §3).
 
-This module implements the correct two-component model where:
-  - f = ω + L + S  (no separate GAS update on f itself)
-  - L and S are BOTH score-driven recursions with their own B and A
-  - The persistence restriction is enforced by a penalty
+This is the sole Harvey long-short model in the framework and the one
+`pipeline.runner.build_stage3_specs` calls for every Stage-3 fit reported
+in reports/multi_location/report.tex.
 
 =============================================================================
 EXECUTION FLOW

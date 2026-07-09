@@ -91,8 +91,17 @@ import pandas as pd
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_logger(name: str = "pipeline") -> logging.Logger:
+    """
+    Return a logger for pipeline messages. If the caller (e.g.
+    run_all_locations.py) has already configured the root logger via
+    logging.basicConfig(), this logger's messages propagate there and are
+    picked up by the caller's handlers (console + file) -- no extra handler
+    is attached, since one would otherwise print every message twice. When
+    used standalone (root not configured), a StreamHandler is attached so
+    output is still visible.
+    """
     logger = logging.getLogger(name)
-    if not logger.handlers:
+    if not logger.handlers and not logging.getLogger().handlers:
         fmt = logging.Formatter(
             "%(asctime)s  [%(levelname)s]  %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
@@ -687,11 +696,16 @@ def build_stage2_specs(
     dist,
     best_gas_lags:  list,
     best_scaling:   str,
+    id_prefix:      str = "stage2_",
 ) -> List[Tuple[str, Any, dict, dict]]:
     """
     Build Stage-2 specs (GAS + weather covariates, sequential).
 
     Warm-starting is applied by the stage runner after each fit.
+
+    id_prefix distinguishes independent tvp-set branches (e.g. "stage2_"
+    for phi+xi, "stage2_phi_" for the phi-only branch, per objective 1a) so
+    the two branches never collide on the same cached model_id.
     """
     from models.cov_gas_model import CovZAGASModel
 
@@ -715,7 +729,7 @@ def build_stage2_specs(
             cov_names=cn[block],
         )
         specs.append((
-            f"stage2_{block}",
+            f"{id_prefix}{block}",
             model,
             {"y": y_train, "X": bt[block], "verbose": False},
             {"y_train": y_train, "y_test": y_test,
@@ -730,9 +744,20 @@ def build_stage3_specs(
     dist,
     best_scaling:       str,
     best_weather_block: str,
+    id_prefix:          str = "stage3_harvey_",
 ) -> List[Tuple[str, Any, dict, dict]]:
     """
     Build Stage-3 specs (Harvey long-short, 4 ENSO variants).
+
+    ENSO long-component blocks are El Nino / La Nina dummy tiers (2026-07-07
+    fix, MODELS.md §18/§2a) — replaces the previous continuous-anomaly
+    tiers, which were built from a mislabelled raw-SST source (see
+    data/station_loader.py header).
+
+    id_prefix distinguishes independent tvp-set branches (e.g.
+    "stage3_harvey_" for phi+xi, "stage3_phi_harvey_" for phi-only, per
+    objective 1a) so the two branches never collide on the same cached
+    model_id.
     """
     from models.harvey_gas import HarveyZAGASModel
 
@@ -750,10 +775,10 @@ def build_stage3_specs(
     empty_te = np.zeros((len(y_test),  0))
 
     enso_variants = [
-        ("no_enso",            [],                        empty_tr, empty_te),
-        ("enso_90d",           cn["enso_90d"],            bt["enso_90d"],            bv["enso_90d"]),
-        ("enso_90d_30d",       cn["enso_90d_30d"],        bt["enso_90d_30d"],        bv["enso_90d_30d"]),
-        ("enso_90d_30d_daily", cn["enso_90d_30d_daily"],  bt["enso_90d_30d_daily"],  bv["enso_90d_30d_daily"]),
+        ("no_enso",           [],                       empty_tr,                    empty_te),
+        ("enso_dummy_current", cn["enso_dummy_current"], bt["enso_dummy_current"],    bv["enso_dummy_current"]),
+        ("enso_dummy_lag1",    cn["enso_dummy_lag1"],    bt["enso_dummy_lag1"],       bv["enso_dummy_lag1"]),
+        ("enso_dummy_lag3",    cn["enso_dummy_lag3"],    bt["enso_dummy_lag3"],       bv["enso_dummy_lag3"]),
     ]
 
     specs = []
@@ -767,7 +792,7 @@ def build_stage3_specs(
             scaling=best_scaling,
         )
         specs.append((
-            f"stage3_harvey_{label}",
+            f"{id_prefix}{label}",
             model,
             {"y": y_train, "X_long": Xl_tr, "X_short": Xs_train, "verbose": False},
             {"y_train": y_train, "y_test": y_test,
@@ -806,13 +831,18 @@ def run_stage1(
     run_dir, log_path, logger,
     force_rerun=False, winners_path=None,
     parallel=False, workers=4,
-) -> Tuple[Optional[dict], List[dict]]:
+) -> Tuple[Optional[dict], List[dict], Optional[dict]]:
     """
     Run all Stage-1 models (baseline GAS, no covariates).
 
     All 12 models are independent — they are run in parallel when
     parallel=True.  Stage 2 cannot start until Stage 1 selects a winner,
     so the fork-join barrier is this function's return.
+
+    Returns (phixi_winner, all_results, phi_only_winner) — the two winners
+    are selected independently within their own tvp set (objective 1a/1b,
+    prompt.md 4d): phi-only by OOS RMSE, phi+xi by OOS CRPS. Neither
+    selection mixes the two tvp sets or falls back to log-likelihood.
     """
     stage_dir = run_dir / "stage1"
     stage_dir.mkdir(exist_ok=True)
@@ -842,20 +872,36 @@ def run_stage1(
             )
             results.append(r)
 
-    winner = select_winner(results)
+    from pipeline.selection import select_phi_only_winner, select_phixi_winner
+    results_phixi = [r for r in results if "phixi" in r.get("model_id", "")]
+    results_phi   = [r for r in results if "phixi" not in r.get("model_id", "")]
+
+    winner       = select_phixi_winner(results_phixi)
+    winner_phi   = select_phi_only_winner(results_phi)
+
     if winner:
         logger.info(
-            f"STAGE 1 WINNER: {winner['model_id']}  "
-            f"loglik={winner.get('loglik', float('nan')):.2f}  "
-            f"crps={winner.get('oos_metrics', {}).get('crps_mean', float('nan')):.4f}"
+            f"STAGE 1 (phi_xi) WINNER: {winner['model_id']}  "
+            f"crps={winner.get('oos_metrics', {}).get('crps_mean', float('nan')):.4f}  "
+            f"({winner.get('_tie_break', '')})"
         )
     else:
-        logger.error("STAGE 1: no valid model")
+        logger.error("STAGE 1 (phi_xi): no valid model")
+
+    if winner_phi:
+        logger.info(
+            f"STAGE 1 (phi_only) WINNER: {winner_phi['model_id']}  "
+            f"rmse={winner_phi.get('oos_metrics', {}).get('rmse', float('nan')):.4f}  "
+            f"({winner_phi.get('_tie_break', '')})"
+        )
+    else:
+        logger.error("STAGE 1 (phi_only): no valid model")
 
     if winners_path:
         _save_stage_summary(winners_path, "stage1", winner, results)
+        _save_stage_summary(winners_path, "stage1_phi_only", winner_phi, results_phi)
 
-    return winner, results
+    return winner, results, winner_phi
 
 
 def run_stage2(
@@ -864,6 +910,7 @@ def run_stage2(
     run_dir, log_path, logger,
     force_rerun=False, winners_path=None,
     parallel=False, workers=4,
+    id_prefix="stage2_", stage_dir_name="stage2", tvp_set="phi_xi",
 ) -> Tuple[Optional[dict], List[dict]]:
     """
     Run Stage-2 weather-covariate models.
@@ -873,10 +920,16 @@ def run_stage2(
     warm-starting from the previous model's GAS+pi block.
 
     theta0_gas_pi: GAS+pi block theta from Stage-1 winner (length n_gas+n_pi).
+
+    id_prefix / stage_dir_name distinguish the phi-only branch (objective
+    1a) from the phi+xi branch so cached artifacts never collide.
+    tvp_set selects the winner criterion (pipeline.selection, prompt.md 4d):
+    "phi_only" -> OOS RMSE, "phi_xi" -> OOS CRPS.
     """
-    stage_dir = run_dir / "stage2"
+    stage_dir = run_dir / stage_dir_name
     stage_dir.mkdir(exist_ok=True)
-    specs = build_stage2_specs(data, pi_dyn, dist, best_gas_lags, best_scaling)
+    specs = build_stage2_specs(data, pi_dyn, dist, best_gas_lags, best_scaling,
+                                id_prefix=id_prefix)
     n = len(specs)
 
     logger.info("=" * 60)
@@ -939,13 +992,24 @@ def run_stage2(
                 except Exception:
                     pass
 
-    winner = select_winner(results)
+    from pipeline.selection import select_phi_only_winner, select_phixi_winner
+    select_fn = select_phi_only_winner if tvp_set == "phi_only" else select_phixi_winner
+    winner = select_fn(results)
     if winner:
-        winner["best_weather_block"] = winner["model_id"].replace("stage2_", "")
-        logger.info(f"STAGE 2 WINNER: {winner['model_id']}  loglik={winner.get('loglik', float('nan')):.2f}")
+        winner["best_weather_block"] = winner["model_id"].replace(id_prefix, "")
+        key_metric = "rmse" if tvp_set == "phi_only" else "crps_mean"
+        logger.info(
+            f"STAGE 2 ({tvp_set}) WINNER: {winner['model_id']}  "
+            f"{key_metric}={winner.get('oos_metrics', {}).get(key_metric, float('nan')):.4f}  "
+            f"({winner.get('_tie_break', '')})"
+        )
 
+    # "stage2" (unqualified) stays the phi+xi branch for backward compatibility
+    # with existing readers (generate_report_extended.py); the phi-only branch
+    # is saved under a distinct key.
+    summary_key = "stage2" if tvp_set == "phi_xi" else "stage2_phi_only"
     if winners_path:
-        _save_stage_summary(winners_path, "stage2", winner, results)
+        _save_stage_summary(winners_path, summary_key, winner, results)
 
     return winner, results
 
@@ -955,15 +1019,23 @@ def run_stage3(
     run_dir, log_path, logger,
     force_rerun=False, winners_path=None,
     parallel=False, workers=4,
+    id_prefix="stage3_harvey_", stage_dir_name="stage3", tvp_set="phi_xi",
 ) -> Tuple[Optional[dict], List[dict]]:
     """
-    Run Stage-3 Harvey long-short models (4 ENSO variants).
+    Run Stage-3 Harvey long-short models (4 ENSO variants: no_enso plus the
+    3 El Nino/La Nina dummy tiers, 2026-07-07 fix).
 
     All 4 ENSO variants are independent — they can be run in parallel.
+
+    id_prefix / stage_dir_name distinguish the phi-only branch (objective
+    1a) from the phi+xi branch. tvp_set selects the winner criterion
+    (pipeline.selection, prompt.md 4d): "phi_only" -> OOS RMSE,
+    "phi_xi" -> OOS CRPS.
     """
-    stage_dir = run_dir / "stage3"
+    stage_dir = run_dir / stage_dir_name
     stage_dir.mkdir(exist_ok=True)
-    specs = build_stage3_specs(data, pi_dyn, dist, best_scaling, best_weather_block)
+    specs = build_stage3_specs(data, pi_dyn, dist, best_scaling, best_weather_block,
+                                id_prefix=id_prefix)
     n = len(specs)
 
     logger.info("=" * 60)
@@ -989,12 +1061,20 @@ def run_stage3(
             )
             results.append(r)
 
-    winner = select_winner(results)
+    from pipeline.selection import select_phi_only_winner, select_phixi_winner
+    select_fn = select_phi_only_winner if tvp_set == "phi_only" else select_phixi_winner
+    winner = select_fn(results)
     if winner:
-        logger.info(f"STAGE 3 WINNER: {winner['model_id']}  loglik={winner.get('loglik', float('nan')):.2f}")
+        key_metric = "rmse" if tvp_set == "phi_only" else "crps_mean"
+        logger.info(
+            f"STAGE 3 ({tvp_set}) WINNER: {winner['model_id']}  "
+            f"{key_metric}={winner.get('oos_metrics', {}).get(key_metric, float('nan')):.4f}  "
+            f"({winner.get('_tie_break', '')})"
+        )
 
+    summary_key = "stage3" if tvp_set == "phi_xi" else "stage3_phi_only"
     if winners_path:
-        _save_stage_summary(winners_path, "stage3", winner, results)
+        _save_stage_summary(winners_path, summary_key, winner, results)
 
     return winner, results
 
@@ -1014,11 +1094,21 @@ def run_pipeline(
     do_stage1:     bool = True,
     do_stage2:     bool = True,
     do_stage3:     bool = True,
+    run_phi_only_branch: bool = True,
     parallel:      bool = False,
     workers:       int  = 4,
 ) -> dict:
     """
     Execute the full sequential thesis pipeline.
+
+    Runs two independent tvp-set branches (objective 1a/1b, prompt.md
+    2026-07-07 revision):
+      - phi+xi branch (as before): winner selected by OOS CRPS.
+      - phi-only branch: winner selected by OOS RMSE, continued through its
+        own Stage 2 (weather covariates) and Stage 3 (Harvey ENSO dummies)
+        under distinct model ids / artifact subdirectories
+        (stage{2,3}_phi / stage{2,3}_phi_harvey_*) so nothing collides with
+        the phi+xi branch's cached artifacts.
 
     Parameters
     ----------
@@ -1029,14 +1119,16 @@ def run_pipeline(
     artifacts_dir : root directory for saving artifacts
     run_id        : experiment identifier (subdirectory name)
     force_rerun   : re-estimate even when valid artifacts exist
-    do_stage{N}   : toggle each stage
+    do_stage{N}   : toggle each stage (phi+xi branch)
+    run_phi_only_branch : also run the phi-only Stage-2/3 branch
     parallel      : run independent models within a stage in parallel (default False)
     workers       : number of parallel worker processes (default 4)
 
     Returns
     -------
-    dict with stage1_winner, stage2_winner, stage3_winner,
-         stage{N}_results, run_dir
+    dict with stage1_winner, stage2_winner, stage3_winner (phi+xi branch),
+         stage1_phi_winner, stage2_phi_winner, stage3_phi_winner (phi-only
+         branch), stage{N}_results, run_dir
     """
     artifacts_dir = Path(artifacts_dir)
     run_dir       = artifacts_dir / run_id
@@ -1047,26 +1139,32 @@ def run_pipeline(
     logger       = get_logger("pipeline")
 
     out = {
-        "stage1_winner":  None,
-        "stage2_winner":  None,
-        "stage3_winner":  None,
-        "stage1_results": [],
-        "stage2_results": [],
-        "stage3_results": [],
-        "run_dir":        str(run_dir),
+        "stage1_winner":      None,
+        "stage2_winner":      None,
+        "stage3_winner":      None,
+        "stage1_phi_winner":  None,
+        "stage2_phi_winner":  None,
+        "stage3_phi_winner":  None,
+        "stage1_results":     [],
+        "stage2_results":     [],
+        "stage3_results":     [],
+        "stage2_phi_results": [],
+        "stage3_phi_results": [],
+        "run_dir":            str(run_dir),
     }
 
     # ── Stage 1 ──────────────────────────────────────────────────────────────
     if do_stage1:
-        w1, r1 = run_stage1(
+        w1, r1, w1_phi = run_stage1(
             data=data, pi_dyn=pi_dyn,
             dist_phi=dist_phi, dist_phixi=dist_phixi,
             run_dir=run_dir, log_path=log_path, logger=logger,
             force_rerun=force_rerun, winners_path=winners_path,
             parallel=parallel, workers=workers,
         )
-        out["stage1_winner"]  = w1
-        out["stage1_results"] = r1
+        out["stage1_winner"]     = w1
+        out["stage1_results"]    = r1
+        out["stage1_phi_winner"] = w1_phi
         if w1 is None:
             logger.error("No Stage-1 winner — aborting.")
             return out
@@ -1075,30 +1173,31 @@ def run_pipeline(
     if w1 is None:
         return out
 
-    # Decode Stage-1 winner configuration
+    # Decode Stage-1 winner configuration. w1 always comes from the phi+xi
+    # candidate pool (run_stage1 selects it via select_phixi_winner), so
+    # this branch's distribution is always dist_phixi -- the phi-only
+    # continuation is handled separately below.
     mid1  = w1["model_id"]
     parts = mid1.split("_")
     scaling_decode = {"unit": "unit", "diagfi": "diagonal_inverse_fisher",
                       "fullfi": "inverse_fisher"}
     winner_scaling  = scaling_decode.get(parts[-1], "diagonal_inverse_fisher")
     winner_lag      = parts[-2]                      # "short" or "seasonal"
-    winner_tv       = "phi_xi" if "phixi" in mid1 else "phi"
 
     # If the fullfi Stage-1 winner has NaN CRPS (GB2 ppf overflow in OOS
     # simulation), Stage 2/3 would inherit fullfi and also produce NaN CRPS,
     # making the 2% improvement test permanently unresolvable.  Fall back to
-    # the best Stage-1 model with *valid* CRPS and the same TV spec for the
-    # scaling passed downstream.  The reported Stage-1 winner is unchanged.
+    # the best Stage-1 model with *valid* CRPS for the scaling passed
+    # downstream.  The reported Stage-1 winner is unchanged.
     if winner_scaling == "inverse_fisher":
         w1_crps = float(
             w1.get("oos_metrics", {}).get("crps_mean", float("nan"))
         )
         if not np.isfinite(w1_crps):
-            _is_phixi = winner_tv == "phi_xi"
             valid_r1 = [
                 r for r in r1
                 if r.get("validity", "failed") not in ("failed",)
-                and ("phixi" in r.get("model_id", "")) == _is_phixi
+                and "phixi" in r.get("model_id", "")
                 and np.isfinite(float(
                     r.get("oos_metrics", {}).get("crps_mean", float("nan"))
                 ))
@@ -1117,7 +1216,7 @@ def run_pipeline(
     from constants import GAS_SHORT_LAGS, GAS_SEASONAL_LAGS
     winner_gas_lags = (GAS_SHORT_LAGS["daily"] if winner_lag == "short"
                        else GAS_SEASONAL_LAGS["daily"])
-    winner_dist     = dist_phixi if winner_tv == "phi_xi" else dist_phi
+    winner_dist     = dist_phixi
 
     # Stage-1 GAS+pi theta for warm-starting Stage 2
     theta0_gas_pi = None
@@ -1169,12 +1268,75 @@ def run_pipeline(
         out["stage3_winner"]  = w3
         out["stage3_results"] = r3
 
+    # ── Phi-only branch (objective 1a) ──────────────────────────────────────
+    # Independent Stage 2/3 continuation of the phi-only Stage-1 winner,
+    # selected and ranked entirely by OOS RMSE, never mixed with the phi+xi
+    # branch above. Written to separate model ids / cache subdirectories.
+    w1_phi = out["stage1_phi_winner"]
+    if run_phi_only_branch and w1_phi is not None:
+        mid1p  = w1_phi["model_id"]
+        parts_p = mid1p.split("_")
+        phi_scaling = scaling_decode.get(parts_p[-1], "diagonal_inverse_fisher")
+        phi_lag     = parts_p[-2]
+        phi_gas_lags = (GAS_SHORT_LAGS["daily"] if phi_lag == "short"
+                        else GAS_SEASONAL_LAGS["daily"])
+
+        theta0_gas_pi_phi = None
+        if w1_phi.get("result") is not None:
+            theta0_gas_pi_phi = w1_phi["result"]["theta"]
+        else:
+            try:
+                df = pd.read_csv(run_dir / "stage1" / mid1p / "estimated_parameters.csv")
+                theta0_gas_pi_phi = df["value"].to_numpy(dtype=float)
+            except Exception:
+                pass
+
+        if do_stage2:
+            w2p, r2p = run_stage2(
+                data=data, pi_dyn=pi_dyn,
+                dist=dist_phi,
+                best_gas_lags=phi_gas_lags,
+                best_scaling=phi_scaling,
+                theta0_gas_pi=theta0_gas_pi_phi,
+                run_dir=run_dir, log_path=log_path, logger=logger,
+                force_rerun=force_rerun, winners_path=winners_path,
+                parallel=parallel, workers=workers,
+                id_prefix="stage2_phi_", stage_dir_name="stage2_phi",
+                tvp_set="phi_only",
+            )
+            out["stage2_phi_winner"]  = w2p
+            out["stage2_phi_results"] = r2p
+
+        w2p = out["stage2_phi_winner"]
+        if do_stage3 and w2p is not None:
+            best_weather_block_phi = w2p.get(
+                "best_weather_block", w2p["model_id"].replace("stage2_phi_", "")
+            )
+            w3p, r3p = run_stage3(
+                data=data, pi_dyn=pi_dyn,
+                dist=dist_phi,
+                best_scaling=phi_scaling,
+                best_weather_block=best_weather_block_phi,
+                run_dir=run_dir, log_path=log_path, logger=logger,
+                force_rerun=force_rerun, winners_path=winners_path,
+                parallel=parallel, workers=workers,
+                id_prefix="stage3_phi_harvey_", stage_dir_name="stage3_phi",
+                tvp_set="phi_only",
+            )
+            out["stage3_phi_winner"]  = w3p
+            out["stage3_phi_results"] = r3p
+        elif do_stage3:
+            logger.warning("No Stage-2 phi-only winner — Stage 3 phi-only skipped.")
+
     # ── Summary ───────────────────────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("PIPELINE COMPLETE")
-    logger.info(f"  Stage 1: {out['stage1_winner']['model_id'] if out['stage1_winner'] else 'n/a'}")
-    logger.info(f"  Stage 2: {out['stage2_winner']['model_id'] if out['stage2_winner'] else 'n/a'}")
-    logger.info(f"  Stage 3: {out['stage3_winner']['model_id'] if out['stage3_winner'] else 'n/a'}")
+    logger.info(f"  Stage 1 (phi+xi):  {out['stage1_winner']['model_id'] if out['stage1_winner'] else 'n/a'}")
+    logger.info(f"  Stage 2 (phi+xi):  {out['stage2_winner']['model_id'] if out['stage2_winner'] else 'n/a'}")
+    logger.info(f"  Stage 3 (phi+xi):  {out['stage3_winner']['model_id'] if out['stage3_winner'] else 'n/a'}")
+    logger.info(f"  Stage 1 (phi-only): {out['stage1_phi_winner']['model_id'] if out['stage1_phi_winner'] else 'n/a'}")
+    logger.info(f"  Stage 2 (phi-only): {out['stage2_phi_winner']['model_id'] if out['stage2_phi_winner'] else 'n/a'}")
+    logger.info(f"  Stage 3 (phi-only): {out['stage3_phi_winner']['model_id'] if out['stage3_phi_winner'] else 'n/a'}")
     logger.info("=" * 60)
 
     return out

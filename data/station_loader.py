@@ -38,10 +38,22 @@ ERA5 temperature:
     data/input/ERA5/temperature/{era5_key}_ERA5_temperature_2m_daily_2006_2025.csv
     Column: "temperature_2m_c"
 
-ENSO — Niño 3.4 SST index (shared across all stations):
-    data/processed/pacific/NINO34_daily.csv
-    Columns: "date", "nino34_sst"
-    Coverage: 1981-09-01 onward
+ENSO — El Niño / La Niña / Neutral state (shared across all stations):
+    data/processed/pacific/ENSO_clean.csv
+    Columns: "date" (monthly), "ONI", "el_nino", "la_nina", "neutral"
+    Coverage: 1950-01-01 onward
+
+    NOTE (fixed 2026-07-08): the previous source,
+    data/processed/pacific/NINO34_daily.csv ("nino34_sst"), is DAILY RAW
+    Niño 3.4 sea-surface temperature (24-30 degC, no climatology removed) —
+    not an anomaly. Applying the standard +/-0.5 degC ENSO threshold to it
+    classified every single day as El Nino. ENSO_clean.csv's "ONI" column is
+    the genuine NOAA Oceanic Nino Index (3-month running mean anomaly) with
+    el_nino/la_nina/neutral already classified at +/-0.5 using the standard
+    methodology. Because ONI is monthly, each month's value is broadcast to
+    its calendar days and lagged by one full month (a month's ONI is not
+    known until the month completes), avoiding both the data bug and any
+    look-ahead leakage.
 
 =============================================================================
 COVARIATE BLOCKS  (identical construction to BHDataLoader)
@@ -53,10 +65,14 @@ Standard GAS covariates (X_t):
     "dewtemp_short"        — above + T_{t-1}, T_{t-2}, T_{t-3}
     "dewtemp_seasonal"     — above + T_{t-364}…T_{t-367}
 
-Harvey long component (X_long):
-    "enso_90d"             — E^{90}_{t-1}  (90-day trailing mean, lag 1)
-    "enso_90d_30d"         — E^{90}_{t-1}, E^{30}_{t-1}
-    "enso_90d_30d_daily"   — E^{90}_{t-1}, E^{30}_{t-1}, E_{t-1}
+Harvey long component (X_long) — El Nino / La Nina dummies (neutral is the
+baseline, omitted category), per MODELS.md §18/§2a of the 2026-07-07 fix:
+    "enso_dummy_current"   — el_nino_t, la_nina_t
+    "enso_dummy_lag1"      — + el_nino_{t-1mo}, la_nina_{t-1mo}
+    "enso_dummy_lag3"      — + el_nino_{t-3mo}, la_nina_{t-3mo}
+(all already lagged 1 month relative to "today" to avoid look-ahead; the
+"lag1"/"lag3" tier names refer to *additional* whole-month lags beyond that
+mandatory 1-month safety lag)
 
 =============================================================================
 STANDARDISATION
@@ -177,8 +193,8 @@ class StationDataLoader:
     """
 
     PRECIP_VALUE_COL = "PRECIPITACAO TOTAL, DIARIO(mm)"
-    NINO34_DATE_COL  = "date"
-    NINO34_VALUE_COL = "nino34_sst"
+    ENSO_DATE_COL    = "date"
+    ENSO_COLS        = ["ONI", "el_nino", "la_nina", "neutral"]
     ERA5_DATE_COL    = "date"
 
     def __init__(
@@ -188,14 +204,14 @@ class StationDataLoader:
         date_col:     str,
         precip_dir:   Path | str,
         era5_dir:     Path | str,
-        nino34_path:  Path | str,
+        enso_path:    Path | str,
     ):
         self.station_name = station_name
         self.era5_key     = era5_key
         self.date_col     = date_col
         self.precip_dir   = Path(precip_dir)
         self.era5_dir     = Path(era5_dir)
-        self.nino34_path  = Path(nino34_path)
+        self.enso_path    = Path(enso_path)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Class method: construct from registry
@@ -207,7 +223,7 @@ class StationDataLoader:
         station_name: str,
         precip_dir:   Path | str,
         era5_dir:     Path | str,
-        nino34_path:  Path | str,
+        enso_path:    Path | str,
     ) -> "StationDataLoader":
         """Create loader from the station registry."""
         if station_name not in STATION_REGISTRY:
@@ -222,7 +238,7 @@ class StationDataLoader:
             date_col=cfg["date_col"],
             precip_dir=precip_dir,
             era5_dir=era5_dir,
-            nino34_path=nino34_path,
+            enso_path=enso_path,
         )
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -264,16 +280,49 @@ class StationDataLoader:
         col = numeric[0] if numeric else df.columns[0]
         return df[col].rename(keyword).reindex(dates)
 
-    def _load_nino34(self, dates: pd.DatetimeIndex) -> pd.Series:
-        """Load daily Niño 3.4 SST index, aligned to dates."""
-        df = pd.read_csv(self.nino34_path, parse_dates=[self.NINO34_DATE_COL])
-        df = df.set_index(self.NINO34_DATE_COL).sort_index()
-        col = (
-            self.NINO34_VALUE_COL
-            if self.NINO34_VALUE_COL in df.columns
-            else [c for c in df.columns if df[c].dtype != object][0]
+    def _load_enso_daily(self, dates: pd.DatetimeIndex) -> pd.DataFrame:
+        """
+        Load monthly ENSO state (ONI anomaly + El Nino/La Nina/Neutral dummies)
+        and broadcast it to daily resolution, lagged by one full calendar
+        month to avoid look-ahead (a month's ONI is not known until the
+        month completes).
+
+        Returns a daily-indexed DataFrame with columns:
+            oni                          — continuous ONI anomaly (for plots)
+            el_nino_t, la_nina_t         — current-state dummies (tier 1)
+            el_nino_lag1mo, la_nina_lag1mo — one additional month back (tier 2)
+            el_nino_lag3mo, la_nina_lag3mo — three additional months back (tier 3)
+            enso_label                   — "El Niño" / "La Niña" / "Neutral"
+        """
+        df = pd.read_csv(self.enso_path, parse_dates=[self.ENSO_DATE_COL])
+        df = df.set_index(self.ENSO_DATE_COL).sort_index()
+        base = df[self.ENSO_COLS]
+
+        monthly = pd.DataFrame(index=base.index)
+        # shift(1): a month's ONI/classification only usable the following month
+        monthly["oni"]              = base["ONI"].shift(1)
+        monthly["el_nino_t"]        = base["el_nino"].shift(1)
+        monthly["la_nina_t"]        = base["la_nina"].shift(1)
+        monthly["el_nino_lag1mo"]   = base["el_nino"].shift(2)
+        monthly["la_nina_lag1mo"]   = base["la_nina"].shift(2)
+        monthly["el_nino_lag3mo"]   = base["el_nino"].shift(4)
+        monthly["la_nina_lag3mo"]   = base["la_nina"].shift(4)
+        monthly["enso_label"] = np.select(
+            [monthly["el_nino_t"] == 1, monthly["la_nina_t"] == 1],
+            ["El Niño", "La Niña"],
+            default="Neutral",
         )
-        return df[col].rename("nino34").reindex(dates)
+
+        daily_grid = pd.date_range(
+            monthly.index.min(), max(dates.max(), monthly.index.max()), freq="D"
+        )
+        daily = (
+            monthly.reindex(monthly.index.union(daily_grid))
+            .sort_index()
+            .ffill()
+            .reindex(daily_grid)
+        )
+        return daily.reindex(dates)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Standardisation (training statistics only)
@@ -331,7 +380,8 @@ class StationDataLoader:
             covariate_blocks_train                   — {block_name: ndarray}
             covariate_blocks_test                    — {block_name: ndarray}
             covariate_col_names                      — {block_name: [col, ...]}
-            nino34_train, nino34_test                — raw Niño 3.4 (unscaled)
+            nino34_train, nino34_test                — ONI anomaly (unscaled, corrected)
+            enso_label_train, enso_label_test         — "El Niño"/"La Niña"/"Neutral"
             summary                                  — data summary dict
         """
         # ── Precipitation ───────────────────────────────────────────────────
@@ -348,7 +398,7 @@ class StationDataLoader:
         # ── ERA5 covariates on full date range ──────────────────────────────
         dp   = self._load_era5_variable("humidity",    "dewpoint",    all_dates)
         temp = self._load_era5_variable("temperature", "temperature", all_dates)
-        n34  = self._load_nino34(all_dates)
+        enso = self._load_enso_daily(all_dates)
 
         # Short-lag blocks: lags [1,2,3]  (per MODELS.md §15.1, §16.1)
         dew_short    = self._lag_block(dp,   [1, 2, 3])
@@ -359,23 +409,26 @@ class StationDataLoader:
         dewtemp_short    = pd.concat([dew_short,    tmp_short],    axis=1)
         dewtemp_seasonal = pd.concat([dew_seasonal, tmp_seasonal], axis=1)
 
-        # ENSO long-component blocks (per MODELS.md §18)
-        e90    = self._rolling_lag(n34, window=90, shift=1).rename("enso_roll90")
-        e30    = self._rolling_lag(n34, window=30, shift=1).rename("enso_roll30")
-        e_lag1 = n34.shift(1).rename("enso_lag1")
-
-        enso_90d         = e90.to_frame()
-        enso_90d_30d     = pd.concat([e90, e30],         axis=1)
-        enso_90d_30d_day = pd.concat([e90, e30, e_lag1], axis=1)
+        # ENSO long-component blocks: El Nino / La Nina dummies (neutral is
+        # the omitted baseline), per MODELS.md §18 / the 2026-07-07 data fix.
+        # Already 1-month-lagged inside _load_enso_daily; "lag1mo"/"lag3mo"
+        # here add further whole-month lags on top of that safety lag.
+        enso_dummy_current = enso[["el_nino_t", "la_nina_t"]]
+        enso_dummy_lag1 = pd.concat(
+            [enso_dummy_current, enso[["el_nino_lag1mo", "la_nina_lag1mo"]]], axis=1
+        )
+        enso_dummy_lag3 = pd.concat(
+            [enso_dummy_lag1, enso[["el_nino_lag3mo", "la_nina_lag3mo"]]], axis=1
+        )
 
         raw_blocks: Dict[str, pd.DataFrame] = {
             "dewpoint_short":      dew_short,
             "dewpoint_seasonal":   dew_seasonal,
             "dewtemp_short":       dewtemp_short,
             "dewtemp_seasonal":    dewtemp_seasonal,
-            "enso_90d":            enso_90d,
-            "enso_90d_30d":        enso_90d_30d,
-            "enso_90d_30d_daily":  enso_90d_30d_day,
+            "enso_dummy_current":  enso_dummy_current,
+            "enso_dummy_lag1":     enso_dummy_lag1,
+            "enso_dummy_lag3":     enso_dummy_lag3,
         }
 
         # ── Train/test split + standardise ──────────────────────────────────
@@ -391,9 +444,16 @@ class StationDataLoader:
             blocks_train[name] = self._apply_scaler(raw_tr, mu, std)
             blocks_test[name]  = self._apply_scaler(raw_te, mu, std)
 
-        # Raw (unscaled) Niño 3.4 for ENSO classification in diagnostics
-        nino34_train = n34.reindex(dates_train).fillna(0.0).values.astype(np.float64)
-        nino34_test  = n34.reindex(dates_test).fillna(0.0).values.astype(np.float64)
+        # Corrected (unscaled) ONI anomaly + precomputed El Nino/La Nina/Neutral
+        # labels for ENSO diagnostics (replaces the previous raw-SST array).
+        nino34_train = enso["oni"].reindex(dates_train).fillna(0.0).values.astype(np.float64)
+        nino34_test  = enso["oni"].reindex(dates_test).fillna(0.0).values.astype(np.float64)
+        enso_label_train = (
+            enso["enso_label"].reindex(dates_train).fillna("Neutral").values
+        )
+        enso_label_test = (
+            enso["enso_label"].reindex(dates_test).fillna("Neutral").values
+        )
 
         # ── Data summary ────────────────────────────────────────────────────
         summary = {
@@ -424,5 +484,7 @@ class StationDataLoader:
             "covariate_col_names":    col_names,
             "nino34_train":           nino34_train,
             "nino34_test":            nino34_test,
+            "enso_label_train":       enso_label_train,
+            "enso_label_test":        enso_label_test,
             "summary":                summary,
         }
