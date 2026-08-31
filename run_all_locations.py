@@ -85,6 +85,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 # ── Project root on path ─────────────────────────────────────────────────────
 ROOT = Path(__file__).parent
@@ -120,6 +121,13 @@ IMPROVEMENT_THRESHOLD = 0.02
 
 # Stage-4 xi-only regime: thresholds retained per objective 3b (q90 dropped)
 STAGE4_THRESHOLDS = [("95", 0.95), ("98", 0.98)]
+
+# Stage 5 (2026-07-09 addition, not part of objectives 1-4): fully static
+# unconditional GB2 (step 1) + threshold-weighted-likelihood dynamic-xi
+# (step 2), estimated only at these three locations, at all four
+# thresholds below -- only the best (by OOS CRPS) is reported.
+STAGE5_LOCATIONS = {"BELO HORIZONTE", "DARWIN AIRPORT", "GARANHUNS (PERNAMBUCO)"}
+STAGE5_THRESHOLDS = [("90", 0.90), ("95", 0.95), ("98", 0.98), ("99", 0.99)]
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log_file = ROOT / "pipeline_all_locations.log"
@@ -414,6 +422,208 @@ def _extended_metrics_from_cached(model_id: str, run_dir: Path, y_test: np.ndarr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Stage 5 (extra experiment, 2026-07-09, only at STAGE5_LOCATIONS):
+#   step 1 -- fully static (no GAS recursion) unconditional ZA-GB2 MLE.
+#   step 2 -- freeze phi/gamma/zeta/pi at step 1's values; estimate a
+#             GAS(1,1) recursion for xi alone, driven by a threshold-
+#             weighted log-likelihood l = sum_t logpdf(y_t;...) * 1(y_t>=q_c),
+#             for c in {90,95,98,99}. Only the best (by OOS CRPS) is
+#             surfaced in the report; all four are estimated and cached.
+# See models/static_gb2.py and models/threshold_weighted_xi_gas.py for the
+# full mathematical writeup, and docs/MODELS.md Sec. 26 for the summary.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_stage5_variant(
+    data: dict, run_dir: Path, stage_dir: Path, force_rerun: bool,
+    dynamic_pi: bool,
+) -> dict:
+    """
+    One Stage 5 variant: step 1 (static GB2, either static or dynamic pi)
+    + step 2 (threshold-weighted xi, c in STAGE5_THRESHOLDS). Suffix
+    "_dynpi" on every model_id distinguishes the dynamic-pi variant so both
+    remain independently cached and reportable (2026-07-09: "keep both").
+    """
+    from distributions.gb2_log_link import GB2LogLink
+    from models.static_gb2 import StaticGB2Model, StaticGB2DynamicPiModel
+    from models.threshold_weighted_xi_gas import ThresholdWeightedXiModel
+    from pipeline.runner import run_single_model
+    from pipeline.selection import select_by_key_metric
+
+    suffix = "_dynpi" if dynamic_pi else ""
+    y_train, y_test = data["y_train"], data["y_test"]
+
+    # ── Step 1 ───────────────────────────────────────────────────────────
+    static_id = f"stage5_static_gb2{suffix}"
+    logger.info(f"STAGE 5 step 1{suffix}  --  static unconditional ZA-GB2 "
+                f"({'dynamic' if dynamic_pi else 'static'} pi)")
+    static_model = StaticGB2DynamicPiModel() if dynamic_pi else StaticGB2Model()
+    r_static = run_single_model(
+        model_id=static_id, model=static_model,
+        fit_kwargs={"y": y_train},
+        oos_kwargs={"y_train": y_train, "y_test": y_test},
+        y_test=y_test, cache_dir=stage_dir,
+        log_path=run_dir / "execution_log.jsonl",
+        logger=logger, force_rerun=force_rerun,
+    )
+    if r_static.get("result") is not None:
+        static_theta = np.asarray(r_static["result"]["theta"], dtype=float)
+    else:
+        params_path = stage_dir / static_id / "estimated_parameters.csv"
+        static_theta = pd.read_csv(params_path)["value"].to_numpy(dtype=float)
+
+    phi_v = float(static_theta[0]); xi_mv = float(static_theta[1])
+    gamma_v = float(static_theta[2]); zeta_v = float(static_theta[3])
+
+    if dynamic_pi:
+        # pi_v is now a full time-varying array, aligned to y_train (fit/IS)
+        # and y_train+y_test (OOS) -- rebuilt from step 1's own fitted
+        # pi_dynamics theta via the model's own filter()/simulate_oos().
+        pi_train_arr = static_model.filter(static_theta, y_train)["pi"]
+        pi_oos_arr   = static_model.simulate_oos(static_theta, y_train, y_test)["pi_oos"]
+        pi_full_arr  = np.concatenate([pi_train_arr, pi_oos_arr])
+        pi_v_fit, pi_v_oos = pi_train_arr, pi_full_arr
+        logger.info(
+            f"  Stage 5 step 1{suffix} static GB2 fit: phi_MV={phi_v:.4f} "
+            f"xi_MV={xi_mv:.4f} gamma_MV={gamma_v:.4f} zeta_MV={zeta_v:.4f}  "
+            f"pi_t dynamic (train mean={pi_train_arr.mean():.4f}, "
+            f"OOS mean={pi_oos_arr.mean():.4f})"
+        )
+    else:
+        pi_v_fit = pi_v_oos = float(static_theta[4])
+        logger.info(
+            f"  Stage 5 step 1 static GB2 fit: phi_MV={phi_v:.4f} xi_MV={xi_mv:.4f} "
+            f"gamma_MV={gamma_v:.4f} zeta_MV={zeta_v:.4f} pi_MV={pi_v_fit:.4f}"
+        )
+
+    # ── Step 2: threshold-weighted dynamic xi, c in STAGE5_THRESHOLDS ──────
+    # theta is mathematically identical whether pi is static or dynamic (pi
+    # never enters this objective -- additive ZA separability, see
+    # models/threshold_weighted_xi_gas.py); re-fit anyway for a clean,
+    # independently-cached artifact trail rather than a shortcut reuse.
+    results = {}
+    for q_label, q_val in STAGE5_THRESHOLDS:
+        model_id = f"stage5_xi_q{q_label}{suffix}"
+        logger.info(f"STAGE 5 step 2{suffix}  --  threshold-weighted xi, q{q_label} "
+                    f"(phi/gamma/zeta/pi frozen from step 1)")
+        model = ThresholdWeightedXiModel(
+            distribution=GB2LogLink(), scaling="diagonal_inverse_fisher",
+            threshold_quantile=q_val,
+        )
+        threshold_c = model.compute_threshold(y_train, q_val)
+        fit_kwargs = {
+            "y": y_train, "phi_v": phi_v, "gamma_v": gamma_v, "zeta_v": zeta_v,
+            "pi_v": pi_v_fit, "threshold_quantile_c": q_val, "xi_mv": xi_mv,
+            "verbose": False, "options": {"maxiter": 500}, "polish": True,
+            "pi_dynamic_source_model_id": static_id if dynamic_pi else None,
+        }
+        oos_kwargs = {
+            "y_train": y_train, "y_test": y_test,
+            "phi_v": phi_v, "gamma_v": gamma_v, "zeta_v": zeta_v, "pi_v": pi_v_oos,
+            "threshold_c": threshold_c,
+        }
+        r = run_single_model(
+            model_id=model_id, model=model,
+            fit_kwargs=fit_kwargs, oos_kwargs=oos_kwargs,
+            y_test=y_test, cache_dir=stage_dir,
+            log_path=run_dir / "execution_log.jsonl",
+            logger=logger, force_rerun=force_rerun,
+        )
+        results[q_label] = r
+
+    # ── Select best c by OOS CRPS ────────────────────────────────────────
+    candidates = [
+        {"model_id": f"stage5_xi_q{q}{suffix}", "validity": r.get("validity"),
+         "n_params": r.get("n_params", 4), "oos_metrics": r.get("oos_metrics", {})}
+        for q, r in results.items()
+    ]
+    winner = select_by_key_metric(
+        candidates, key_metric="crps_mean", higher_better=False,
+        improvement_threshold=IMPROVEMENT_THRESHOLD,
+    )
+    if winner:
+        logger.info(f"  Stage 5{suffix} WINNER: {winner['model_id']}  "
+                     f"crps={winner.get('oos_metrics', {}).get('crps_mean', float('nan')):.4f}  "
+                     f"({winner.get('_tie_break', '')})")
+
+    return {
+        "static_id": static_id, "static_theta": static_theta.tolist(),
+        "winner": winner, "results": results,
+    }
+
+
+def run_stage5(data: dict, run_dir: Path, force_rerun: bool = False) -> dict:
+    """
+    Stage 5 (extra experiment, not part of objectives 1-4): step 1 - fully
+    static unconditional ZA-GB2 MLE; step 2 - freeze phi/gamma/zeta/pi at
+    step 1's values, estimate a GAS(1,1) recursion for xi alone driven by a
+    threshold-weighted log-likelihood, for c in {90,95,98,99}.
+
+    Run in two variants (2026-07-09, "keep both"):
+      static pi : pi frozen as a single constant (original design).
+      dynamic pi: pi_t fit standalone via the AR-logistic occurrence model
+                  (pi_dynamics/), independent of the GB2 fit -- additive ZA
+                  log-likelihood separability, same principle as pi/GB2
+                  separability in step 1 itself.
+    Both variants' own best-of-4-thresholds winner is computed; the overall
+    best (by OOS CRPS) across the two variants is recorded for reports that
+    only want to show one (the summary report; the main report shows both).
+    """
+    stage_dir = run_dir / "stage5"
+    stage_dir.mkdir(exist_ok=True)
+
+    static_out = _run_stage5_variant(data, run_dir, stage_dir, force_rerun, dynamic_pi=False)
+    dynpi_out  = _run_stage5_variant(data, run_dir, stage_dir, force_rerun, dynamic_pi=True)
+
+    static_winner, dynpi_winner = static_out["winner"], dynpi_out["winner"]
+    overall_best = None
+    if static_winner and dynpi_winner:
+        c_static = static_winner.get("oos_metrics", {}).get("crps_mean", float("inf"))
+        c_dynpi  = dynpi_winner.get("oos_metrics", {}).get("crps_mean", float("inf"))
+        overall_best = "static_pi" if c_static <= c_dynpi else "dynamic_pi"
+    elif static_winner:
+        overall_best = "static_pi"
+    elif dynpi_winner:
+        overall_best = "dynamic_pi"
+    if overall_best:
+        logger.info(f"  Stage 5 overall best variant: {overall_best}")
+
+    winners_path = run_dir / "stage_winners.json"
+    try:
+        existing = json.loads(winners_path.read_text()) if winners_path.exists() else {}
+    except Exception:
+        existing = {}
+    existing["stage5"] = {
+        "static_model": static_out["static_id"],
+        "static_theta": {
+            "phi_MV": static_out["static_theta"][0], "xi_MV": static_out["static_theta"][1],
+            "gamma_MV": static_out["static_theta"][2], "zeta_MV": static_out["static_theta"][3],
+            "pi_MV": static_out["static_theta"][4],
+        },
+        "winner": static_winner["model_id"] if static_winner else None,
+        "models": [
+            {"model_id": f"stage5_xi_q{q}", "validity": r.get("validity"),
+             "loglik": r.get("loglik"), "crps_mean": r.get("oos_metrics", {}).get("crps_mean")}
+            for q, r in static_out["results"].items()
+        ],
+    }
+    existing["stage5_dynpi"] = {
+        "static_model": dynpi_out["static_id"],
+        "winner": dynpi_winner["model_id"] if dynpi_winner else None,
+        "models": [
+            {"model_id": f"stage5_xi_q{q}_dynpi", "validity": r.get("validity"),
+             "loglik": r.get("loglik"), "crps_mean": r.get("oos_metrics", {}).get("crps_mean")}
+            for q, r in dynpi_out["results"].items()
+        ],
+    }
+    existing["stage5_overall_best_variant"] = overall_best
+    winners_path.write_text(json.dumps(existing, indent=2, default=str))
+
+    return {
+        "static": static_out, "dynpi": dynpi_out, "overall_best_variant": overall_best,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Single-location runner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -524,6 +734,13 @@ def run_location(
     elif not phi_final:
         alert(f"{display}: no phi-only final winner -- Stage 4 skipped.")
 
+    # ── Stage 5 (extra experiment, only at STAGE5_LOCATIONS) ────────────────
+    stage5_out = None
+    if station_name in STAGE5_LOCATIONS:
+        t_s5 = time.time()
+        stage5_out = run_stage5(data=data, run_dir=run_dir, force_rerun=force_rerun)
+        logger.info(f"  Stage 5 completed in {time.time()-t_s5:.1f}s")
+
     return {
         "station":            station_name,
         "run_id":             run_id,
@@ -531,6 +748,7 @@ def run_location(
         "phixi_final_winner": phixi_final,
         "phi_final_winner":   phi_final,
         "stage4_out":         stage4_out,
+        "stage5_out":         stage5_out,
         "pipeline_out":       pipeline_out,
     }
 

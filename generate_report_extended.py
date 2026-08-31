@@ -479,6 +479,8 @@ def _plot_is_diagnostics(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_stage_dir(model_id: str) -> str:
+    if model_id.startswith("stage5_"):
+        return "stage5"
     if model_id.startswith("stage4_xi_regime"):
         return "stage4_xi_regime"
     if model_id.startswith("stage3_phi_harvey"):
@@ -490,6 +492,223 @@ def _resolve_stage_dir(model_id: str) -> str:
     if model_id.startswith("stage2_"):
         return "stage2"
     return "stage1"
+
+
+def _stage_label_for_model_id(model_id: str) -> str:
+    """Human-readable stage label for a model_id, e.g. for annotating cross-
+    location tables that mix winners from different stages (2026-07-09b)."""
+    if model_id.startswith("stage5_"):
+        return "Stage 5"
+    if model_id.startswith("stage4_"):
+        return "Stage 4"
+    if "harvey" in model_id:
+        return "Stage 3 (Harvey)"
+    if model_id.startswith("stage3_"):
+        return "Stage 3"
+    if model_id.startswith("stage2_"):
+        return "Stage 2"
+    return "Stage 1"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 5 (static benchmark + threshold-weighted xi, 2026-07-09): bespoke
+# reconstruction, deliberately NOT routed through build_model_from_meta's
+# generic tv_names-inference fallback. StaticGB2Model has tv_param_names=[]
+# (empty by design -- nothing is time-varying), and the generic fallback's
+# `meta.get("tv_param_names") or ...` pattern treats an empty-but-correct
+# list the same as a missing key, silently substituting the wrong default
+# (see session history: this exact "or fallback" footgun on a falsy-but-
+# valid value was found and fixed twice already for other stages). Stage 5's
+# frozen inputs (phi/gamma/zeta/pi/threshold_c) are also plain scalars
+# saved directly in metadata.json -- no upstream base-model trajectory to
+# replay (unlike Stage 4's RegimeXiOnlyModel) -- so reconstruction here is
+# a direct metadata read, not a replay of some other stage's filter.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stage5_reconstruct(model_id: str, run_dir: Path, data: Optional[dict] = None):
+    """
+    Returns (model, theta, frozen_kwargs) or (None, None, {}).
+
+    `data` (needing y_train/y_test) is only required for the "_dynpi"
+    threshold-xi variants, to rebuild their time-varying pi_t array from
+    the sibling StaticGB2DynamicPiModel artifact -- see pi_dynamic /
+    pi_dynamic_source_model_id in that model's saved metadata.json
+    (models/threshold_weighted_xi_gas.py::save_result).
+    """
+    meta = _load_meta(run_dir, "stage5", model_id)
+    params_df = _load_params_df(run_dir, "stage5", model_id)
+    theta = _get_theta(params_df)
+    if theta is None or not meta:
+        return None, None, {}
+
+    if model_id == "stage5_static_gb2":
+        from models.static_gb2 import StaticGB2Model
+        return StaticGB2Model(), theta, {}
+
+    if model_id == "stage5_static_gb2_dynpi":
+        from models.static_gb2 import StaticGB2DynamicPiModel
+        return StaticGB2DynamicPiModel(), theta, {}
+
+    if model_id.startswith("stage5_xi_q"):
+        from models.threshold_weighted_xi_gas import ThresholdWeightedXiModel
+        from distributions.gb2_log_link import GB2LogLink
+        try:
+            phi_v = float(meta["phi"]); gamma_v = float(meta["gamma"]); zeta_v = float(meta["zeta"])
+            threshold_c = float(meta["threshold_c"])
+        except (KeyError, TypeError):
+            return None, None, {}
+
+        if meta.get("pi_dynamic"):
+            src_id = meta.get("pi_dynamic_source_model_id")
+            if not src_id or data is None:
+                return None, None, {}
+            src_model, src_theta, _ = _stage5_reconstruct(src_id, run_dir, data)
+            if src_model is None:
+                return None, None, {}
+            y_train, y_test = data["y_train"], data["y_test"]
+            pi_train = src_model.filter(src_theta, y_train)["pi"]
+            pi_oos   = src_model.simulate_oos(src_theta, y_train, y_test)["pi_oos"]
+            frozen = {
+                "phi_v": phi_v, "gamma_v": gamma_v, "zeta_v": zeta_v,
+                "pi_v": np.concatenate([pi_train, pi_oos]),  # simulate_oos/full-length
+                "threshold_c": threshold_c,
+            }
+        else:
+            try:
+                frozen = {
+                    "phi_v": phi_v, "gamma_v": gamma_v, "zeta_v": zeta_v,
+                    "pi_v": float(meta["pi"]), "threshold_c": threshold_c,
+                }
+            except (KeyError, TypeError):
+                return None, None, {}
+
+        model = ThresholdWeightedXiModel(
+            distribution=GB2LogLink(),
+            scaling=meta.get("scaling", "diagonal_inverse_fisher"),
+            threshold_quantile=meta.get("threshold_quantile", 0.95),
+        )
+        return model, theta, frozen
+
+    return None, None, {}
+
+
+def _stage5_extended_metrics(model_id: str, run_dir: Path, data: dict, model_cache: dict) -> Optional[dict]:
+    model, theta, frozen = _stage5_reconstruct(model_id, run_dir, data)
+    if model is None:
+        return None
+    model_cache[model_id] = model
+    try:
+        # frozen["pi_v"], when present and array-valued, is already full-length
+        # (train+test, see _stage5_reconstruct) -- exactly what simulate_oos expects.
+        oos_paths = model.simulate_oos(theta, data["y_train"], data["y_test"], **frozen)
+        mets = compute_extended_oos_metrics(
+            model=model, paths_oos=oos_paths, y_test=data["y_test"], n_draws=1000,
+        )
+        mets["model_id"] = model_id
+        return mets
+    except Exception as exc:
+        print(f"  [WARN] Stage-5 extended metrics failed for {model_id}: {exc}")
+        return None
+
+
+def _exceedance_ratios_for_model(
+    model_id: str, run_dir: Path, data: dict, model_cache: dict,
+    quantile_levels=(0.95, 0.98, 0.99),
+) -> Optional[dict]:
+    """
+    Empirical/theoretical exceedance ratio at each quantile level for any
+    model (generic Stage 1-4 models or Stage 5) -- the same calibration
+    check used to build the main "how many floods really happened" table,
+    factored out here so it can be reused for a magnitude-scale-independent
+    comparison against Stage 5 (2026-07-09b: CRPS/twCRPS are dominated by
+    Stage 5's frozen phi's poor point-scale, which is expected and not
+    informative about whether the threshold-weighted xi tail mechanism
+    itself is well calibrated; exceedance ratios are calibration-only,
+    checking predicted vs. actual crossing FREQUENCY, not magnitude).
+
+    Returns {"exceed_emp_XXXXX": ratio, ...} keyed like
+    diagnostics.dynamics.compute_exceedance_frequencies, plus "model_id",
+    or None if reconstruction/computation fails.
+    """
+    y_test = data["y_test"]
+
+    if model_id.startswith("stage5_"):
+        model, theta, frozen = _stage5_reconstruct(model_id, run_dir, data)
+        if model is None:
+            return None
+        model_cache[model_id] = model
+        try:
+            oos_paths = model.simulate_oos(theta, data["y_train"], data["y_test"], **frozen)
+        except Exception as exc:
+            print(f"  [WARN] Stage-5 exceedance reconstruction failed for {model_id}: {exc}")
+            return None
+    else:
+        stage = _resolve_stage_dir(model_id)
+        meta      = _load_meta(run_dir, stage, model_id)
+        params_df = _load_params_df(run_dir, stage, model_id)
+        paths_npz = _load_paths_npz(run_dir, stage, model_id)
+        if paths_npz is None:
+            return None
+        meta = _patch_meta_for_reconstruction(meta, params_df)
+        oos_paths = _reconstruct_oos_paths(paths_npz, meta)
+        if oos_paths is None:
+            return None
+        if model_id not in model_cache:
+            try:
+                model_cache[model_id] = _build_model_from_meta(meta, params_df, model_id=model_id)
+            except Exception as exc:
+                print(f"  [WARN] Could not reconstruct {model_id} for exceedance ratios: {exc}")
+                return None
+        model = model_cache[model_id]
+
+    try:
+        quants = compute_dynamic_quantiles(model, oos_paths, list(quantile_levels))
+        exc = compute_exceedance_frequencies(y=y_test, dynamic_quantiles=quants, quantile_levels=list(quantile_levels))
+    except Exception as ex:
+        print(f"  [WARN] Exceedance ratio computation failed for {model_id}: {ex}")
+        return None
+
+    out = {"model_id": model_id}
+    for q in quantile_levels:
+        key = f"exceed_emp_{int(q*10000):05d}"
+        theo = 1.0 - q
+        emp = exc.get(key)
+        out[f"ratio_{int(q*10000):05d}"] = (emp / theo) if (emp is not None and theo > 0) else None
+    return out
+
+
+def _stage5_is_diagnostics(model_id: str, run_dir: Path, data: dict, fig_dir: Path) -> Optional[dict]:
+    model, theta, frozen = _stage5_reconstruct(model_id, run_dir, data)
+    if model is None:
+        return None
+    y_train = data["y_train"]
+    # filter()/cdf_series() need pi_v aligned to y_train alone; frozen["pi_v"]
+    # (when array-valued) is full-length train+test -- slice to the train
+    # portion here rather than inside _stage5_reconstruct, since that
+    # function's frozen dict is shared with simulate_oos (which needs the
+    # full-length array unsliced).
+    if "pi_v" in frozen and not np.isscalar(frozen["pi_v"]):
+        frozen = {**frozen, "pi_v": np.asarray(frozen["pi_v"])[: len(y_train)]}
+    try:
+        cdfs = model.cdf_series(theta, y_train, **frozen)
+    except Exception as exc:
+        print(f"  [WARN] Stage-5 IS cdf_series failed for {model_id}: {exc}")
+        return None
+    if cdfs is None or len(cdfs) == 0:
+        return None
+    rng = np.random.default_rng(0)
+    n = len(cdfs)
+    y_eff = y_train[len(y_train) - n:]
+    pit = pit_values(cdfs, y_eff, randomise_zeros=True, rng=rng)
+    qr = quantile_residuals(cdfs, y_eff, randomise_zeros=True, rng=rng)
+    pit_path, qq_path, acf_path = _plot_is_diagnostics(
+        model_id=model_id, pit=pit, qr=qr, fig_dir=fig_dir
+    )
+    return {
+        "pit": pit, "qr": qr,
+        "pit_mean": float(np.nanmean(pit)), "pit_std": float(np.nanstd(pit)),
+        "pit_path": pit_path, "qq_path": qq_path, "acf_path": acf_path,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -507,6 +726,9 @@ def _compute_extended_metrics_for_model(
 
     Returns dict of metrics or None if paths unavailable.
     """
+    if model_id.startswith("stage5_"):
+        return _stage5_extended_metrics(model_id, run_dir, data, model_cache)
+
     stage = _resolve_stage_dir(model_id)
 
     meta      = _load_meta(run_dir, stage, model_id)
@@ -624,6 +846,9 @@ def _compute_is_diagnostics_for_winner(
     """
     Compute IS PIT / QR for a winner model.  Returns dict with pit, qr, paths.
     """
+    if model_id.startswith("stage5_"):
+        return _stage5_is_diagnostics(model_id, run_dir, data, fig_dir)
+
     if model_id.startswith("stage4_xi_regime"):
         try:
             cdfs = _stage4_is_cdfs(model_id, run_dir, data, winners or {})
@@ -853,9 +1078,22 @@ def _inter_stage_progression_table_tex(
 def _stage_comparison_table_tex(
     run_dir: Path, stage: str,
     winners: dict, caption: str, label: str,
+    model_ids: Optional[List[str]] = None,
+    winner_key: Optional[str] = None,
 ) -> str:
-    """LaTeX model comparison table for one stage."""
-    model_ids = _all_model_ids(run_dir, stage)
+    """
+    LaTeX model comparison table for one stage.
+
+    model_ids: override the default _all_model_ids(run_dir, stage) listing
+    -- needed when a stage directory holds more than one independently-
+    reported family (e.g. stage5/ holds both the static-pi and dynamic-pi
+    Stage 5 variants side by side).
+    winner_key: which key of `winners` to read "winner" from, if different
+    from `stage` itself (e.g. stage5's dynamic-pi variant winner lives
+    under winners["stage5_dynpi"], not winners["stage5"]).
+    """
+    if model_ids is None:
+        model_ids = _all_model_ids(run_dir, stage)
     if not model_ids:
         return f"% No models found for {stage}\n"
 
@@ -874,7 +1112,7 @@ def _stage_comparison_table_tex(
             "n_params": meta.get("n_params"),
         })
 
-    winner_mid = winners.get(stage, {}).get("winner")
+    winner_mid = winners.get(winner_key or stage, {}).get("winner")
 
     cols_hdr = r"\small Model & Validity & loglik & CRPS & RMSE & MAE & $p$"
     body_lines = []
@@ -1874,6 +2112,311 @@ def generate_location_section(
         _section_meta["stage4_base_model"] = s4_base_id
         _section_meta["stage4_counterpart"] = s4_cp_id
 
+    # ── Stage 5: static benchmark + threshold-weighted xi (extra experiment,
+    # 2026-07-09, not part of objectives 1-4), only at Belo Horizonte, Darwin
+    # Airport, Garanhuns. See docs/MODELS.md Sec. 31 and models/static_gb2.py
+    # / models/threshold_weighted_xi_gas.py for the full mathematical writeup.
+    # Two variants are run (2026-07-09b, "keep both"): pi frozen at a single
+    # constant (static-pi) vs. pi_t fit standalone as a time-varying
+    # AR-logistic process (dynamic-pi) -- xi's own GAS(1,1) fit is identical
+    # either way (pi never enters that objective), only OOS/IS evaluation
+    # and the reported full-series loglik differ.
+    from run_all_locations import STAGE5_LOCATIONS
+    s5_winner_id = None
+    if station_name in STAGE5_LOCATIONS:
+        s5_all = _all_model_ids(run_dir, "stage5")
+        s5_static_ids = sorted(m for m in s5_all if not m.endswith("_dynpi"))
+        s5_dynpi_ids  = sorted(m for m in s5_all if m.endswith("_dynpi"))
+        if s5_all:
+            tex_parts.append(r"\subsection{Stage 5 -- Static Benchmark and Threshold-Weighted xi}" + "\n")
+            s5_info    = winners.get("stage5", {})
+            s5dp_info  = winners.get("stage5_dynpi", {})
+            s5_static  = s5_info.get("static_theta", {})
+            s5_winner_static = s5_info.get("winner")
+            s5_winner_dynpi  = s5dp_info.get("winner")
+            best_variant = winners.get("stage5_overall_best_variant", "static_pi")
+            s5_winner_id = s5_winner_static if best_variant == "static_pi" else s5_winner_dynpi
+
+            tex_parts.append(
+                r"An additional experiment (2026-07-09), not part of objectives "
+                r"1--4, run only at this location, in two pi variants (see "
+                r"below). "
+                r"\textbf{Step 1 -- static benchmark}: a fully static (no GAS "
+                r"recursion) zero-augmented GB2 is fit by unconditional maximum "
+                r"likelihood -- $\phi,\xi,\gamma,\zeta$ are constants for the "
+                r"whole series, not driven by any state equation. Because the "
+                r"zero-augmented log-likelihood is additively separable in "
+                r"$\pi$ (occurrence) versus $(\phi,\xi,\gamma,\zeta)$ (the GB2 "
+                r"shape/scale) -- they share no parameters -- the two are "
+                r"always estimated independently, not jointly. In the "
+                r"\emph{static-pi} variant, $\pi_{MV}$ is the closed-form "
+                r"empirical wet-day fraction (no numerical optimisation at "
+                r"all); in the \emph{dynamic-pi} variant, $\pi_t$ is instead "
+                r"fit as a full time-varying AR-logistic process (the same "
+                r"occurrence model used in Stages 1--4, "
+                r"$\eta_t=\omega_0+\rho\,\eta_{t-1}+\sum_{l\in\{1,365,366\}}"
+                r"\omega_l y_{t-l}$, $\pi_t=\sigma(\eta_t)$ -- 3 seasonal "
+                r"$y$-lags plus one AR(1) term on $\eta$ itself, 5 parameters "
+                r"total), fit standalone by maximum likelihood on the binary "
+                r"wet/dry sequence alone, independent of the GB2 side. "
+                r"Either way, $(\phi_{MV},\xi_{MV},\gamma_{MV},\zeta_{MV})$ "
+                r"maximise $\sum_{y_t>0} \log g_y(y_t;\phi,\xi,\gamma,\zeta)$ "
+                r"over training wet days only (dry days carry no information "
+                r"about the positive-part shape), via a bounded L-BFGS-B warm "
+                r"start followed by an unbounded BFGS polish with soft "
+                r"penalties -- this codebase's standard optimisation "
+                r"convention; the bounded step alone was found, empirically, "
+                r"to clip $\phi$ at an artificial wall (its hard bound exists "
+                r"only to produce a safe GAS-filter warm start elsewhere in "
+                r"this codebase, not a final answer)."
+                rf" Static-pi result: $\phi_{{MV}}={_fmt(s5_static.get('phi_MV'),4)}$, "
+                rf"$\xi_{{MV}}={_fmt(s5_static.get('xi_MV'),4)}$, "
+                rf"$\gamma_{{MV}}={_fmt(s5_static.get('gamma_MV'),4)}$, "
+                rf"$\zeta_{{MV}}={_fmt(s5_static.get('zeta_MV'),4)}$, "
+                rf"$\pi_{{MV}}={_fmt(s5_static.get('pi_MV'),4)}$ "
+                r"(the GB2 shape/scale estimates are numerically identical "
+                r"in the dynamic-pi variant, since the two sides of the fit "
+                r"do not interact)."
+                + "\n\n"
+            )
+            tex_parts.append(
+                r"\textbf{Step 2 -- threshold-weighted xi}: $\phi,\gamma,\zeta,\pi$ "
+                r"are frozen at their step-1 values above (never re-estimated); "
+                r"only $\xi$ is dynamic, via a plain GAS(1,1) recursion -- "
+                r"one lag -- "
+                r"$\xi_{t+1}=\omega_\xi+A_\xi s_t+B_\xi \xi_t$. Unlike every "
+                r"other model in this report, the log-likelihood driving both "
+                r"the fit and the score $s_t$ is threshold-weighted rather than "
+                r"computed from every wet day: "
+                r"$l=\sum_t \log g_y(y_t;\phi_{MV},\xi_t,\gamma_{MV},\zeta_{MV}) "
+                r"\cdot \mathbf{1}(y_t \geq q_c)$, where $q_c$ is the $c$-th "
+                r"percentile of training wet-day rainfall. Below-threshold days "
+                r"($y_t < q_c$, which includes every dry day by construction) "
+                r"contribute neither likelihood nor score at $t$ -- $\xi_t$ "
+                r"still evolves through them via the autoregressive term "
+                r"$B_\xi \xi_t$ alone (mean-reversion), exactly as every GAS "
+                r"filter in this framework already treats a dry day as "
+                r"uninformative for the positive-part distribution; this simply "
+                r"extends ``uninformative'' from ``zero rainfall'' to ``below "
+                r"the $c$-th percentile.'' This differs from Stage 4, which "
+                r"computes its score from every wet day and instead rescales "
+                r"how strongly that score feeds into the recursion above the "
+                r"threshold -- Stage 5 discards below-threshold information "
+                r"entirely rather than reweighting it. Since pi never enters "
+                r"this objective, $\xi$'s fitted GAS(1,1) parameters are "
+                r"numerically identical between the static-pi and dynamic-pi "
+                r"variants -- only the OOS/IS evaluation (which does use pi) "
+                r"and the reported full-series loglik differ. Estimated "
+                r"independently for $c\in\{90,95,98,99\}$ in each variant "
+                r"(Tables~\ref{tab:" + station_short + r"_s5} and "
+                r"\ref{tab:" + station_short + r"_s5_dynpi}); only the "
+                r"threshold with the best OOS CRPS is each variant's own "
+                r"result, matching the phi+xi branch's own ranking criterion."
+                + "\n\n"
+            )
+
+            tex_parts.append(_stage_comparison_table_tex(
+                run_dir, "stage5", winners, model_ids=s5_static_ids, winner_key="stage5",
+                caption=(
+                    f"{display}: Stage 5, static-pi variant -- static "
+                    "benchmark (no GAS recursion) and threshold-weighted "
+                    "$\\xi$ at all four thresholds $c$. Winner (best OOS "
+                    "CRPS among the four thresholds) marked with \\textbf{*}."
+                ),
+                label=f"tab:{station_short}_s5",
+            ))
+            tex_parts.append(_stage_comparison_table_tex(
+                run_dir, "stage5", winners, model_ids=s5_dynpi_ids, winner_key="stage5_dynpi",
+                caption=(
+                    f"{display}: Stage 5, dynamic-pi variant -- static "
+                    "benchmark with time-varying $\\pi_t$ and threshold-"
+                    "weighted $\\xi$ at all four thresholds $c$. Winner "
+                    "marked with \\textbf{*}."
+                ),
+                label=f"tab:{station_short}_s5_dynpi",
+            ))
+
+            s5_mets = []
+            for mid in s5_all:
+                m = _compute_extended_metrics_for_model(mid, run_dir, data, model_cache)
+                if m:
+                    s5_mets.append(m)
+            s5_mets_static = [m for m in s5_mets if not m["model_id"].endswith("_dynpi")]
+            s5_mets_dynpi  = [m for m in s5_mets if m["model_id"].endswith("_dynpi")]
+            if s5_mets:
+                pd.DataFrame(s5_mets).to_csv(
+                    csv_dir / f"{station_short}_stage5_metrics.csv", index=False
+                )
+            if s5_mets_static:
+                tex_parts.append(_extended_metrics_table_tex(
+                    s5_mets_static,
+                    caption=f"{display}: Stage 5 (static-pi) OOS CRPS and twCRPS@95/98.",
+                    label=f"tab:{station_short}_s5_ext",
+                    cols_group="crps",
+                ))
+            if s5_mets_dynpi:
+                tex_parts.append(_extended_metrics_table_tex(
+                    s5_mets_dynpi,
+                    caption=f"{display}: Stage 5 (dynamic-pi) OOS CRPS and twCRPS@95/98.",
+                    label=f"tab:{station_short}_s5_dynpi_ext",
+                    cols_group="crps",
+                ))
+
+            if s5_winner_id:
+                s5_winner_ext = next((m for m in s5_mets if m["model_id"] == s5_winner_id), None)
+
+                # Compare against the phi+xi branch's own final winner on the
+                # same metric, exactly as the earlier "does xi help" section --
+                # both models already in model_cache, no re-fitting either way.
+                phixi_ext = _compute_extended_metrics_for_model(
+                    fw_info.get("model_id"), run_dir, data, model_cache
+                ) if fw_info.get("model_id") else None
+                verdict = ""
+                if s5_winner_ext and phixi_ext:
+                    c5, cx = s5_winner_ext.get("crps_mean"), phixi_ext.get("crps_mean")
+                    if c5 is not None and cx is not None and np.isfinite(c5) and np.isfinite(cx):
+                        pct = (cx - c5) / abs(cx) * 100 if cx else float("nan")
+                        direction = "improves on" if c5 < cx else "is worse than"
+                        verdict = (
+                            rf" CRPS {_fmt(c5)} vs.\ the phi+xi branch's own "
+                            rf"final winner (\texttt{{{_tex(fw_info.get('model_id',''))}}}, "
+                            rf"CRPS {_fmt(cx)}): Stage 5 {direction} it by "
+                            rf"{abs(pct):.1f}\%."
+                        )
+
+                static_note = ""
+                static_bench_id = "stage5_static_gb2" if best_variant == "static_pi" else "stage5_static_gb2_dynpi"
+                static_ext = next((m for m in s5_mets if m["model_id"] == static_bench_id), None)
+                if s5_winner_ext and static_ext:
+                    c5, c0 = s5_winner_ext.get("crps_mean"), static_ext.get("crps_mean")
+                    if c5 is not None and c0 is not None and np.isfinite(c5) and np.isfinite(c0) and c0:
+                        pct0 = (c5 - c0) / abs(c0) * 100
+                        static_note = (
+                            r" Notably, the fully static step-1 benchmark "
+                            rf"(CRPS {_fmt(c0)}) itself beats every threshold-"
+                            rf"weighted $\xi$ candidate, including this winner, "
+                            rf"by {pct0:.1f}\% -- adding threshold-driven $\xi$ "
+                            r"dynamics on top of a frozen scale did not pay off "
+                            r"at this location."
+                        )
+
+                variant_note = ""
+                s5w_static_ext = next((m for m in s5_mets if m["model_id"] == s5_winner_static), None)
+                s5w_dynpi_ext  = next((m for m in s5_mets if m["model_id"] == s5_winner_dynpi), None)
+                if s5w_static_ext and s5w_dynpi_ext:
+                    cst, cdp = s5w_static_ext.get("crps_mean"), s5w_dynpi_ext.get("crps_mean")
+                    if cst is not None and cdp is not None and np.isfinite(cst) and np.isfinite(cdp):
+                        variant_note = (
+                            rf" Static-pi's own best (\texttt{{{_tex(s5_winner_static)}}}, "
+                            rf"CRPS {_fmt(cst)}) vs.\ dynamic-pi's own best "
+                            rf"(\texttt{{{_tex(s5_winner_dynpi)}}}, CRPS {_fmt(cdp)}): "
+                            + ("static-pi wins" if cst <= cdp else "dynamic-pi wins")
+                            + f" -- reported below as this location's Stage 5 result."
+                        )
+
+                tex_parts.append(
+                    rf"\textbf{{Stage 5 winner}} ({best_variant.replace('_',' ')}): "
+                    rf"\texttt{{{_tex(s5_winner_id)}}} (best OOS CRPS among the "
+                    r"four thresholds)." + verdict + static_note + variant_note + "\n\n"
+                )
+
+                is_diag = _compute_is_diagnostics_for_winner(
+                    model_id=s5_winner_id, run_dir=run_dir, data=data,
+                    col_name_dict=data["covariate_col_names"], fig_dir=fig_dir,
+                    winners=winners,
+                )
+                if is_diag:
+                    pit_rel = os.path.relpath(is_diag["pit_path"], fig_dir.parent.parent).replace("\\", "/")
+                    acf_rel = os.path.relpath(is_diag["acf_path"], fig_dir.parent.parent).replace("\\", "/")
+                    tex_parts.append(
+                        rf"\paragraph{{IS diagnostics (\texttt{{{_tex(s5_winner_id)}}})}}"
+                        + "\n"
+                        + f"PIT mean = {is_diag['pit_mean']:.3f} (ideal 0.5), "
+                        f"std = {is_diag['pit_std']:.3f} (ideal {1/12**0.5:.3f})." + "\n\n"
+                    )
+                    tex_parts.append(_fig_tex(
+                        pit_rel, f"{display} (Stage 5, {_tex(s5_winner_id)}): IS PIT histogram.",
+                        f"fig:{station_short}_s5_pit", width="0.55",
+                    ))
+                    tex_parts.append(_fig_tex(
+                        acf_rel, f"{display} (Stage 5, {_tex(s5_winner_id)}): IS quantile-residual ACF (400 lags).",
+                        f"fig:{station_short}_s5_acf", width="0.75",
+                    ))
+
+                # ── Calibration-only comparison: exceedance ratios + twCRPS,
+                # vs. the phi+xi branch's own final winner (2026-07-09b).
+                # CRPS/twCRPS above are dominated by Stage 5's frozen phi's
+                # point-scale (expected -- a fixed scale cannot track the
+                # seasonal cycle a dynamic-phi winner can); the calibration
+                # question -- does the threshold-weighted tail mechanism
+                # itself predict extreme-crossing FREQUENCY correctly,
+                # independent of magnitude -- is answered by exceedance
+                # ratios instead, which is magnitude-scale-independent.
+                cmp_id = fw_info.get("model_id")
+                s5_exc = _exceedance_ratios_for_model(s5_winner_id, run_dir, data, model_cache)
+                cmp_exc = _exceedance_ratios_for_model(cmp_id, run_dir, data, model_cache) if cmp_id else None
+                if s5_exc and cmp_exc:
+                    tex_parts.append(
+                        r"\paragraph{Calibration-only comparison: exceedance ratios and twCRPS}"
+                        + "\n"
+                        + r"CRPS/twCRPS above are dominated by Stage 5's frozen "
+                        r"$\phi$'s point-scale, which cannot track the seasonal "
+                        r"cycle the way a dynamic-$\phi$ winner can -- expected, "
+                        r"not informative about the threshold-weighted $\xi$ "
+                        r"mechanism's own tail behaviour. Exceedance ratios "
+                        r"(actual vs.\ predicted crossing frequency, magnitude-"
+                        r"independent) are a fairer test." + "\n\n"
+                    )
+                    s5_label  = _stage_label_for_model_id(s5_winner_id)
+                    cmp_label = _stage_label_for_model_id(cmp_id)
+                    rows_exc = []
+                    for q in (0.95, 0.98, 0.99):
+                        key = f"ratio_{int(q*10000):05d}"
+                        rows_exc.append({
+                            "q": f"q{q*100:g}",
+                            f"Stage 5 ({s5_label})": s5_exc.get(key),
+                            f"Best of previous stages ({cmp_label})": cmp_exc.get(key),
+                        })
+                    df_exc = pd.DataFrame(rows_exc)
+                    hdr = " & ".join(r"\small " + _tex(c) for c in df_exc.columns) + r" \\"
+                    body_exc = []
+                    for _, row in df_exc.iterrows():
+                        cells = [str(row["q"])] + [
+                            (f"{v:.2f}$\\times$" if v is not None and np.isfinite(v) else "--")
+                            for v in row[1:]
+                        ]
+                        body_exc.append(" & ".join(cells) + r" \\")
+                    tex_parts.append(
+                        r"\begin{table}[ht]" + "\n\\centering\n\\footnotesize\n"
+                        r"\resizebox{\ifdim\width>\textwidth\textwidth\else\width\fi}{!}{%" + "\n"
+                        r"\begin{tabular}{lrr}" + "\n\\hline\n"
+                        + hdr + "\n\\hline\n" + "\n".join(body_exc) + "\n\\hline\n"
+                        r"\end{tabular}" + "\n}" + "\n"
+                        rf"\caption{{{display}: exceedance ratio (actual/predicted crossing frequency), "
+                        r"Stage 5 winner vs.\ best model from previous stages. 1.0$\times$ is perfect.}"
+                        + "\n"
+                        rf"\label{{tab:{station_short}_s5_exc}}" + "\n"
+                        r"\end{table}" + "\n"
+                    )
+                    _section_meta["stage5_exc_ratios"] = {k: v for k, v in s5_exc.items() if k != "model_id"}
+                    _section_meta["stage5_cmp_exc_ratios"] = {k: v for k, v in cmp_exc.items() if k != "model_id"}
+
+                tw5 = s5_winner_ext.get("twcrps_95") if s5_winner_ext else None
+                twc = phixi_ext.get("twcrps_95") if phixi_ext else None
+                _section_meta["stage5_twcrps_95"] = tw5
+                _section_meta["stage5_cmp_twcrps_95"] = twc
+                _section_meta["stage5_cmp_model_id"] = cmp_id
+                _section_meta["stage5_cmp_stage_label"] = _stage_label_for_model_id(cmp_id) if cmp_id else None
+                _section_meta["stage5_stage_label"] = _stage_label_for_model_id(s5_winner_id)
+
+            _section_meta["stage5_winner"] = s5_winner_id
+            _section_meta["stage5_best_variant"] = best_variant
+            _section_meta["stage5_static_theta"] = s5_static
+            _section_meta["stage5_crps"] = (
+                next((m.get("crps_mean") for m in s5_mets if m["model_id"] == s5_winner_id), None)
+                if s5_winner_id else None
+            )
+
     # ── Appendix: parameter estimates + standard errors, all 7 winners ─────
     # Per prompt.md: standard errors were saved (every model's save_result())
     # but never shown in round 1's report. One table per winner, kept
@@ -1889,6 +2432,11 @@ def generate_location_section(
     if s4_winner_id:
         appendix_entries.append((f"Stage 4 (q{best_q})", "stage4_xi_regime",
                                   {"model_id": s4_winner_id}))
+    if s5_winner_id:
+        appendix_entries.append(("Stage 5 (static benchmark)", "stage5",
+                                  {"model_id": "stage5_static_gb2"}))
+        appendix_entries.append((f"Stage 5 ({s5_winner_id.replace('stage5_xi_', '')})", "stage5",
+                                  {"model_id": s5_winner_id}))
     appendix_entries = [(lbl, sd, w) for lbl, sd, w in appendix_entries if w]
 
     if appendix_entries:
@@ -1925,7 +2473,7 @@ def generate_global_comparison(
     # Two independent tables (objective 4d/1a/1b): phi-only branch ranked by
     # OOS RMSE, phi+xi branch ranked by OOS CRPS. Never mixed into one table
     # (REPORTING.md §10: avoid mixing unrelated metrics).
-    rows_phi, rows_phixi, rows_s4, rows_xicompare = [], [], [], []
+    rows_phi, rows_phixi, rows_s4, rows_xicompare, rows_s5 = [], [], [], [], []
     for station, res in station_results.items():
         cfg = STATION_REGISTRY.get(station, {})
         display = cfg.get("display", station)
@@ -1961,6 +2509,18 @@ def generate_global_comparison(
                 "phi+xi counterpart": res.get("stage4_counterpart", "?"),
                 "q95 accepted": _s4cell(res.get("stage4_q95_accepted"), res.get("stage4_q95_improvement")),
                 "q98 accepted": _s4cell(res.get("stage4_q98_accepted"), res.get("stage4_q98_improvement")),
+            })
+        if res.get("stage5_winner"):
+            c5, cx = res.get("stage5_crps"), res.get("phixi_crps")
+            vs_phixi = "--"
+            if c5 is not None and cx is not None and np.isfinite(c5) and np.isfinite(cx) and cx:
+                vs_phixi = f"{(cx - c5) / abs(cx):+.1%}"
+            rows_s5.append({
+                "Station": display,
+                "Best variant": res.get("stage5_best_variant", "static_pi").replace("_", " "),
+                "Winner": res["stage5_winner"],
+                "OOS CRPS": res.get("stage5_crps", float("nan")),
+                "vs. phi+xi branch winner": vs_phixi,
             })
 
     def _emit_table(rows, caption, label, numeric_cols):
@@ -2032,6 +2592,24 @@ def generate_global_comparison(
         rows_s4, "Stage 4 acceptance by location and threshold.",
         "tab:global_s4", set(),
     )
+
+    if rows_s5:
+        tex_parts.append(
+            r"\section{Stage 5 -- Static Benchmark and Threshold-Weighted xi}" + "\n"
+        )
+        tex_parts.append(
+            r"Extra experiment (2026-07-09, not part of objectives 1--4), run "
+            r"only at Belo Horizonte, Darwin Airport, and Garanhuns -- see "
+            r"docs/MODELS.md Sec.~31 and each location's own subsection for "
+            r"the full methodology. Winner is the best OOS CRPS among four "
+            r"threshold-weighted $\xi$ fits ($c\in\{90,95,98,99\}$), with "
+            r"$\phi,\gamma,\zeta,\pi$ frozen at a fully static (no GAS "
+            r"recursion) unconditional MLE." + "\n\n"
+        )
+        _emit_table(
+            rows_s5, "Stage 5 winner and OOS CRPS by location.",
+            "tab:global_s5", {"OOS CRPS"},
+        )
 
     # Narrative: which locations accepted Stage 2/3 covariates, Stage 4.
     tex_parts.append(r"\section{Cross-Location Patterns}" + "\n")
@@ -2426,6 +3004,9 @@ def main():
             "stage4_q98_improvement": s4_accept.get("98", {}).get("rel_improvement"),
             "stage4_base_model": s4_info.get("base_model"),
             "stage4_counterpart": s4_info.get("counterpart"),
+            "stage5_winner":  section_extra.get("stage5_winner"),
+            "stage5_crps":    section_extra.get("stage5_crps"),
+            "stage5_best_variant": section_extra.get("stage5_best_variant"),
         }
 
     # Global comparison

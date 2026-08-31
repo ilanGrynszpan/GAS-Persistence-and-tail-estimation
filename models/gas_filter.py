@@ -457,6 +457,16 @@ class GASFilter:
     def filter(self, theta: np.ndarray, y: np.ndarray) -> dict:
         return self._run_filter(theta, y, return_paths=True)
 
+    def fit_unconditional(self, y_pos: np.ndarray) -> dict:
+        """
+        Public entry point for the static (constant-parameter, no GAS
+        recursion) MLE fit -- see `_unconditional_mle` for full docs. Exposed
+        separately so callers that want a genuine "static model" result
+        (e.g. Stage 5 step 1: an unconditional GB2 fit, not merely a GAS
+        warm-start) do not need to reach into a private method.
+        """
+        return self._unconditional_mle(y_pos)
+
     def _unconditional_mle(self, y_pos: np.ndarray) -> dict:
         """
         Fit the distribution with constant (time-invariant) parameters to y_pos.

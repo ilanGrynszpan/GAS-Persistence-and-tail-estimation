@@ -796,9 +796,9 @@ $$
 L_{j,t+1}
 =
 
-B_{L,j}L_{j,t}
+\phi_{L,j}L_{j,t}
 +
-A_{L,j}s_{j,t}
+\kappa_{L,j}s_{j,t}
 +
 \Gamma_{L,j}'X^{long}_t,
 $$
@@ -809,9 +809,9 @@ $$
 S_{j,t+1}
 =
 
-B_{S,j}S_{j,t}
+\phi_{S,j}S_{j,t}
 +
-A_{S,j}s_{j,t}
+\kappa_{S,j}s_{j,t}
 +
 \Gamma_{S,j}'X^{short}_t.
 $$
@@ -832,7 +832,7 @@ $$
 The persistence restriction is:
 
 $$
-0 < B_{S,j} < B_{L,j} < 1.
+0 < \phi_{S,j} < \phi_{L,j} < 1.
 $$
 
 The restriction ensures that the long component is more persistent than the short component.
@@ -1184,3 +1184,95 @@ The correct implementation direction is:
 Avoid combinatorial growth in model files.
 
 The repository should evolve into a general score-driven modelling framework, not a collection of one-off scripts.
+
+---
+
+# 31. Stage 5 — Static Benchmark and Threshold-Weighted Xi Tail Dynamics
+
+Stage 5 is an additional experiment (2026-07-09), not part of the Stage 1-4
+pipeline objectives, run only at three locations (Belo Horizonte, Darwin
+Airport, Garanhuns). It asks: how much of a model's tail performance comes
+from having *any* time-varying scale at all, versus from letting the tail
+shape parameter respond specifically to extreme observations?
+
+## 31.1 Step 1 — Fully Static Unconditional GB2
+
+No GAS recursion. phi, xi, gamma, zeta are constants for the whole series.
+The zero-augmented log-likelihood factorises additively:
+
+$$
+l(\theta) = \sum_{y_t=0} \log(1-\pi) + \sum_{y_t>0} \left[ \log(\pi) + \log g_y(y_t;\phi,\xi,\gamma,\zeta) \right]
+$$
+
+$\pi$ and $(\phi,\xi,\gamma,\zeta)$ share no parameters, so their MLEs are
+estimated separately, not jointly:
+
+$$
+\pi_{MV} = \frac{\#\{y_t>0\}}{\#\{y_t\}} \qquad \text{(closed form)}
+$$
+
+$$
+(\phi_{MV},\xi_{MV},\gamma_{MV},\zeta_{MV}) = \arg\max \sum_{y_t>0} \log g_y(y_t;\phi,\xi,\gamma,\zeta)
+$$
+
+estimated by unbounded BFGS (a bounded L-BFGS-B pass first, as a safe
+starting point away from the degenerate $\gamma \geq \zeta$ region, exactly
+as `GASFilter`'s own internal warm-start does; the bounded result is not
+the final answer, since those bounds exist only to keep the warm start
+away from degeneracy and are not wide enough for the true unconstrained
+optimum -- confirmed empirically at Darwin, where $\phi$ landed exactly on
+the bound before the unbounded polish was added).
+
+## 31.2 Step 2 — Threshold-Weighted Xi
+
+$\phi$, $\gamma$, $\zeta$, $\pi$ are frozen at their step-1 values (never
+re-estimated). Only $\xi$ is dynamic, via a plain GAS(1,1) recursion:
+
+$$
+\xi_{t+1} = \omega_\xi + A_\xi s_t + B_\xi \xi_t
+$$
+
+but the log-likelihood driving both the fit and the score $s_t$ is
+threshold-weighted, not the plain per-observation density:
+
+$$
+l(\theta) = \sum_{t=1}^{T} \log g_y(y_t; \phi_{MV}, \xi_t, \gamma_{MV}, \zeta_{MV}) \cdot I_t, \qquad I_t = \mathbf{1}(y_t \geq q_c)
+$$
+
+where $q_c$ is the $c$-th percentile of training wet-day observations, for
+$c \in \{90, 95, 98, 99\}$ (four separate fits; only the best by OOS CRPS
+is reported). Below-threshold days ($I_t=0$, which includes every
+zero-rainfall day by construction) contribute neither likelihood nor score
+at $t$ -- $\xi_t$ still evolves through those days via the autoregressive
+term $B_\xi \xi_t$ alone, exactly as every GAS filter in this framework
+already treats a zero observation as uninformative for the positive-part
+distribution; Stage 5 simply extends "uninformative" from "zero rainfall"
+to "below the $c$-th percentile."
+
+This differs from Stage 4 (§22-23): Stage 4 computes its score from every
+wet day and instead multiplies the score-response coefficient by
+$(1 + A^{ext}/A \cdot R_t(c))$ above the threshold, reweighting how
+strongly a wet day's information feeds into the recursion. Stage 5
+discards below-threshold information entirely rather than reweighting it.
+
+## 31.3 Reported Log-Likelihood
+
+The threshold-weighted training objective above is not comparable across
+different $c$ (each maximises a different, subset-restricted objective)
+nor against any other model's full-series log-likelihood. For AIC/BIC and
+every comparison table, Stage 5 step 2 instead reports the standard
+full-series zero-augmented log-likelihood, evaluated at every observation
+using the fitted $\xi_t$ path:
+
+$$
+l_{full} = \sum_t \begin{cases} \log(1-\pi_{MV}) & y_t = 0 \\ \log(\pi_{MV}) + \log g_y(y_t;\phi_{MV},\xi_t,\gamma_{MV},\zeta_{MV}) & y_t > 0 \end{cases}
+$$
+
+## 31.4 Parameter Count
+
+Step 1 (the static model) is reported as its own model with 5 parameters
+($\phi_{MV},\xi_{MV},\gamma_{MV},\zeta_{MV},\pi_{MV}$). Step 2's own
+n\_params is 4 ($\omega_\xi, f_{0,\xi}, A_\xi, B_\xi$) -- the frozen
+step-1 inputs are not double-counted, matching Stage 4's own convention of
+reporting the frozen base model's parameter count separately from the
+regime model's incremental parameter count.

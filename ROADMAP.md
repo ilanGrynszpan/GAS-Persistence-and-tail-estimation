@@ -338,3 +338,62 @@ Completed tasks should be checked and retained as part of the project's developm
 Do not add speculative future research, commercial ideas, startup plans, or unrelated applications.
 
 The roadmap should remain focused on the software currently being built.
+
+---
+
+# Pi-Dynamics Alternatives Experiment (2026-07-14)
+
+A Stage 1 side-experiment (not part of the Stage 1-4 pipeline objectives):
+compares four occurrence-probability ($\pi_t$) dynamics specifications --
+the existing AR-logistic model (seasonal lags), an AR-logistic model with
+short lags {1,2,3}, a no-AR short-lag variant, and a model where $\eta_t$
+is driven by the frozen magnitude GAS(p,q) scale path $\varphi_{t|t-1}$ --
+at all six locations, entirely in-sample.
+
+Implemented, not yet run (per docs/EXECUTION.md, execution requires user
+authorization after code review):
+
+* `pi_dynamics/ar_logistic_custom_lags.py` -- configurable short-lag /
+  no-AR occurrence dynamics.
+* `pi_dynamics/phi_linked.py` -- phi-linked occurrence dynamics.
+* `diagnostics/occurrence_pit.py` -- randomised Bernoulli PIT/quantile
+  residuals.
+* `diagnostics/pi_dynamics_eval.py` -- in-sample RMSE/CRPS evaluation
+  against a frozen magnitude baseline.
+* `run_pi_dynamics_alternatives.py` -- fits all four variants at all six
+  locations, saves artifacts under `artifacts/pi_dynamics_experiment/`.
+* `generate_pi_dynamics_report.py` -- builds `reports/pi_dynamics_alternatives/`
+  (tables, figures, report.tex/PDF) from those artifacts only.
+
+None of the existing Stage 1-4 code, artifacts, or reports were modified to
+build this experiment.
+
+---
+
+# Multi-Location Stage 1-4 Diagnostic Mosaics (2026-07-31)
+
+A reporting-only deliverable (not a new experiment): cross-location mosaic
+figures -- PIT histogram, normal QQ plot, and 400-lag quantile-residual
+ACF -- showing each stage's own winning model (Stage 1 baseline GAS,
+Stage 2 weather covariates, Stage 3 Harvey long-short, Stage 4
+tail-sensitive xi regime) at all six completed locations, side by side.
+Stages 1-3 are shown for both the phi+xi branch and the phi-only branch
+separately (21 mosaic PNG/PDF files total: 7 stage/branch combinations x
+3 chart types). Every stage's own winner is shown regardless of whether it
+became the pipeline's overall final model.
+
+Implemented, not yet run (per docs/EXECUTION.md, execution requires user
+authorization after code review):
+
+* `diagnostics/plots.py` -- added `pit_histogram_mosaic`, `qq_plot_mosaic`,
+  `acf_mosaic_400` (cross-location grid builders; ACF fixed to y in
+  [-1, 1] with a shaded +/-2/sqrt(n) null band per panel).
+* `diagnostics/multilocation_mosaics.py` -- stage/branch winner resolution
+  (`resolve_stage_winner`, `resolve_stage4_winner`) and per-location IS
+  diagnostic assembly, reusing `generate_report_extended.py`'s existing
+  model-reconstruction/CDF logic rather than duplicating it.
+* `multilocation_diagnostic_mosaics.ipynb` -- orchestration notebook;
+  writes to `reports/multi_location/mosaics/`.
+
+No existing Stage 1-4 code, artifacts, or the main multi-location report
+were modified to build this.

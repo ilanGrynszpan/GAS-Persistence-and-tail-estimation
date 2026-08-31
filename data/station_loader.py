@@ -121,6 +121,7 @@ STATION_REGISTRY: Dict[str, Dict] = {
         "run_id":   "run_20260701_bh",
         "short":    "bh",
         "display":  "Belo Horizonte",
+        "country":  "Brazil",
     },
     "CRUZEIRO DO SUL (ACRE)": {
         "era5_key": "CRUZEIRO_DO_SUL",
@@ -128,6 +129,7 @@ STATION_REGISTRY: Dict[str, Dict] = {
         "run_id":   "run_20260705_cruzeiro",
         "short":    "cruzeiro",
         "display":  "Cruzeiro do Sul",
+        "country":  "Brazil",
     },
     "DARWIN AIRPORT": {
         "era5_key": "DARWIN_AIRPORT",
@@ -135,6 +137,11 @@ STATION_REGISTRY: Dict[str, Dict] = {
         "run_id":   "run_20260705_darwin",
         "short":    "darwin",
         "display":  "Darwin Airport",
+        "country":  "Australia",
+        # Only DARWIN AIRPORT needs a shorter name for figures (dropping
+        # "Airport") -- every other station's mosaic_name matches "display"
+        # by default (see mosaic_name() below), so this is the one override.
+        "mosaic_name": "Darwin",
     },
     "GARANHUNS (PERNAMBUCO)": {
         "era5_key": "GARANHUNS",
@@ -142,6 +149,7 @@ STATION_REGISTRY: Dict[str, Dict] = {
         "run_id":   "run_20260705_garanhuns",
         "short":    "garanhuns",
         "display":  "Garanhuns",
+        "country":  "Brazil",
     },
     "MANAUS": {
         "era5_key": "MANAUS",
@@ -149,6 +157,7 @@ STATION_REGISTRY: Dict[str, Dict] = {
         "run_id":   "run_20260705_manaus",
         "short":    "manaus",
         "display":  "Manaus",
+        "country":  "Brazil",
     },
     "SALVADOR": {
         "era5_key": "SALVADOR",
@@ -156,6 +165,7 @@ STATION_REGISTRY: Dict[str, Dict] = {
         "run_id":   "run_20260705_salvador",
         "short":    "salvador",
         "display":  "Salvador",
+        "country":  "Brazil",
     },
     "SÃO PAULO": {
         "era5_key": "SAO_PAULO",
@@ -163,6 +173,7 @@ STATION_REGISTRY: Dict[str, Dict] = {
         "run_id":   "run_20260705_saopaulo",
         "short":    "saopaulo",
         "display":  "São Paulo",
+        "country":  "Brazil",
     },
     "TORONTO": {
         "era5_key": "TORONTO",
@@ -170,8 +181,19 @@ STATION_REGISTRY: Dict[str, Dict] = {
         "run_id":   "run_20260705_toronto",
         "short":    "toronto",
         "display":  "Toronto",
+        "country":  "Canada",
     },
 }
+
+
+def mosaic_name(station_key: str) -> str:
+    """Short location name for figures (e.g. "Darwin" instead of the
+    canonical "display" name "Darwin Airport"). Falls back to "display"
+    when a station has no override -- see the "mosaic_name" comment above.
+    Does not affect "display", which remains the name used everywhere else
+    (report chapters, table captions, CSV columns, artifact paths)."""
+    cfg = STATION_REGISTRY[station_key]
+    return cfg.get("mosaic_name", cfg["display"])
 
 # Stations to exclude from multi-location runs
 EXCLUDED_STATIONS = {"RIYADH OBS. (O.A.P."}
