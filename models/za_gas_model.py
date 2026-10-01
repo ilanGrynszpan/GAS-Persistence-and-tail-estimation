@@ -66,7 +66,7 @@ from scipy.special import expit, log_expit  # logistic σ(x) = 1/(1+e^{-x})
 
 from distributions.base import Distribution
 from pi_dynamics.base import PiDynamics
-from models.gas_filter import GASFilter
+from models.gas_filter import GASFilter, _sigmoid_scalar, _logit_scalar
 from models.lags import SEASONAL_LAGS
 
 try:
@@ -76,7 +76,7 @@ except Exception:
     _NB_AVAIL = False
 
 _NB_DIST_NAMES = {"GB2LogLink", "GB2LogLinkPhiOnly"}
-_NB_PI_NAMES   = {"ARLogisticPiDynamics"}
+_NB_PI_NAMES   = {"ARLogisticPiDynamics", "ARLogisticCustomLagsPiDynamics"}
 
 
 class ZAGASModel:
@@ -102,10 +102,85 @@ class ZAGASModel:
         # Legacy alias kept for backward compat
         scale_score: bool | None = None,
         static_params: List[str] | None = None,
+        # Experimental: per-lag sigmoid-bounded A/B (default off) and
+        # sigmoid-bounded occurrence persistence rho (default off) -- see
+        # reports/seasonality GAS/gradient_and_convergence_diagnosis.md §8.
+        # Both default to reproducing the exact previous behaviour.
+        bound_ab: bool = False,
+        a_max: float = 2.0,
+        b_max: float = 1.0,
+        bound_rho: bool = False,
+        rho_max: float = 0.999,
+        # Link-only ("v3") extensions, all default off -- see reports/
+        # original vs v2/ link-only follow-up and models/gas_filter.py's
+        # _ParamCodec docstring:
+        #   ab_signed        : A/B decode through a SIGNED sigmoid
+        #                      (-max, max) instead of one-sided (0, max),
+        #                      matching the original |A|/|B| penalty's true
+        #                      (symmetric) domain.
+        #   rho_signed       : same idea for rho.
+        #   free_zeta_gamma  : zeta's theta slot becomes a free delta;
+        #                      natural-scale zeta = gamma + log(kurtosis_margin)
+        #                      + exp(delta), guaranteeing
+        #                      exp(zeta) > kurtosis_margin*exp(gamma) by
+        #                      construction -- the GB2 moment-existence
+        #                      condition, generalised (kurtosis_margin=1.0
+        #                      reproduces the ORIGINAL model's mean-only
+        #                      requirement zeta>gamma; =4.0 is the 4th-
+        #                      moment/kurtosis condition).
+        #   unconstrained_penalties : drop the |static_param|<20 auxiliary
+        #                      numerical guard entirely. Does NOT touch the
+        #                      state/eta explosion safety nets (STATE_LIMIT/
+        #                      ETA_LIMIT) -- those are numerical-validity
+        #                      safeguards (OPTIMIZATION.md §5), not
+        #                      statistical domain constraints, and remain
+        #                      active regardless of this flag.
+        ab_signed: bool = False,
+        rho_signed: bool = False,
+        free_zeta_gamma: bool = False,
+        kurtosis_margin: float = 4.0,
+        unconstrained_penalties: bool = False,
+        #   unconstrained_state : drop the state-magnitude (|f_{j,t}|<15)
+        #                      soft quadratic penalty entirely. Unlike
+        #                      unconstrained_penalties above, this DOES
+        #                      touch one of the two safety nets named in
+        #                      the note two paragraphs up -- empirically
+        #                      (report_se_utils.check_penalty_contamination)
+        #                      this specific penalty, not the A/B/rho boxes,
+        #                      turned out to be the sole source of nearly
+        #                      every "(boundary optimum)" SE label under V2.
+        #                      The UNCONDITIONAL isfinite() crash-guard in
+        #                      models/_nb_gb2_filter.py is a separate
+        #                      mechanism and stays active regardless --
+        #                      this flag removes the statistical-looking
+        #                      soft cost, not numerical-overflow protection.
+        #                      Does not touch ETA_LIMIT (never observed to
+        #                      bind in practice). Experimental, default off.
+        unconstrained_state: bool = False,
+        # Joint-softmax B (2026-09-02, requires bound_ab=True): see
+        # models/gas_filter.py's _ParamCodec docstring and CovZAGASModel's
+        # constructor -- identical semantics here.
+        bound_b_joint: bool = False,
+        b_total_max: float = 0.98,
+        # Tanh-rescale B (2026-09-02, alternative to bound_b_joint): see
+        # models/gas_filter.py's _ParamCodec docstring and CovZAGASModel's
+        # constructor -- identical semantics here.
+        bound_b_tanh_sum: bool = False,
+        b_sum_max: float = 1.0,
+        # Static box (2026-09-02, mutually exclusive with free_zeta_gamma):
+        # see models/gas_filter.py's _ParamCodec docstring and
+        # CovZAGASModel's constructor -- identical semantics here.
+        bound_static_box: bool = False,
+        static_box: Tuple[float, float] = (-2.0, 15.0),
     ):
         self.dist = distribution
         self.pi_dyn = pi_dynamics
         self.seasonal = seasonal
+        self.bound_rho = bound_rho
+        self.rho_max = rho_max
+        self.rho_signed = rho_signed
+        self.unconstrained_penalties = unconstrained_penalties
+        self.unconstrained_state = unconstrained_state
 
         # Build the GAS filter — gas_lags and scaling are explicit per MODELS.md §10
         self.gas = GASFilter(
@@ -115,6 +190,11 @@ class ZAGASModel:
             scaling=scaling,
             scale_score=scale_score,
             static_params=static_params,
+            bound_ab=bound_ab, a_max=a_max, b_max=b_max, ab_signed=ab_signed,
+            bound_b_joint=bound_b_joint, b_total_max=b_total_max,
+            bound_b_tanh_sum=bound_b_tanh_sum, b_sum_max=b_sum_max,
+            free_zeta_gamma=free_zeta_gamma, kurtosis_margin=kurtosis_margin,
+            bound_static_box=bound_static_box, static_box=static_box,
         )
 
         self.lags    = self.gas.lags
@@ -137,8 +217,22 @@ class ZAGASModel:
         return theta[:n_gas], theta[n_gas:]
 
     def _decode_pi(self, pi_theta: np.ndarray) -> dict:
-        """Return dict mapping pi parameter names → values."""
-        return {name: float(pi_theta[i]) for i, name in enumerate(self._pi_names)}
+        """
+        Return dict mapping pi parameter names → values.
+
+        When bound_rho is set, "rho" is decoded through
+        rho_max * sigmoid(raw) (or, when rho_signed too, the SIGNED
+        rho_max * (2*sigmoid(raw)-1), matching the original |rho| penalty's
+        true symmetric domain) instead of being read raw -- see the
+        constructor docstring's bound_ab/bound_rho/rho_signed note.
+        """
+        out = {name: float(pi_theta[i]) for i, name in enumerate(self._pi_names)}
+        if self.bound_rho and "rho" in out:
+            if self.rho_signed:
+                out["rho"] = self.rho_max * (2.0 * _sigmoid_scalar(out["rho"]) - 1.0)
+            else:
+                out["rho"] = self.rho_max * _sigmoid_scalar(out["rho"])
+        return out
 
     def parameter_names(self) -> List[str]:
         """Flat theta parameter names in optimizer order."""
@@ -225,13 +319,14 @@ class ZAGASModel:
         scaling_i  = self._SCALING_INT.get(self.gas.scaling, 0)
 
         lags_gas   = np.array(list(L), dtype=np.int64)
-        pi_lags_py = SEASONAL_LAGS[self.seasonal]
+        pi_lags_py = list(getattr(self.pi_dyn, "lags", None) or SEASONAL_LAGS[self.seasonal])
         lags_pi    = np.array(pi_lags_py, dtype=np.int64)
         pi_wy      = np.array([pi_params[f"omega_y_{l}"] for l in pi_lags_py])
         pi_omega0  = float(pi_params["omega0"])
-        pi_rho     = float(pi_params["rho"])
+        pi_rho     = float(pi_params.get("rho", 0.0))
+        pi_link    = 1 if getattr(self.pi_dyn, "link", "logistic") == "reciprocal" else 0
 
-        LAM_STATE   = 1e3
+        LAM_STATE   = 0.0 if self.unconstrained_state else 1e3
         LAM_ETA     = 1e2
         STATE_LIMIT = 15.0
         ETA_LIMIT   = 30.0
@@ -253,7 +348,7 @@ class ZAGASModel:
                 lags_gas=lags_gas,
                 xi_s=xi_s, gamma_s=gamma_s, zeta_s=zeta_s,
                 pi_omega0=pi_omega0, pi_rho=pi_rho,
-                pi_wy=pi_wy, lags_pi=lags_pi,
+                pi_wy=pi_wy, lags_pi=lags_pi, pi_link=pi_link,
                 max_lag=eff, scaling=scaling_i,
                 lam_state=LAM_STATE, state_lim=STATE_LIMIT,
                 lam_eta=LAM_ETA,    eta_lim=ETA_LIMIT,
@@ -304,7 +399,7 @@ class ZAGASModel:
                 lags_gas=lags_gas,
                 gamma_s=gamma_s, zeta_s=zeta_s,
                 pi_omega0=pi_omega0, pi_rho=pi_rho,
-                pi_wy=pi_wy, lags_pi=lags_pi,
+                pi_wy=pi_wy, lags_pi=lags_pi, pi_link=pi_link,
                 max_lag=eff, scaling=scaling_i,
                 lam_state=LAM_STATE, state_lim=STATE_LIMIT,
                 lam_eta=LAM_ETA,    eta_lim=ETA_LIMIT,
@@ -398,7 +493,7 @@ class ZAGASModel:
 
         LAM_PERSIST = 1e5
         LAM_SCORE = 1e3
-        LAM_STATE = 1e3
+        LAM_STATE = 0.0 if self.unconstrained_state else 1e3
         LAM_ETA = 1e2
         LAM_STATIC = 1e5
 
@@ -414,44 +509,69 @@ class ZAGASModel:
         gamma_v = gp.get("gamma")
         zeta_v  = gp.get("zeta")
 
-        if gamma_v is not None and zeta_v is not None:
+        # When free_zeta_gamma is set, gp["zeta"] was already decoded as
+        # gamma + log(kurtosis_margin) + exp(delta) (models/gas_filter.py's
+        # _ParamCodec.decode()) -- exp(zeta) > kurtosis_margin*exp(gamma)
+        # holds for EVERY real delta by construction, so this check and the
+        # soft push-away penalty below it would never fire anyway; skipped
+        # explicitly so that is clear from reading the code, not implicit.
+        if not self.gas.codec.free_zeta_gamma and gamma_v is not None and zeta_v is not None:
             # Moment condition: E[Y] < ∞ requires b·p > 1, i.e. exp(zeta-gamma) > 1,
             # i.e. zeta > gamma.  When violated the GB2 has an infinite mean and
-            # the log-likelihood is undefined.  Return a hard barrier.
+            # the log-likelihood is undefined.  Return a hard barrier -- a bare
+            # NUMERICAL-VALIDITY guard (same class as the isfinite() checks in
+            # models/_nb_gb2_filter.py), kept regardless of
+            # unconstrained_penalties/bound_static_box.
             if gamma_v >= zeta_v:
                 return (1e12 + penalty) if not return_paths else {}
 
-            # Soft push away from the boundary: penalize log(b·p) < 0.5
+            # Soft push away from the boundary: penalize log(b·p) < 0.5.
+            # Unlike the hard barrier above, this IS a genuine statistical
+            # restriction (not bare validity) -- dropped under
+            # unconstrained_penalties, matching the |static|<20 guard below.
             bp_log = zeta_v - gamma_v
-            if bp_log < 0.5:
+            if bp_log < 0.5 and not self.unconstrained_penalties:
                 penalty += LAM_STATIC * (0.5 - bp_log) ** 2
 
-        # Prevent absurd static values under unconstrained BFGS
-        for s in self.gas.static_names:
-            val = gp[s]
-            excess = max(0.0, abs(val) - 20.0)
-            penalty += LAM_STATIC * excess**2
+        # Prevent absurd static values under unconstrained BFGS -- an
+        # auxiliary numerical guard, not a real domain constraint, so it is
+        # dropped entirely under unconstrained_penalties.
+        if not self.unconstrained_penalties:
+            for s in self.gas.static_names:
+                val = gp[s]
+                excess = max(0.0, abs(val) - 20.0)
+                penalty += LAM_STATIC * excess**2
 
         # -----------------------------
         # GAS persistence penalties
+        #
+        # Skipped when self.gas.codec.bound_ab is set: A_{j,l}/B_{j,l} are
+        # then already individually bounded by construction (per-lag
+        # sigmoid, see _ParamCodec), a deliberately looser alternative to
+        # this joint sum-of-|coefficients| penalty -- applying both would
+        # defeat the point of the looser reparameterisation. See
+        # reports/seasonality GAS/gradient_and_convergence_diagnosis.md §8.
         # -----------------------------
-        for name in self.gas.tv_names:
-            b_vals = np.array([gp[f"B_{name}_{l}"] for l in L])
-            b_sum = np.sum(np.abs(b_vals))
-            excess_b = max(0.0, b_sum - B_LIMIT)
-            penalty += LAM_PERSIST * excess_b**2
+        if not self.gas.codec.bound_ab:
+            for name in self.gas.tv_names:
+                b_vals = np.array([gp[f"B_{name}_{l}"] for l in L])
+                b_sum = np.sum(np.abs(b_vals))
+                excess_b = max(0.0, b_sum - B_LIMIT)
+                penalty += LAM_PERSIST * excess_b**2
 
-            a_vals = np.array([gp[f"A_{name}_{l}"] for l in L])
-            a_sum = np.sum(np.abs(a_vals))
-            excess_a = max(0.0, a_sum - A_LIMIT)
-            penalty += LAM_SCORE * excess_a**2
+                a_vals = np.array([gp[f"A_{name}_{l}"] for l in L])
+                a_sum = np.sum(np.abs(a_vals))
+                excess_a = max(0.0, a_sum - A_LIMIT)
+                penalty += LAM_SCORE * excess_a**2
 
         # -----------------------------
-        # Pi persistence penalty
+        # Pi persistence penalty (skipped when bound_rho: rho is then
+        # already bounded by construction via _decode_pi's sigmoid)
         # -----------------------------
-        rho = pi_params.get("rho", 0.0)
-        excess_rho = max(0.0, abs(rho) - RHO_LIMIT)
-        penalty += LAM_PERSIST * excess_rho**2
+        if not self.bound_rho:
+            rho = pi_params.get("rho", 0.0)
+            excess_rho = max(0.0, abs(rho) - RHO_LIMIT)
+            penalty += LAM_PERSIST * excess_rho**2
 
         # ---- Compiled fast path ------------------------------------------------
         # For GB2 + ARLogistic pi dynamics the numba filter handles the loop
@@ -505,14 +625,21 @@ class ZAGASModel:
             eta_eff[i]  = eta_t
             eta_arr[t]  = eta_t
 
+            # Numerical-safety guard (see models/harvey_gas.py's identical
+            # fix, 2026-09-11): a transient rho excursion during a BFGS
+            # line-search probe can make the AR-in-eta recursion compound
+            # geometrically over thousands of steps to a magnitude where
+            # squaring it below overflows a Python float instead of merely
+            # returning a large-but-finite penalty.
+            if not np.isfinite(eta_t) or abs(eta_t) > 1e100:
+                return (1e12 + penalty) if not return_paths else {}
             eta_excess = max(0.0, abs(eta_t) - ETA_LIMIT)
             penalty += LAM_ETA * eta_excess**2
 
-            pi_arr[t] = float(expit(eta_t))
+            pi_arr[t] = float(self.pi_dyn.pi_from_eta(eta_t))
 
-            # Stable log probabilities; no clipping needed
-            log_pi_t = log_expit(eta_arr[t])
-            log_one_minus_pi_t = log_expit(-eta_arr[t])
+            # Stable log probabilities via the pi-dynamics' own link
+            log_pi_t, log_one_minus_pi_t = self.pi_dyn.log_pi_terms(eta_arr[t])
 
             # Likelihood
             if y[t] == 0:
@@ -640,6 +767,13 @@ class ZAGASModel:
         """Combined starting vector [gas_theta | pi_theta]."""
         gas_theta = self.gas.initial_theta(y)
         pi_theta = self.pi_dyn.initial_params(y, self.seasonal)
+        if self.bound_rho and "rho" in self._pi_names:
+            # See CovZAGASModel.initial_theta's identical note: convert
+            # pi_dyn's natural-scale rho target to the raw pre-sigmoid value.
+            i = self._pi_names.index("rho")
+            pi_theta = pi_theta.copy()
+            target = pi_theta[i] / self.rho_max
+            pi_theta[i] = _logit_scalar((target + 1.0) / 2.0) if self.rho_signed else _logit_scalar(target)
         return np.concatenate([gas_theta, pi_theta])
 
     def default_bounds(self) -> List[Tuple[float, float]]:
@@ -835,6 +969,23 @@ class ZAGASModel:
             "se_quality":         result.get("se_quality", "unavailable"),
             "polish_improvement": float(result.get("polish_improvement", 0.0)),
             "bound_diagnostics":  result.get("bound_diagnostics", {}),
+            "bound_ab":           self.gas.codec.bound_ab,
+            "a_max":              self.gas.codec.a_max,
+            "b_max":              self.gas.codec.b_max,
+            "bound_rho":          self.bound_rho,
+            "rho_max":            self.rho_max,
+            "ab_signed":          self.gas.codec.ab_signed,
+            "rho_signed":         self.rho_signed,
+            "free_zeta_gamma":    self.gas.codec.free_zeta_gamma,
+            "kurtosis_margin":    self.gas.codec.kurtosis_margin,
+            "unconstrained_penalties": self.unconstrained_penalties,
+            "unconstrained_state": self.unconstrained_state,
+            "bound_b_joint":      self.gas.codec.bound_b_joint,
+            "b_total_max":        self.gas.codec.b_total_max,
+            "bound_b_tanh_sum":   self.gas.codec.bound_b_tanh_sum,
+            "b_sum_max":          self.gas.codec.b_sum_max,
+            "bound_static_box":   self.gas.codec.bound_static_box,
+            "static_box":         list(self.gas.codec.static_box),
         }
         (cache_dir / "metadata.json").write_text(_json.dumps(meta, indent=2))
 
@@ -895,7 +1046,7 @@ class ZAGASModel:
             )
             eta_eff[i] = eta_t
             eta_arr[t] = eta_t
-            pi_arr[t] = float(expit(eta_t))
+            pi_arr[t] = float(self.pi_dyn.pi_from_eta(eta_t))
 
             if y_full[t] > 0:
                 raw_score = self.dist.score(y_full[t], **call_params)

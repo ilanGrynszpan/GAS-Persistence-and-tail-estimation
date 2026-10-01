@@ -1,0 +1,519 @@
+=== FLAT FIT Thu Sep 10 20:00:59 HPAC 2026 ===
+[phase A / stage1] 144 tasks on 22 workers
+  [1/144] (skip) stage1 bh/phi_only/L1/unit
+  [2/144] (done) stage1 bh/phi_only/L123/unit rmse=10.342 grad=7.00
+  [3/144] (done) stage1 bh/phi_only/L1_365_366/unit rmse=10.293 grad=25.42
+  [4/144] (done) stage1 bh/phi_only/L1/diagonal_inverse_fisher rmse=10.243 grad=6.12
+  [5/144] (done) stage1 bh/phi_only/L1/inverse_fisher rmse=10.314 grad=2.90
+  [6/144] (done) stage1 bh/phi_only/L123/inverse_fisher rmse=10.654 grad=7.00
+  [7/144] (done) stage1 bh/phi_only/L123/diagonal_inverse_fisher rmse=10.342 grad=0.33
+  [8/144] (done) stage1 bh/phi_only/L1_365_366/inverse_fisher rmse=10.515 grad=25.42
+  [9/144] (done) stage1 bh/phi_xi/L1/unit rmse=10.242 grad=0.92
+  [10/144] (done) stage1 bh/phi_only/L1_365_366/diagonal_inverse_fisher rmse=10.311 grad=0.13
+  [11/144] (done) stage1 bh/phi_only/L123_365_366/unit rmse=10.335 grad=2.18
+  [12/144] (done) stage1 bh/phi_xi/L1/diagonal_inverse_fisher rmse=10.243 grad=1.03
+  [13/144] (done) stage1 bh/phi_xi/L1/inverse_fisher rmse=10.784 grad=43.24
+  [14/144] (done) stage1 bh/phi_only/L123_365_366/inverse_fisher rmse=10.675 grad=2.18
+  [15/144] (done) stage1 bh/phi_only/L123_365_366/diagonal_inverse_fisher rmse=10.381 grad=1.02
+  [16/144] (done) stage1 bh/phi_xi/L1_365_366/unit rmse=10.296 grad=55.79
+  [17/144] (done) stage1 bh/phi_xi/L123/unit rmse=10.337 grad=0.11
+  [18/144] (done) stage1 cruzeiro/phi_only/L1/unit rmse=13.843 grad=19.28
+  [19/144] (done) stage1 bh/phi_xi/L1_365_366/diagonal_inverse_fisher rmse=10.330 grad=3.78
+  [20/144] (done) stage1 bh/phi_xi/L123/inverse_fisher rmse=15.562 grad=49.53
+  [21/144] (done) stage1 cruzeiro/phi_only/L123/unit rmse=13.862 grad=43.83
+  [22/144] (done) stage1 cruzeiro/phi_only/L1/inverse_fisher rmse=13.848 grad=19.28
+  [23/144] (done) stage1 cruzeiro/phi_only/L1/diagonal_inverse_fisher rmse=13.846 grad=1.74
+  [24/144] (done) stage1 cruzeiro/phi_only/L1_365_366/unit rmse=13.985 grad=1.48
+  [25/144] (done) stage1 cruzeiro/phi_only/L123/inverse_fisher rmse=13.883 grad=43.83
+  [26/144] (done) stage1 bh/phi_xi/L123/diagonal_inverse_fisher rmse=10.334 grad=1.54
+  [27/144] (done) stage1 cruzeiro/phi_only/L1_365_366/inverse_fisher rmse=14.061 grad=1.48
+  [28/144] (done) stage1 cruzeiro/phi_only/L1_365_366/diagonal_inverse_fisher rmse=13.985 grad=1.86
+  [29/144] (done) stage1 cruzeiro/phi_only/L123/diagonal_inverse_fisher rmse=13.865 grad=0.07
+  [30/144] (done) stage1 cruzeiro/phi_only/L123_365_366/unit rmse=13.898 grad=19.46
+  [31/144] (done) stage1 bh/phi_xi/L1_365_366/inverse_fisher rmse=19.823 grad=15.76
+  [32/144] (done) stage1 cruzeiro/phi_xi/L1/diagonal_inverse_fisher rmse=13.781 grad=0.70
+  [33/144] (done) stage1 cruzeiro/phi_xi/L1/unit rmse=13.829 grad=0.15
+  [34/144] (done) stage1 bh/phi_xi/L123_365_366/diagonal_inverse_fisher rmse=10.475 grad=15.79
+  [35/144] (done) stage1 cruzeiro/phi_only/L123_365_366/diagonal_inverse_fisher rmse=13.900 grad=8.23
+  [36/144] (done) stage1 cruzeiro/phi_only/L123_365_366/inverse_fisher rmse=13.965 grad=19.46
+  [37/144] (done) stage1 darwin/phi_only/L1/unit rmse=15.168 grad=1.02
+  [38/144] (done) stage1 cruzeiro/phi_xi/L1/inverse_fisher rmse=14.256 grad=2.92
+  [39/144] (done) stage1 bh/phi_xi/L123_365_366/unit rmse=10.375 grad=14.68
+  [40/144] (done) stage1 darwin/phi_only/L1/inverse_fisher rmse=15.707 grad=1.02
+  [41/144] (done) stage1 cruzeiro/phi_xi/L123/unit rmse=13.821 grad=1.84
+  [42/144] (done) stage1 darwin/phi_only/L1/diagonal_inverse_fisher rmse=15.167 grad=0.22
+  [43/144] (done) stage1 darwin/phi_only/L123/unit rmse=15.209 grad=0.92
+  [44/144] (done) stage1 bh/phi_xi/L123_365_366/inverse_fisher rmse=nan grad=15.82
+  [45/144] (done) stage1 cruzeiro/phi_xi/L1_365_366/inverse_fisher rmse=nan grad=6.64
+  [46/144] (done) stage1 cruzeiro/phi_xi/L123/inverse_fisher rmse=nan grad=5.29
+  [47/144] (done) stage1 darwin/phi_only/L1_365_366/unit rmse=15.090 grad=0.17
+  [48/144] (done) stage1 darwin/phi_only/L123/inverse_fisher rmse=15.877 grad=0.92
+  [49/144] (done) stage1 darwin/phi_only/L123/diagonal_inverse_fisher rmse=15.239 grad=0.56
+  [50/144] (done) stage1 cruzeiro/phi_xi/L123/diagonal_inverse_fisher rmse=13.813 grad=118.81
+  [51/144] (done) stage1 cruzeiro/phi_xi/L1_365_366/diagonal_inverse_fisher rmse=14.044 grad=13.44
+  [52/144] (done) stage1 cruzeiro/phi_xi/L1_365_366/unit rmse=14.053 grad=4.70
+  [53/144] (done) stage1 darwin/phi_only/L1_365_366/inverse_fisher rmse=15.714 grad=0.17
+  [54/144] (done) stage1 darwin/phi_only/L123_365_366/unit rmse=15.321 grad=52.51
+  [55/144] (done) stage1 darwin/phi_only/L1_365_366/diagonal_inverse_fisher rmse=15.094 grad=0.16
+  [56/144] (done) stage1 darwin/phi_xi/L1/unit rmse=15.147 grad=105.49
+  [57/144] (done) stage1 darwin/phi_xi/L1/inverse_fisher rmse=nan grad=1.89
+  [58/144] (done) stage1 darwin/phi_xi/L1/diagonal_inverse_fisher rmse=15.128 grad=0.12
+  [59/144] (done) stage1 darwin/phi_only/L123_365_366/diagonal_inverse_fisher rmse=15.375 grad=0.90
+  [60/144] (done) stage1 darwin/phi_only/L123_365_366/inverse_fisher rmse=16.733 grad=52.51
+  [61/144] (done) stage1 cruzeiro/phi_xi/L123_365_366/diagonal_inverse_fisher rmse=13.913 grad=49.50
+  [62/144] (done) stage1 darwin/phi_xi/L123/unit rmse=15.070 grad=218.33
+  [63/144] (done) stage1 darwin/phi_xi/L1_365_366/unit rmse=15.114 grad=73.80
+  [64/144] (done) stage1 garanhuns/phi_only/L1/unit rmse=9.867 grad=0.34
+  [65/144] (done) stage1 darwin/phi_xi/L123/inverse_fisher rmse=nan grad=1.44
+  [66/144] (done) stage1 garanhuns/phi_only/L123/unit rmse=9.909 grad=3.49
+  [67/144] (done) stage1 garanhuns/phi_only/L1/diagonal_inverse_fisher rmse=9.868 grad=0.10
+  [68/144] (done) stage1 cruzeiro/phi_xi/L123_365_366/unit rmse=13.915 grad=72.98
+  [69/144] (done) stage1 garanhuns/phi_only/L1_365_366/unit rmse=9.939 grad=0.32
+  [70/144] (done) stage1 garanhuns/phi_only/L1/inverse_fisher rmse=10.276 grad=0.34
+  [71/144] (done) stage1 darwin/phi_xi/L1_365_366/diagonal_inverse_fisher rmse=15.147 grad=11.22
+  [72/144] (done) stage1 garanhuns/phi_only/L123/diagonal_inverse_fisher rmse=9.904 grad=1.65
+  [73/144] (done) stage1 garanhuns/phi_only/L123/inverse_fisher rmse=10.348 grad=3.49
+  [74/144] (done) stage1 garanhuns/phi_only/L1_365_366/diagonal_inverse_fisher rmse=9.939 grad=0.20
+  [75/144] (done) stage1 darwin/phi_xi/L123/diagonal_inverse_fisher rmse=15.159 grad=0.39
+  [76/144] (done) stage1 garanhuns/phi_only/L1_365_366/inverse_fisher rmse=10.064 grad=0.32
+  [77/144] (done) stage1 garanhuns/phi_only/L123_365_366/unit rmse=9.918 grad=82.22
+  [78/144] (done) stage1 cruzeiro/phi_xi/L123_365_366/inverse_fisher rmse=nan grad=16.30
+  [79/144] (done) stage1 darwin/phi_xi/L1_365_366/inverse_fisher rmse=nan grad=5.89
+  [80/144] (done) stage1 garanhuns/phi_xi/L1/inverse_fisher rmse=nan grad=0.08
+  [81/144] (done) stage1 garanhuns/phi_xi/L1/unit rmse=9.874 grad=1.00
+  [82/144] (done) stage1 garanhuns/phi_only/L123_365_366/diagonal_inverse_fisher rmse=9.919 grad=20.29
+  [83/144] (done) stage1 garanhuns/phi_only/L123_365_366/inverse_fisher rmse=10.311 grad=82.22
+  [84/144] (done) stage1 manaus/phi_only/L1/unit rmse=17.574 grad=1.07
+  [85/144] (done) stage1 darwin/phi_xi/L123_365_366/diagonal_inverse_fisher rmse=15.389 grad=87.94
+  [86/144] (done) stage1 garanhuns/phi_xi/L123/inverse_fisher rmse=nan grad=686.72
+  [87/144] (done) stage1 garanhuns/phi_xi/L1/diagonal_inverse_fisher rmse=9.950 grad=0.19
+  [88/144] (done) stage1 garanhuns/phi_xi/L1_365_366/inverse_fisher rmse=nan grad=0.50
+  [89/144] (done) stage1 manaus/phi_only/L1/diagonal_inverse_fisher rmse=17.574 grad=1.14
+  [90/144] (done) stage1 manaus/phi_only/L1/inverse_fisher rmse=17.622 grad=1.07
+  [91/144] (done) stage1 manaus/phi_only/L123/unit rmse=17.557 grad=9.80
+  [92/144] (done) stage1 garanhuns/phi_xi/L123/diagonal_inverse_fisher rmse=9.883 grad=26.55
+  [93/144] (done) stage1 manaus/phi_only/L1_365_366/unit rmse=17.543 grad=37.44
+  [94/144] (done) stage1 darwin/phi_xi/L123_365_366/unit rmse=15.576 grad=14.87
+  [95/144] (done) stage1 garanhuns/phi_xi/L123/unit rmse=9.876 grad=281.58
+  [96/144] (done) stage1 manaus/phi_only/L123/diagonal_inverse_fisher rmse=17.557 grad=55.36
+  [97/144] (done) stage1 garanhuns/phi_xi/L1_365_366/unit rmse=9.918 grad=1.86
+  [98/144] (done) stage1 manaus/phi_only/L1_365_366/diagonal_inverse_fisher rmse=17.556 grad=125.70
+  [99/144] (done) stage1 garanhuns/phi_xi/L123_365_366/inverse_fisher rmse=nan grad=13.66
+  [100/144] (done) stage1 manaus/phi_only/L1_365_366/inverse_fisher rmse=17.548 grad=37.44
+  [101/144] (done) stage1 manaus/phi_only/L123/inverse_fisher rmse=17.638 grad=9.80
+  [102/144] (done) stage1 darwin/phi_xi/L123_365_366/inverse_fisher rmse=nan grad=4.84
+  [103/144] (done) stage1 garanhuns/phi_xi/L1_365_366/diagonal_inverse_fisher rmse=9.968 grad=6.40
+  [104/144] (done) stage1 garanhuns/phi_xi/L123_365_366/unit rmse=9.882 grad=23.01
+  [105/144] (done) stage1 manaus/phi_xi/L1/unit rmse=17.529 grad=143.09
+  [106/144] (done) stage1 manaus/phi_only/L123_365_366/unit rmse=17.566 grad=3.19
+  [107/144] (done) stage1 manaus/phi_only/L123_365_366/inverse_fisher rmse=17.665 grad=3.19
+  [108/144] (done) stage1 manaus/phi_xi/L1/diagonal_inverse_fisher rmse=17.537 grad=33.90
+  [109/144] (done) stage1 salvador/phi_only/L1/unit rmse=12.789 grad=0.98
+  [110/144] (done) stage1 manaus/phi_only/L123_365_366/diagonal_inverse_fisher rmse=17.565 grad=5.95
+  [111/144] (done) stage1 manaus/phi_xi/L1/inverse_fisher rmse=17.981 grad=28.52
+  [112/144] (done) stage1 salvador/phi_only/L123/unit rmse=12.701 grad=17.05
+  [113/144] (done) stage1 salvador/phi_only/L1/diagonal_inverse_fisher rmse=12.789 grad=0.41
+  [114/144] (done) stage1 salvador/phi_only/L1/inverse_fisher rmse=13.226 grad=0.98
+  [115/144] (done) stage1 salvador/phi_only/L1_365_366/unit rmse=12.728 grad=0.35
+  [116/144] (done) stage1 manaus/phi_xi/L1_365_366/unit rmse=17.505 grad=7.16
+  [117/144] (done) stage1 manaus/phi_xi/L123/unit rmse=17.552 grad=0.23
+  [118/144] (done) stage1 manaus/phi_xi/L123/inverse_fisher rmse=nan grad=7.33
+  [119/144] (done) stage1 salvador/phi_only/L123/diagonal_inverse_fisher rmse=12.701 grad=0.54
+  [120/144] (done) stage1 manaus/phi_xi/L1_365_366/diagonal_inverse_fisher rmse=17.503 grad=21.21
+  [121/144] (done) stage1 salvador/phi_only/L123/inverse_fisher rmse=14.080 grad=17.05
+  [122/144] (done) stage1 salvador/phi_only/L1_365_366/diagonal_inverse_fisher rmse=12.728 grad=0.35
+  [123/144] (done) stage1 manaus/phi_xi/L123/diagonal_inverse_fisher rmse=17.554 grad=1.64
+  [124/144] (done) stage1 salvador/phi_only/L1_365_366/inverse_fisher rmse=14.373 grad=0.35
+  [125/144] (done) stage1 manaus/phi_xi/L1_365_366/inverse_fisher rmse=17.676 grad=0.18
+  [126/144] (done) stage1 salvador/phi_only/L123_365_366/unit rmse=12.807 grad=0.59
+  [127/144] (done) stage1 salvador/phi_only/L123_365_366/diagonal_inverse_fisher rmse=12.807 grad=0.86
+  [128/144] (done) stage1 salvador/phi_xi/L1/inverse_fisher rmse=nan grad=0.50
+  [129/144] (done) stage1 salvador/phi_xi/L1/unit rmse=12.715 grad=0.72
+  [130/144] (done) stage1 manaus/phi_xi/L123_365_366/unit rmse=17.642 grad=28260.37
+  [131/144] (done) stage1 salvador/phi_only/L123_365_366/inverse_fisher rmse=17.212 grad=0.59
+  [132/144] (done) stage1 salvador/phi_xi/L1/diagonal_inverse_fisher rmse=12.719 grad=0.36
+  [133/144] (done) stage1 garanhuns/phi_xi/L123_365_366/diagonal_inverse_fisher rmse=9.952 grad=0.84
+  [134/144] (done) stage1 salvador/phi_xi/L1_365_366/unit rmse=12.833 grad=0.39
+  [135/144] (done) stage1 manaus/phi_xi/L123_365_366/diagonal_inverse_fisher rmse=17.651 grad=21683.80
+  [136/144] (done) stage1 manaus/phi_xi/L123_365_366/inverse_fisher rmse=nan grad=19.75
+  [137/144] (done) stage1 salvador/phi_xi/L123/unit rmse=12.738 grad=1.47
+  [138/144] (done) stage1 salvador/phi_xi/L1_365_366/inverse_fisher rmse=nan grad=17.69
+  [139/144] (done) stage1 salvador/phi_xi/L123/inverse_fisher rmse=nan grad=26.23
+  [140/144] (done) stage1 salvador/phi_xi/L1_365_366/diagonal_inverse_fisher rmse=12.769 grad=2.30
+  [141/144] (done) stage1 salvador/phi_xi/L123/diagonal_inverse_fisher rmse=12.718 grad=25.65
+  [142/144] (done) stage1 salvador/phi_xi/L123_365_366/inverse_fisher rmse=nan grad=211.79
+  [143/144] (done) stage1 salvador/phi_xi/L123_365_366/unit rmse=12.824 grad=22.04
+  [144/144] (done) stage1 salvador/phi_xi/L123_365_366/diagonal_inverse_fisher rmse=12.861 grad=73.25
+[phase A / stage1] done in 238s  {'done': 143, 'skip': 1, 'err': 0}
+  scaling picked: bh phi_only=unit phi_xi=diagonal_inverse_fisher
+  scaling picked: cruzeiro phi_only=unit phi_xi=inverse_fisher
+  scaling picked: darwin phi_only=diagonal_inverse_fisher phi_xi=unit
+  scaling picked: garanhuns phi_only=diagonal_inverse_fisher phi_xi=diagonal_inverse_fisher
+  scaling picked: manaus phi_only=unit phi_xi=inverse_fisher
+  scaling picked: salvador phi_only=diagonal_inverse_fisher phi_xi=diagonal_inverse_fisher
+[phase B / stage2+harvey] 324 tasks on 22 workers
+  [1/324] (done) stage2 bh/phi_only/L1/dew rmse=10.859
+  [2/324] (done) stage2 bh/phi_only/L1_365_366/dew rmse=10.512
+  [3/324] (done) stage2 bh/phi_only/L1_365_366/dew_temp rmse=10.603
+  [4/324] (done) stage2 bh/phi_only/L1/dew_temp_enso rmse=10.795
+  [5/324] (done) stage2 bh/phi_only/L1/dew_temp rmse=10.871
+  [6/324] (done) stage2 bh/phi_only/L1_365_366/dew_temp_enso rmse=10.491
+  [7/324] (done) stage2 bh/phi_only/L123/dew rmse=10.904
+  [8/324] (done) stage2 bh/phi_only/L123_365_366/dew_temp rmse=10.591
+  [9/324] (done) stage2 bh/phi_only/L123/dew_temp_enso rmse=10.843
+  [10/324] (done) stage2 bh/phi_only/L123_365_366/dew_temp_enso rmse=10.487
+  [11/324] (done) stage2 bh/phi_only/L123_365_366/dew rmse=10.540
+  [12/324] (done) stage2 bh/phi_only/L123/dew_temp rmse=10.893
+  [13/324] (done) stage2 cruzeiro/phi_only/L1/dew rmse=13.925
+  [14/324] (done) stage2 bh/phi_xi/L1/dew_temp rmse=10.836
+  [15/324] (done) stage2 bh/phi_xi/L1/dew_temp_enso rmse=10.773
+  [16/324] (done) stage2 cruzeiro/phi_only/L1/dew_temp rmse=13.922
+  [17/324] (done) stage2 cruzeiro/phi_only/L1/dew_temp_enso rmse=13.996
+  [18/324] (done) stage2 cruzeiro/phi_only/L1_365_366/dew rmse=14.118
+  [19/324] (done) stage2 bh/phi_xi/L1/dew rmse=10.852
+  [20/324] (done) stage2 cruzeiro/phi_only/L123/dew_temp_enso rmse=14.015
+  [21/324] (done) stage2 cruzeiro/phi_only/L123/dew rmse=13.954
+  [22/324] (done) stage2 cruzeiro/phi_only/L123/dew_temp rmse=13.950
+  [23/324] (done) stage2 cruzeiro/phi_only/L1_365_366/dew_temp rmse=14.131
+  [24/324] (done) stage2 bh/phi_xi/L1_365_366/dew rmse=10.703
+  [25/324] (done) stage2 cruzeiro/phi_only/L1_365_366/dew_temp_enso rmse=14.171
+  [26/324] (done) stage2 bh/phi_xi/L123/dew_temp rmse=10.911
+  [27/324] (done) stage2 bh/phi_xi/L123/dew rmse=10.911
+  [28/324] (done) stage2 cruzeiro/phi_only/L123_365_366/dew rmse=14.037
+  [29/324] (done) stage2 cruzeiro/phi_only/L123_365_366/dew_temp rmse=14.030
+  [30/324] (done) stage2 bh/phi_xi/L1_365_366/dew_temp rmse=10.562
+  [31/324] (done) stage2 cruzeiro/phi_only/L123_365_366/dew_temp_enso rmse=14.169
+  [32/324] (done) stage2 bh/phi_xi/L123_365_366/dew_temp rmse=10.792
+  [33/324] (done) stage2 bh/phi_xi/L1_365_366/dew_temp_enso rmse=10.526
+  [34/324] (done) stage2 cruzeiro/phi_xi/L1/dew rmse=14.238
+  [35/324] (done) stage2 darwin/phi_only/L1/dew rmse=15.179
+  [36/324] (done) stage2 cruzeiro/phi_xi/L1/dew_temp_enso rmse=14.008
+  [37/324] (done) stage2 cruzeiro/phi_xi/L1/dew_temp rmse=14.213
+  [38/324] (done) stage2 darwin/phi_only/L1/dew_temp rmse=15.098
+  [39/324] (done) stage2 bh/phi_xi/L123/dew_temp_enso rmse=10.917
+  [40/324] (done) stage2 cruzeiro/phi_xi/L123/dew rmse=nan
+  [41/324] (done) stage2 darwin/phi_only/L123/dew rmse=15.737
+  [42/324] (done) stage2 darwin/phi_only/L1/dew_temp_enso rmse=15.066
+  [43/324] (done) stage2 cruzeiro/phi_xi/L123/dew_temp rmse=nan
+  [44/324] (done) stage2 darwin/phi_only/L1_365_366/dew rmse=15.162
+  [45/324] (done) stage2 darwin/phi_xi/L1/dew rmse=15.208
+  [46/324] (done) stage2 darwin/phi_only/L1_365_366/dew_temp rmse=15.153
+  [47/324] (done) stage2 darwin/phi_only/L1_365_366/dew_temp_enso rmse=15.134
+  [48/324] (done) stage2 darwin/phi_only/L123/dew_temp rmse=15.666
+  [49/324] (done) stage2 bh/phi_xi/L123_365_366/dew rmse=10.812
+  [50/324] (done) stage2 darwin/phi_xi/L1/dew_temp rmse=15.183
+  [51/324] (done) stage2 darwin/phi_only/L123_365_366/dew_temp_enso rmse=15.342
+  [52/324] (done) stage2 darwin/phi_only/L123/dew_temp_enso rmse=15.661
+  [53/324] (done) stage2 cruzeiro/phi_xi/L1_365_366/dew_temp_enso rmse=nan
+  [54/324] (done) stage2 darwin/phi_only/L123_365_366/dew_temp rmse=15.327
+  [55/324] (done) stage2 darwin/phi_xi/L1/dew_temp_enso rmse=15.201
+  [56/324] (done) stage2 cruzeiro/phi_xi/L1_365_366/dew rmse=14.945
+  [57/324] (done) stage2 cruzeiro/phi_xi/L123/dew_temp_enso rmse=nan
+  [58/324] (done) stage2 darwin/phi_only/L123_365_366/dew rmse=15.391
+  [59/324] (done) stage2 bh/phi_xi/L123_365_366/dew_temp_enso rmse=10.711
+  [60/324] (done) stage2 cruzeiro/phi_xi/L123_365_366/dew_temp rmse=nan
+  [61/324] (done) stage2 darwin/phi_xi/L123/dew rmse=15.683
+  [62/324] (done) stage2 cruzeiro/phi_xi/L123_365_366/dew_temp_enso rmse=nan
+  [63/324] (done) stage2 garanhuns/phi_only/L1/dew rmse=10.158
+  [64/324] (done) stage2 darwin/phi_xi/L123/dew_temp rmse=15.695
+  [65/324] (done) stage2 darwin/phi_xi/L1_365_366/dew rmse=15.151
+  [66/324] (done) stage2 garanhuns/phi_only/L123/dew rmse=10.358
+  [67/324] (done) stage2 cruzeiro/phi_xi/L123_365_366/dew rmse=nan
+  [68/324] (done) stage2 garanhuns/phi_only/L1/dew_temp rmse=10.125
+  [69/324] (done) stage2 garanhuns/phi_only/L1/dew_temp_enso rmse=10.143
+  [70/324] (done) stage2 cruzeiro/phi_xi/L1_365_366/dew_temp rmse=14.675
+  [71/324] (done) stage2 garanhuns/phi_only/L123/dew_temp rmse=10.336
+  [72/324] (done) stage2 garanhuns/phi_only/L1_365_366/dew rmse=10.036
+  [73/324] (done) stage2 garanhuns/phi_only/L1_365_366/dew_temp rmse=10.003
+  [74/324] (done) stage2 garanhuns/phi_only/L123/dew_temp_enso rmse=10.349
+  [75/324] (done) stage2 darwin/phi_xi/L1_365_366/dew_temp rmse=15.116
+  [76/324] (done) stage2 garanhuns/phi_only/L1_365_366/dew_temp_enso rmse=10.059
+  [77/324] (done) stage2 darwin/phi_xi/L123/dew_temp_enso rmse=15.694
+  [78/324] (done) stage2 garanhuns/phi_only/L123_365_366/dew rmse=9.974
+  [79/324] (done) stage2 darwin/phi_xi/L123_365_366/dew rmse=15.328
+  [80/324] (done) stage2 darwin/phi_xi/L1_365_366/dew_temp_enso rmse=15.092
+  [81/324] (done) stage2 garanhuns/phi_only/L123_365_366/dew_temp rmse=9.946
+  [82/324] (done) stage2 garanhuns/phi_only/L123_365_366/dew_temp_enso rmse=9.977
+  [83/324] (done) stage2 garanhuns/phi_xi/L1/dew rmse=10.133
+  [84/324] (done) stage2 manaus/phi_only/L1/dew rmse=17.785
+  [85/324] (done) stage2 manaus/phi_only/L1/dew_temp rmse=17.777
+  [86/324] (done) stage2 manaus/phi_only/L1/dew_temp_enso rmse=17.730
+  [87/324] (done) stage2 garanhuns/phi_xi/L1/dew_temp rmse=10.177
+  [88/324] (done) stage2 garanhuns/phi_xi/L123/dew_temp rmse=10.229
+  [89/324] (done) stage2 manaus/phi_only/L123/dew rmse=17.714
+  [90/324] (done) stage2 manaus/phi_only/L1_365_366/dew rmse=17.628
+  [91/324] (done) stage2 garanhuns/phi_xi/L123/dew rmse=10.244
+  [92/324] (done) stage2 manaus/phi_only/L123/dew_temp rmse=17.701
+  [93/324] (done) stage2 manaus/phi_only/L123/dew_temp_enso rmse=17.679
+  [94/324] (done) stage2 garanhuns/phi_xi/L1/dew_temp_enso rmse=10.191
+  [95/324] (done) stage2 garanhuns/phi_xi/L1_365_366/dew rmse=10.044
+  [96/324] (done) stage2 manaus/phi_only/L1_365_366/dew_temp rmse=17.635
+  [97/324] (done) stage2 manaus/phi_only/L1_365_366/dew_temp_enso rmse=17.511
+  [98/324] (done) stage2 garanhuns/phi_xi/L123/dew_temp_enso rmse=10.204
+  [99/324] (done) stage2 garanhuns/phi_xi/L1_365_366/dew_temp rmse=10.096
+  [100/324] (done) stage2 manaus/phi_only/L123_365_366/dew_temp rmse=17.662
+  [101/324] (done) stage2 manaus/phi_only/L123_365_366/dew_temp_enso rmse=17.551
+  [102/324] (done) stage2 manaus/phi_only/L123_365_366/dew rmse=17.665
+  [103/324] (done) stage2 manaus/phi_xi/L1/dew_temp rmse=18.120
+  [104/324] (done) stage2 garanhuns/phi_xi/L1_365_366/dew_temp_enso rmse=10.053
+  [105/324] (done) stage2 manaus/phi_xi/L1/dew rmse=18.029
+  [106/324] (done) stage2 darwin/phi_xi/L123_365_366/dew_temp_enso rmse=15.396
+  [107/324] (done) stage2 garanhuns/phi_xi/L123_365_366/dew_temp rmse=10.130
+  [108/324] (done) stage2 manaus/phi_xi/L1/dew_temp_enso rmse=18.000
+  [109/324] (done) stage2 garanhuns/phi_xi/L123_365_366/dew rmse=10.032
+  [110/324] (done) stage2 salvador/phi_only/L1/dew rmse=13.942
+  [111/324] (done) stage2 salvador/phi_only/L1/dew_temp rmse=13.940
+  [112/324] (done) stage2 manaus/phi_xi/L123/dew rmse=nan
+  [113/324] (done) stage2 salvador/phi_only/L123/dew rmse=13.714
+  [114/324] (done) stage2 salvador/phi_only/L1/dew_temp_enso rmse=13.924
+  [115/324] (done) stage2 manaus/phi_xi/L1_365_366/dew rmse=17.766
+  [116/324] (done) stage2 garanhuns/phi_xi/L123_365_366/dew_temp_enso rmse=10.203
+  [117/324] (done) stage2 manaus/phi_xi/L1_365_366/dew_temp rmse=18.183
+  [118/324] (done) stage2 salvador/phi_only/L123/dew_temp rmse=13.706
+  [119/324] (done) stage2 manaus/phi_xi/L123/dew_temp rmse=nan
+  [120/324] (done) stage2 manaus/phi_xi/L123/dew_temp_enso rmse=nan
+  [121/324] (done) stage2 salvador/phi_only/L1_365_366/dew rmse=13.494
+  [122/324] (done) stage2 salvador/phi_only/L123/dew_temp_enso rmse=13.693
+  [123/324] (done) stage2 manaus/phi_xi/L1_365_366/dew_temp_enso rmse=17.852
+  [124/324] (done) stage2 salvador/phi_only/L1_365_366/dew_temp rmse=13.482
+  [125/324] (done) stage2 salvador/phi_only/L1_365_366/dew_temp_enso rmse=13.475
+  [126/324] (done) stage2 darwin/phi_xi/L123_365_366/dew_temp rmse=15.249
+  [127/324] (done) stage2 salvador/phi_only/L123_365_366/dew_temp rmse=13.586
+  [128/324] (done) stage2 manaus/phi_xi/L123_365_366/dew_temp rmse=nan
+  [129/324] (done) stage2 salvador/phi_only/L123_365_366/dew rmse=13.521
+  [130/324] (done) stage3 bh/phi_only/none rmse=10.585 crps=3.543 grad=269903.32
+  [131/324] (done) stage2 manaus/phi_xi/L123_365_366/dew rmse=nan
+  [132/324] (done) stage2 salvador/phi_xi/L1/dew rmse=13.946
+  [133/324] (done) stage2 salvador/phi_only/L123_365_366/dew_temp_enso rmse=13.594
+  [134/324] (done) stage3 bh/phi_only/enso rmse=10.537 crps=3.517 grad=352272.03
+  [135/324] (done) stage2 salvador/phi_xi/L1/dew_temp rmse=13.984
+  [136/324] (done) stage3 bh/phi_only/dew rmse=10.667 crps=3.618 grad=757622.58
+  [137/324] (done) stage2 salvador/phi_xi/L1/dew_temp_enso rmse=13.949
+  [138/324] (done) stage3 bh/phi_only/dew_enso rmse=10.525 crps=3.523 grad=540532.46
+  [139/324] (done) stage2 manaus/phi_xi/L123_365_366/dew_temp_enso rmse=nan
+  [140/324] (done) stage3 bh/phi_only/dew_temp_enso rmse=10.363 crps=3.441 grad=62263.97
+  [141/324] (done) stage2 salvador/phi_xi/L1_365_366/dew rmse=13.501
+  [142/324] (done) stage2 salvador/phi_xi/L123/dew rmse=13.743
+  [143/324] (done) stage2 salvador/phi_xi/L123/dew_temp rmse=13.692
+  [144/324] (done) stage2 salvador/phi_xi/L1_365_366/dew_temp rmse=13.544
+  [145/324] (done) stage3 bh/phi_xi/none rmse=11.046 crps=3.684 grad=85980.62
+  [146/324] (done) stage3 bh/phi_xi/enso rmse=12.373 crps=3.858 grad=156854.53
+  [147/324] (done) stage2 salvador/phi_xi/L1_365_366/dew_temp_enso rmse=13.553
+  [148/324] (done) stage2 salvador/phi_xi/L123/dew_temp_enso rmse=13.649
+  [149/324] (done) stage3 bh/phi_xi/dew rmse=10.634 crps=3.603 grad=18207.45
+  [150/324] (done) stage2 salvador/phi_xi/L123_365_366/dew_temp_enso rmse=14.095
+  [151/324] (done) stage2 salvador/phi_xi/L123_365_366/dew_temp rmse=13.953
+  [152/324] (done) stage3 bh/phi_xi/dew_enso rmse=10.507 crps=3.499 grad=7520.75
+  [153/324] (done) stage3 bh/phi_xi/dew_temp_enso rmse=11.096 crps=3.606 grad=428973.36
+  [154/324] (done) stage2 salvador/phi_xi/L123_365_366/dew rmse=13.573
+  [155/324] (done) stage3 cruzeiro/phi_only/none rmse=13.899 crps=5.713 grad=7.27
+  [156/324] (done) stage4S bh/phi_only/none rmse=10.788 crps=3.643 grad=0.35
+  [157/324] (done) stage4S bh/phi_only/enso rmse=10.788 crps=3.643 grad=0.35
+  [158/324] (done) stage3 cruzeiro/phi_only/enso rmse=14.858 crps=6.409 grad=550118.29
+  [159/324] (done) stage4S bh/phi_only/dew_temp_enso rmse=10.344 crps=3.448 grad=3.26
+  [160/324] (done) stage4 bh/phi_only/enso rmse=10.377 crps=3.480 grad=402556.88
+  [161/324] (done) stage3 cruzeiro/phi_only/dew rmse=13.880 crps=5.704 grad=0.10
+  [162/324] (done) stage3 cruzeiro/phi_only/dew_temp_enso rmse=13.972 crps=5.756 grad=0.62
+  [163/324] (done) stage3 cruzeiro/phi_only/dew_enso rmse=13.975 crps=5.757 grad=0.12
+  [164/324] (done) stage4 bh/phi_only/dew rmse=10.347 crps=3.434 grad=2082786.51
+  [165/324] (done) stage4 bh/phi_only/dew_enso rmse=10.194 crps=3.370 grad=822023.79
+  [166/324] (done) stage4 bh/phi_only/none rmse=10.767 crps=3.495 grad=255090.17
+  [167/324] (done) stage4 bh/phi_only/dew_temp_enso rmse=10.233 crps=3.409 grad=302221.35
+  [168/324] (done) stage4 cruzeiro/phi_only/none rmse=37.578 crps=7.490 grad=2011735.70
+  [169/324] (done) stage4 cruzeiro/phi_only/enso rmse=29.002 crps=6.518 grad=336826.10
+  [170/324] (done) stage3 cruzeiro/phi_xi/none rmse=nan crps=nan grad=337304.36
+  [171/324] (done) stage4 cruzeiro/phi_only/dew rmse=14.470 crps=6.096 grad=97313.33
+  [172/324] (done) stage4S cruzeiro/phi_only/dew_temp_enso rmse=13.997 crps=5.760 grad=20.89
+  [173/324] (done) stage4S bh/phi_only/dew rmse=10.338 crps=3.449 grad=0.07
+  [174/324] (done) stage4 cruzeiro/phi_only/dew_temp_enso rmse=4029286416679026688.000 crps=25534200990660316.000 grad=14816896.15
+  [175/324] (done) stage4S cruzeiro/phi_only/none rmse=13.977 crps=5.750 grad=0.10
+  [176/324] (done) stage4S cruzeiro/phi_only/enso rmse=13.977 crps=5.750 grad=0.10
+  [177/324] (done) stage3 cruzeiro/phi_xi/enso rmse=nan crps=nan grad=4.37
+  [178/324] (done) stage3 cruzeiro/phi_xi/dew rmse=nan crps=nan grad=233249.92
+  [179/324] (done) stage4S bh/phi_only/dew_enso rmse=10.338 crps=3.449 grad=0.07
+  [180/324] (done) stage4S cruzeiro/phi_only/dew rmse=13.989 crps=5.757 grad=0.57
+  [181/324] (done) stage4S cruzeiro/phi_only/dew_enso rmse=13.989 crps=5.757 grad=0.57
+  [182/324] (done) stage4 cruzeiro/phi_only/dew_enso rmse=14.239 crps=5.891 grad=114776.05
+  [183/324] (done) stage3 cruzeiro/phi_xi/dew_enso rmse=nan crps=nan grad=343673.46
+  [184/324] (done) stage3 cruzeiro/phi_xi/dew_temp_enso rmse=nan crps=nan grad=206159.69
+  [185/324] (done) stage4S cruzeiro/phi_xi/none rmse=16.968 crps=6.501 grad=102045.23
+  [186/324] (done) stage4S cruzeiro/phi_xi/enso rmse=16.968 crps=6.501 grad=102045.23
+  [187/324] (done) stage3 darwin/phi_only/none rmse=15.800 crps=5.009 grad=32402.39
+  [188/324] (done) stage3 darwin/phi_only/enso rmse=15.288 crps=4.811 grad=574461.86
+  [189/324] (done) stage3 darwin/phi_only/dew rmse=15.189 crps=4.776 grad=43069.65
+  [190/324] (done) stage4S cruzeiro/phi_xi/dew rmse=18.989 crps=6.659 grad=84147.02
+  [191/324] (done) stage4 cruzeiro/phi_xi/enso rmse=21.957 crps=6.503 grad=56757.57
+  [192/324] (done) stage4 cruzeiro/phi_xi/dew_enso rmse=21.967 crps=6.503 grad=56744.61
+  [193/324] (done) stage4S cruzeiro/phi_xi/dew_enso rmse=18.989 crps=6.659 grad=84147.02
+  [194/324] (done) stage4 cruzeiro/phi_xi/dew_temp_enso rmse=22.028 crps=6.502 grad=56685.29
+  [195/324] (done) stage3 darwin/phi_only/dew_temp_enso rmse=64.529 crps=6.593 grad=192942.60
+  [196/324] (done) stage3 darwin/phi_only/dew_enso rmse=15.265 crps=4.767 grad=0.26
+  [197/324] (done) stage4 cruzeiro/phi_xi/dew rmse=19.027 crps=6.486 grad=65258.41
+  [198/324] (done) stage4S cruzeiro/phi_xi/dew_temp_enso rmse=17.030 crps=6.486 grad=101742.91
+  [199/324] (done) stage4 darwin/phi_only/enso rmse=15.356 crps=4.724 grad=1179.66
+  [200/324] (done) stage3 darwin/phi_xi/none rmse=16.123 crps=5.212 grad=13296.49
+  [201/324] (done) stage4 cruzeiro/phi_xi/none rmse=265.744 crps=7.569 grad=18677.81
+  [202/324] (done) stage3 darwin/phi_xi/enso rmse=15.929 crps=5.131 grad=192577.27
+  [203/324] (done) stage3 darwin/phi_xi/dew rmse=15.496 crps=4.860 grad=10612.75
+  [204/324] (done) stage3 darwin/phi_xi/dew_temp_enso rmse=15.388 crps=4.810 grad=117099.60
+  [205/324] (done) stage4 darwin/phi_only/dew_temp_enso rmse=15.772 crps=5.025 grad=4254860.98
+  [206/324] (done) stage4 darwin/phi_only/none rmse=273028910.428 crps=10556277.925 grad=115855.09
+  [207/324] (done) stage3 darwin/phi_xi/dew_enso rmse=15.390 crps=4.865 grad=281697.96
+  [208/324] (done) stage4 darwin/phi_only/dew_enso rmse=15.129 crps=4.749 grad=301900.26
+  [209/324] (done) stage4 darwin/phi_only/dew rmse=2407418003402915840.000 crps=77137367750434896.000 grad=28861.43
+  [210/324] (done) stage4S darwin/phi_xi/none rmse=nan crps=nan grad=53108.52
+  [211/324] (done) stage4S darwin/phi_xi/enso rmse=nan crps=nan grad=53108.52
+  [212/324] (done) stage4S darwin/phi_only/none rmse=15.480 crps=4.929 grad=0.15
+  [213/324] (done) stage4S darwin/phi_only/enso rmse=15.480 crps=4.929 grad=0.15
+  [214/324] (done) stage4S darwin/phi_only/dew rmse=15.135 crps=4.734 grad=2.42
+  [215/324] (done) stage4S darwin/phi_only/dew_enso rmse=15.135 crps=4.734 grad=2.42
+  [216/324] (done) stage4 darwin/phi_xi/enso rmse=15.808 crps=5.112 grad=34541.80
+  [217/324] (done) stage4S darwin/phi_only/dew_temp_enso rmse=15.356 crps=4.819 grad=52.44
+  [218/324] (done) stage3 garanhuns/phi_only/none rmse=9.998 crps=3.175 grad=0.06
+  [219/324] (done) stage3 garanhuns/phi_only/enso rmse=10.024 crps=3.185 grad=0.15
+  [220/324] (done) stage3 garanhuns/phi_only/dew rmse=10.002 crps=3.186 grad=0.05
+  [221/324] (done) stage3 garanhuns/phi_only/dew_enso rmse=10.011 crps=3.187 grad=0.05
+  [222/324] (done) stage3 garanhuns/phi_only/dew_temp_enso rmse=10.017 crps=3.190 grad=0.04
+  [223/324] (done) stage4 garanhuns/phi_only/dew rmse=10.012 crps=3.166 grad=2355.28
+  [224/324] (done) stage4 garanhuns/phi_only/enso rmse=10.001 crps=3.169 grad=991088.62
+  [225/324] (done) stage4S darwin/phi_xi/dew_temp_enso rmse=nan crps=nan grad=54518.23
+  [226/324] (done) stage4 garanhuns/phi_only/dew_temp_enso rmse=10.085 crps=3.204 grad=254356.61
+  [227/324] (done) stage4 garanhuns/phi_only/dew_enso rmse=9.958 crps=3.170 grad=417299.82
+  [228/324] (done) stage4 garanhuns/phi_only/none rmse=9.981 crps=3.167 grad=3.04
+  [229/324] (done) stage4 bh/phi_xi/dew_temp_enso rmse=10.270 crps=3.428 grad=401278.16
+  [230/324] (done) stage4 bh/phi_xi/dew rmse=10.644 crps=3.566 grad=76591.26
+  [231/324] (done) stage4S garanhuns/phi_only/none rmse=10.019 crps=3.175 grad=0.90
+  [232/324] (done) stage4 bh/phi_xi/none rmse=10.482 crps=3.542 grad=122330.86
+  [233/324] (done) stage4S garanhuns/phi_only/enso rmse=10.019 crps=3.175 grad=0.90
+  [234/324] (done) stage3 garanhuns/phi_xi/none rmse=9.987 crps=3.166 grad=0.03
+  [235/324] (done) stage4S garanhuns/phi_only/dew rmse=10.015 crps=3.186 grad=0.06
+  [236/324] (done) stage3 garanhuns/phi_xi/dew rmse=10.327 crps=3.270 grad=433856.97
+  [237/324] (done) stage4S garanhuns/phi_only/dew_enso rmse=10.015 crps=3.186 grad=0.06
+  [238/324] (done) stage3 garanhuns/phi_xi/enso rmse=10.016 crps=3.170 grad=0.12
+  [239/324] (done) stage3 garanhuns/phi_xi/dew_temp_enso rmse=10.055 crps=3.183 grad=1.02
+  [240/324] (done) stage3 garanhuns/phi_xi/dew_enso rmse=9.953 crps=3.170 grad=0.32
+  [241/324] (done) stage4S garanhuns/phi_only/dew_temp_enso rmse=9.979 crps=3.171 grad=0.13
+  [242/324] (done) stage4S darwin/phi_xi/dew rmse=nan crps=nan grad=120063239.13
+  [243/324] (done) stage4S darwin/phi_xi/dew_enso rmse=nan crps=nan grad=120063239.13
+  [244/324] (done) stage4 bh/phi_xi/dew_enso rmse=10.555 crps=3.521 grad=94906.01
+  [245/324] (done) stage3 manaus/phi_only/none rmse=17.696 crps=6.463 grad=107.10
+  [246/324] (done) stage3 manaus/phi_only/enso rmse=17.750 crps=6.493 grad=110169.79
+  [247/324] (done) stage3 manaus/phi_only/dew rmse=17.634 crps=6.428 grad=46.30
+  [248/324] (done) stage3 manaus/phi_only/dew_enso rmse=17.645 crps=6.432 grad=19.12
+  [249/324] (done) stage3 manaus/phi_only/dew_temp_enso rmse=17.644 crps=6.432 grad=0.16
+  [250/324] (done) stage4 bh/phi_xi/enso rmse=10.461 crps=3.491 grad=136804.32
+  [251/324] (done) stage4 manaus/phi_only/enso rmse=17.877 crps=6.567 grad=168626.11
+  [252/324] (done) stage4 manaus/phi_only/none rmse=17.655 crps=6.451 grad=11302.82
+  [253/324] (done) stage4 darwin/phi_xi/dew rmse=15.273 crps=4.766 grad=19786.96
+  [254/324] (done) stage4 manaus/phi_only/dew rmse=17.706 crps=6.455 grad=3201.81
+  [255/324] (done) stage4 manaus/phi_only/dew_enso rmse=17.903 crps=6.554 grad=314039.55
+  [256/324] (done) stage4S manaus/phi_only/none rmse=17.683 crps=6.459 grad=3.35
+  [257/324] (done) stage4 manaus/phi_only/dew_temp_enso rmse=18.473 crps=6.807 grad=1079286.07
+  [258/324] (done) stage4 darwin/phi_xi/dew_enso rmse=15.399 crps=4.785 grad=187201.73
+  [259/324] (done) stage4S manaus/phi_only/enso rmse=17.683 crps=6.459 grad=3.35
+  [260/324] (done) stage3 manaus/phi_xi/none rmse=17.941 crps=6.533 grad=68.03
+  [261/324] (done) stage3 manaus/phi_xi/enso rmse=nan crps=nan grad=65474.06
+  [262/324] (done) stage3 manaus/phi_xi/dew rmse=80406988287124376351014903611392.000 crps=285753905463379628170971971584.000 grad=275234.55
+  [263/324] (done) stage3 manaus/phi_xi/dew_enso rmse=18.478 crps=6.871 grad=11707.63
+  [264/324] (done) stage4S manaus/phi_only/dew rmse=17.635 crps=6.436 grad=0.05
+  [265/324] (done) stage4S manaus/phi_only/dew_enso rmse=17.635 crps=6.436 grad=0.05
+  [266/324] (done) stage3 manaus/phi_xi/dew_temp_enso rmse=nan crps=nan grad=298193.20
+  [267/324] (done) stage4 garanhuns/phi_xi/dew rmse=10.069 crps=3.207 grad=10509.12
+  [268/324] (done) stage4 darwin/phi_xi/dew_temp_enso rmse=15.389 crps=4.789 grad=1579.40
+  [269/324] (done) stage4S bh/phi_xi/none rmse=11.598 crps=3.555 grad=33.77
+  [270/324] (done) stage4S bh/phi_xi/dew rmse=10.335 crps=3.442 grad=19.20
+  [271/324] (done) stage4S bh/phi_xi/dew_enso rmse=10.335 crps=3.442 grad=19.20
+  [272/324] (done) stage4S manaus/phi_only/dew_temp_enso rmse=17.629 crps=6.430 grad=0.14
+  [273/324] (done) stage4S bh/phi_xi/enso rmse=11.598 crps=3.555 grad=33.77
+  [274/324] (done) stage3 salvador/phi_only/none rmse=13.418 crps=4.791 grad=0.36
+  [275/324] (done) stage3 salvador/phi_only/enso rmse=14.603 crps=5.091 grad=60796.34
+  [276/324] (done) stage4S manaus/phi_xi/dew_temp_enso rmse=25.021 crps=7.173 grad=71241.88
+  [277/324] (done) stage4 garanhuns/phi_xi/none rmse=10.379 crps=3.461 grad=111367.41
+  [278/324] (done) stage3 salvador/phi_only/dew rmse=13.410 crps=4.792 grad=0.35
+  [279/324] (done) stage4 manaus/phi_xi/dew rmse=nan crps=nan grad=480493.31
+  [280/324] (done) stage3 salvador/phi_only/dew_enso rmse=13.409 crps=4.791 grad=0.34
+  [281/324] (done) stage3 salvador/phi_only/dew_temp_enso rmse=13.435 crps=4.801 grad=0.56
+  [282/324] (done) stage4 salvador/phi_only/enso rmse=13.502 crps=4.826 grad=199771.43
+  [283/324] (done) stage4 salvador/phi_only/none rmse=13.419 crps=4.792 grad=2.91
+  [284/324] (done) stage4S bh/phi_xi/dew_temp_enso rmse=11.211 crps=3.481 grad=20.17
+  [285/324] (done) stage4 salvador/phi_only/dew rmse=13.428 crps=4.796 grad=0.46
+  [286/324] (done) stage4S garanhuns/phi_xi/dew_temp_enso rmse=nan crps=nan grad=25815.11
+  [287/324] (done) stage4S salvador/phi_only/none rmse=13.426 crps=4.783 grad=0.38
+  [288/324] (done) stage4 salvador/phi_only/dew_enso rmse=13.437 crps=4.781 grad=0.32
+  [289/324] (done) stage4S salvador/phi_only/enso rmse=13.426 crps=4.783 grad=0.38
+  [290/324] (done) stage3 salvador/phi_xi/none rmse=13.528 crps=4.823 grad=396.68
+  [291/324] (done) stage3 salvador/phi_xi/enso rmse=13.424 crps=4.760 grad=203293.36
+  [292/324] (done) stage4 darwin/phi_xi/none rmse=15.687 crps=4.975 grad=105311.07
+  [293/324] (done) stage4 salvador/phi_only/dew_temp_enso rmse=13.441 crps=4.787 grad=0.31
+  [294/324] (done) stage4S salvador/phi_only/dew rmse=13.571 crps=4.850 grad=125.88
+  [295/324] (done) stage4S salvador/phi_only/dew_enso rmse=13.571 crps=4.850 grad=125.88
+  [296/324] (done) stage3 salvador/phi_xi/dew_enso rmse=13.402 crps=4.790 grad=0.35
+  [297/324] (done) stage3 salvador/phi_xi/dew_temp_enso rmse=13.487 crps=4.804 grad=0.31
+  [298/324] (done) stage3 salvador/phi_xi/dew rmse=13.424 crps=4.793 grad=0.36
+  [299/324] (done) stage4S salvador/phi_only/dew_temp_enso rmse=13.418 crps=4.807 grad=68.72
+  [300/324] (done) stage4 manaus/phi_xi/none rmse=nan crps=nan grad=64585.78
+  [301/324] (done) stage4S garanhuns/phi_xi/none rmse=9.987 crps=3.168 grad=37.56
+  [302/324] (done) stage4 salvador/phi_xi/none rmse=13.949 crps=4.449 grad=31497.94
+  [303/324] (done) stage4 garanhuns/phi_xi/dew_enso rmse=9.997 crps=3.181 grad=13.63
+  [304/324] (done) stage4S garanhuns/phi_xi/enso rmse=9.987 crps=3.168 grad=37.56
+  [305/324] (done) stage4S garanhuns/phi_xi/dew rmse=9.990 crps=3.184 grad=19.72
+  [306/324] (done) stage4 garanhuns/phi_xi/enso rmse=10.023 crps=3.173 grad=5.52
+  [307/324] (done) stage4S garanhuns/phi_xi/dew_enso rmse=9.990 crps=3.184 grad=19.72
+  [308/324] (done) stage4 garanhuns/phi_xi/dew_temp_enso rmse=10.041 crps=3.173 grad=3.00
+  [309/324] (done) stage4 manaus/phi_xi/dew_temp_enso rmse=nan crps=nan grad=26472.66
+  [310/324] (done) stage4 manaus/phi_xi/enso rmse=nan crps=nan grad=50457.76
+  [311/324] (done) stage4 salvador/phi_xi/enso rmse=13.494 crps=4.807 grad=180573.51
+  [312/324] (done) stage4S manaus/phi_xi/none rmse=17.979 crps=6.726 grad=137.66
+  [313/324] (done) stage4 salvador/phi_xi/dew_temp_enso rmse=13.646 crps=4.828 grad=2239935.94
+  [314/324] (done) stage4S manaus/phi_xi/enso rmse=17.979 crps=6.726 grad=137.66
+  [315/324] (done) stage4 manaus/phi_xi/dew_enso rmse=nan crps=nan grad=46.68
+  [316/324] (done) stage4S salvador/phi_xi/none rmse=13.418 crps=4.782 grad=0.79
+  [317/324] (done) stage4S manaus/phi_xi/dew rmse=17.674 crps=6.459 grad=7.25
+  [318/324] (done) stage4S manaus/phi_xi/dew_enso rmse=17.674 crps=6.459 grad=7.25
+  [319/324] (done) stage4S salvador/phi_xi/enso rmse=13.418 crps=4.782 grad=0.79
+  [320/324] (done) stage4 salvador/phi_xi/dew rmse=13.431 crps=4.796 grad=24.48
+  [321/324] (done) stage4S salvador/phi_xi/dew rmse=13.404 crps=4.785 grad=0.96
+  [322/324] (done) stage4S salvador/phi_xi/dew_enso rmse=13.404 crps=4.785 grad=0.96
+  [323/324] (done) stage4S salvador/phi_xi/dew_temp_enso rmse=13.460 crps=4.794 grad=0.33
+  [324/324] (done) stage4 salvador/phi_xi/dew_enso rmse=13.439 crps=4.794 grad=32.95
+[phase B / stage2+harvey] done in 3521s  {'done': 324, 'skip': 0, 'err': 0}
+[phase C / stage5] 6 tasks on 6 workers
+  [1/6] (done) stage5 cruzeiro
+  [2/6] (done) stage5 darwin
+  [3/6] (done) stage5 garanhuns
+  [4/6] (done) stage5 bh
+  [5/6] (done) stage5 manaus
+  [6/6] (done) stage5 salvador
+    stage5 (base stage3/dew/phi_only): rmse=14.694 crps=6.292 grad=106411.73
+    stage5 (base stage3/dew_enso/phi_only): rmse=107210.889 crps=548.044 grad=7562507.77
+    stage5 (base stage3/none/phi_xi): rmse=9.986 crps=3.166 grad=6.81
+    stage5 (base stage4S/dew/phi_only): rmse=nan crps=nan grad=187464.94
+    stage5 (base stage4S/dew_temp_enso/phi_only): rmse=107.159 crps=8.348 grad=70349.61
+    stage5 (base stage4/dew_enso/phi_only): rmse=13.439 crps=4.794 grad=32.95
+[phase C / stage5] done in 782s  {'done': 6, 'skip': 0, 'err': 0}
+flat run complete; summary.json written
+=== FLAT AUGMENT Thu Sep 10 21:16:43 HPAC 2026 ===
+  [25/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\bh\stage2\L123_365_366_dew
+  [50/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\bh\stage3\dew__xi
+  [75/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\bh\stage4S\enso
+  [100/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\cruzeiro\stage1\L1_inverse_fisher
+  [125/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\cruzeiro\stage2\L1_dew_temp__xi
+  [150/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\cruzeiro\stage4S\dew_enso
+  [175/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\darwin\stage1\L1_365_366_unit
+  [200/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\darwin\stage2\L1_365_366_dew_temp_enso__xi
+  [225/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\darwin\stage4\none
+  [250/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\garanhuns\stage1\L1_365_366_diagonal_inverse_fisher
+  [275/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\garanhuns\stage2\L1_365_366_dew__xi
+  [300/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\garanhuns\stage4\dew_enso__xi
+  [325/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\manaus\stage1\L123_inverse_fisher
+  [350/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\manaus\stage2\L123_dew_temp__xi
+  [375/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\manaus\stage4\dew
+  [400/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\salvador\stage1\L123_365_366_unit__xi
+  [425/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\salvador\stage2\L123_365_366_dew_temp_enso__xi
+  [450/474] have C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\salvador\stage3\enso
+augment pass complete {'done': 0, 'have': 474, 'err': 0, 'skip': 0}
+=== REPORT Thu Sep 10 21:16:50 HPAC 2026 ===
+wrote report.tex + tables.tex
+report.pdf: OK
+tables.pdf: OK
+=== ALL DONE Thu Sep 10 21:18:48 HPAC 2026 ===

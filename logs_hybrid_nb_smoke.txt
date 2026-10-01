@@ -1,0 +1,7 @@
+base: stage4S dew
+use_nb_filter: True
+nb objective: 34378.96069425087
+py objective: 34378.9606860621 diff: 8.188770152628422e-06
+fit time: 81.11255145072937 loglik: -4995.7333497399 success: False
+rmse: 10.15471498786527 crps: 3.2224459346489107 grad: 148.15065242146375
+SMOKE TEST OK

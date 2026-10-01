@@ -62,3 +62,23 @@ class PiDynamics(ABC):
         params   : dict of parameter values (keys match param_names)
         seasonal : 'daily' or 'monthly'
         """
+
+    # ------------------------------------------------------------------
+    # Occurrence link  η_t -> π_t  (concrete; override for a different link)
+    # ------------------------------------------------------------------
+    # The default logistic link matches this module's docstring and every
+    # historical fit. A subclass that wants a different mapping (e.g. the
+    # reciprocal π = 1/(1+η)) overrides `pi_from_eta` and `log_pi_terms`
+    # AND sets a `link` attribute -- the model dispatchers read that
+    # attribute to pass the matching integer code to the numba kernels
+    # (see models/_nb_gb2_filter.py `_pi_link_terms`).
+
+    def pi_from_eta(self, eta):
+        """P(y_t > 0 | F_{t-1}) from the latent η_t. Default: logistic."""
+        from scipy.special import expit
+        return expit(eta)
+
+    def log_pi_terms(self, eta):
+        """Return (log π_t, log(1 - π_t)) stably. Default: logistic."""
+        from scipy.special import log_expit
+        return log_expit(eta), log_expit(-eta)

@@ -1,0 +1,8 @@
+[stage5 hybrid (gas1 phi, harvey xi)] 6 tasks on 6 workers
+  [1/6] (done) darwin (base stage3/dew_enso) fit=7s rmse=15.050 crps=4.475 grad=0.10
+  [2/6] (done) cruzeiro (base stage3/none) fit=11s rmse=13.780 crps=5.642 grad=494297.59
+  [3/6] (done) manaus (base stage4S/dew) fit=12s rmse=20.788 crps=7.131 grad=38401.69
+  [4/6] (done) salvador (base stage4S/dew) fit=49s rmse=12.657 crps=4.192 grad=0.35
+  [5/6] (done) garanhuns (base stage4S/dew_temp_enso) fit=64s rmse=9.827 crps=2.938 grad=10.49
+  [6/6] (done) bh (base stage4S/dew) fit=100s rmse=10.168 crps=3.225 grad=78.81
+[stage5 hybrid (gas1 phi, harvey xi)] done in 107s  {'done': 6, 'skip': 0, 'err': 0}

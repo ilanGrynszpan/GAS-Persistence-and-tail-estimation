@@ -124,9 +124,13 @@ STAGE4_THRESHOLDS = [("95", 0.95), ("98", 0.98)]
 
 # Stage 5 (2026-07-09 addition, not part of objectives 1-4): fully static
 # unconditional GB2 (step 1) + threshold-weighted-likelihood dynamic-xi
-# (step 2), estimated only at these three locations, at all four
-# thresholds below -- only the best (by OOS CRPS) is reported.
-STAGE5_LOCATIONS = {"BELO HORIZONTE", "DARWIN AIRPORT", "GARANHUNS (PERNAMBUCO)"}
+# (step 2), at all four thresholds below -- only the best (by OOS CRPS) is
+# reported. Originally run at only 3 of the 6 active locations (an
+# unexplained exploratory subset, not a numerical/data limitation -- the
+# other 3 simply never had this function called for them); extended
+# 2026-09-06 to all 6 active project locations per direct instruction.
+STAGE5_LOCATIONS = {"BELO HORIZONTE", "DARWIN AIRPORT", "GARANHUNS (PERNAMBUCO)",
+                     "CRUZEIRO DO SUL (ACRE)", "MANAUS", "SALVADOR"}
 STAGE5_THRESHOLDS = [("90", 0.90), ("95", 0.95), ("98", 0.98), ("99", 0.99)]
 
 # ── Logging ───────────────────────────────────────────────────────────────────

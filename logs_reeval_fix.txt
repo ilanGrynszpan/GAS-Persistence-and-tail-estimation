@@ -1,0 +1,25 @@
+=== RE-EVAL (bug fix: OOS eta i-index) Thu Sep 10 21:25:46 HPAC 2026 ===
+  [25/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\bh\stage2\L123_365_366_dew
+  [50/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\bh\stage3\enso
+  [75/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\bh\stage4S\dew_enso__xi
+  [100/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\cruzeiro\stage1\L1_unit__xi
+  [125/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\cruzeiro\stage3\dew__xi
+  [150/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\darwin\stage1\L123_365_366_diagonal_inverse_fisher
+  [175/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\darwin\stage1\L1_365_366_diagonal_inverse_fisher__xi
+  [200/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\darwin\stage2\L1_365_366_dew_temp_enso__xi
+  [225/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\darwin\stage4\enso
+  [250/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\garanhuns\stage1\L1_365_366_unit__xi
+  [275/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\garanhuns\stage2\L123_dew_temp_enso__xi
+  [300/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\garanhuns\stage3\dew__xi
+  [325/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\manaus\stage1\L123_diagonal_inverse_fisher__xi
+  [350/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\manaus\stage2\L123_dew_temp_enso
+  [375/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\manaus\stage4\dew_enso__xi
+  [400/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\salvador\stage1\L123_inverse_fisher__xi
+  [425/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\salvador\stage2\L123_dew
+  [450/474] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\rerun_10092026\salvador\stage3\dew_temp_enso
+augment pass complete {'done': 474, 'have': 0, 'err': 0, 'skip': 0}
+=== REPORT Thu Sep 10 21:31:22 HPAC 2026 ===
+wrote report.tex + tables.tex
+report.pdf: OK
+tables.pdf: OK
+=== ALL DONE Thu Sep 10 21:33:24 HPAC 2026 ===

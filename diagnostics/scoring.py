@@ -470,6 +470,7 @@ def compute_extended_oos_metrics(
     brier_levels: Sequence[float] = EXTENDED_QUANTILE_LEVELS,
     n_draws: int = 1000,
     seed: int = 42,
+    return_raw: bool = False,
 ) -> dict:
     """
     Comprehensive extended OOS evaluation.
@@ -673,6 +674,13 @@ def compute_extended_oos_metrics(
 
     result.update(kup_result)
     result.update(chrf_result)
+
+    if return_raw:
+        # The raw PIT sequence is the one thing Kupiec/Christoffersen tests
+        # actually need (see diagnostics.tests.kupiec_test/christoffersen_test:
+        # both take pit_values + alpha) -- saving it lets those tests be
+        # re-run later at ANY alpha level without re-simulating draws.
+        result["_pit_values"] = pit_vals.tolist()
 
     return result
 

@@ -1,0 +1,3 @@
+wrote report.tex + tables.tex
+report.pdf: OK
+tables.pdf: OK

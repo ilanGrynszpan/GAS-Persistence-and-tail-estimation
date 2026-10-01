@@ -76,14 +76,39 @@ class ARLogisticCustomLagsPiDynamics(PiDynamics):
         omega_y[0..K-1] -- coefficients on lagged y values, in `lags` order
     """
 
-    def __init__(self, lags: List[int], include_ar: bool = True):
+    def __init__(self, lags: List[int], include_ar: bool = True,
+                 link: str = "logistic"):
         if not lags or any(l <= 0 for l in lags):
             raise ValueError(
                 f"ARLogisticCustomLagsPiDynamics requires a non-empty list "
                 f"of strictly positive lags, got {lags!r}."
             )
+        if link not in ("logistic", "reciprocal"):
+            raise ValueError(
+                f"link must be 'logistic' or 'reciprocal', got {link!r}."
+            )
         self.lags = list(lags)
         self.include_ar = bool(include_ar)
+        # link == "reciprocal":  pi_{t|t-1} = 1 / (1 + eta_t)   (2026-09-10)
+        #   eta_t is then the "dry odds" (1-pi)/pi and needs eta_t > -1 for a
+        #   valid probability; pi_from_eta / log_pi_terms below clamp to a
+        #   valid range as a numerical safeguard, matching the numba path's
+        #   _pi_link_terms(pi_link=1).
+        self.link = str(link)
+
+    # --- occurrence link overrides (only bite when link == "reciprocal") ---
+    def pi_from_eta(self, eta):
+        if self.link != "reciprocal":
+            return super().pi_from_eta(eta)
+        e = np.asarray(eta, dtype=float)
+        denom = np.where(1.0 + e < 1e-12, 1e-12, 1.0 + e)
+        return np.clip(1.0 / denom, 1e-12, 1.0 - 1e-12)
+
+    def log_pi_terms(self, eta):
+        if self.link != "reciprocal":
+            return super().log_pi_terms(eta)
+        pi = self.pi_from_eta(eta)
+        return np.log(pi), np.log(1.0 - pi)
 
     # ------------------------------------------------------------------
     def param_names(self, seasonal: str) -> List[str]:
@@ -94,7 +119,14 @@ class ARLogisticCustomLagsPiDynamics(PiDynamics):
         return names
 
     def default_bounds(self, seasonal: str):
-        bounds = [(-5.0, 2.0)]  # omega0, same range as ARLogisticPiDynamics
+        # For the reciprocal link, omega0 is a positive "dry-odds" level
+        # (eta ~ (1-pi)/pi), not a logit -- give it a [0, 20] box so the
+        # warm-start L-BFGS-B pass is not boxed away from the stationary
+        # region implied by initial_params.
+        if self.link == "reciprocal":
+            bounds = [(0.0, 20.0)]
+        else:
+            bounds = [(-5.0, 2.0)]  # omega0, same range as ARLogisticPiDynamics
         if self.include_ar:
             bounds.append((-0.95, 0.95))  # rho
         # Short rainfall lags (l in {1,2,3}) act directly on eta in mm units;
@@ -107,7 +139,15 @@ class ARLogisticCustomLagsPiDynamics(PiDynamics):
     def initial_params(self, y: np.ndarray, seasonal: str) -> np.ndarray:
         pi_hat = np.mean(y > 0)
         pi_hat = np.clip(pi_hat, 0.01, 0.99)
-        omega0 = float(np.log(pi_hat / (1.0 - pi_hat)))
+        if self.link == "reciprocal":
+            # pi = 1/(1+eta)  =>  eta ~ (1 - pi_hat)/pi_hat  (the "dry odds").
+            # With rho=0 at the start, omega0 should sit at that stationary
+            # level so pi_{t|t-1} starts near the empirical wet fraction
+            # instead of at the clamp (eta<0 -> pi~1 -> a degenerate,
+            # gradient-starved start; see the module docstring).
+            omega0 = float((1.0 - pi_hat) / pi_hat)
+        else:
+            omega0 = float(np.log(pi_hat / (1.0 - pi_hat)))
         theta0 = [omega0]
         if self.include_ar:
             theta0.append(0.5)

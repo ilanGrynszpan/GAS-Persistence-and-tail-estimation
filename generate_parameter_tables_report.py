@@ -183,7 +183,7 @@ def _section_title(stage: int, branch: Optional[str], display: str) -> str:
 # here once, by hand, from the four _run_filter implementations).
 #
 # Three constraint families appear:
-#   (a) individual bound        -- |A_L_j| <= 2.0, |B_xi_1| <= 0.98, etc.
+#   (a) individual bound        -- |kappa_L_j| <= 2.0, |B_xi_1| <= 0.98, etc.
 #   (b) GROUP bound (lag sums)  -- Stage 1/2's standard GAS blocks penalize
 #       sum_l |A_{j,l}| <= 2.0 and sum_l |B_{j,l}| <= 0.98 ACROSS the whole
 #       lag set L, not per lag. The number shown for each individual A_j_l /
@@ -194,10 +194,11 @@ def _section_title(stage: int, branch: Optional[str], display: str) -> str:
 #       are penalized on ||Gamma_j||_2 <= 20, so each individual
 #       coefficient's implied bound is +/-20 (since |Gamma_j,k| <=
 #       ||Gamma_j||_2), again not a per-coefficient bound.
-#   (d) relative bound            -- Harvey's B_S_j is penalized against
-#       B_L_j itself (0 < B_S_j < B_L_j), not a fixed constant; the upper
-#       bound shown (0.995) is the outer bound implied by B_L_j's own cap,
-#       not the true (tighter, fit-specific) limit -- see the Introduction.
+#   (d) relative bound            -- Harvey's phi_S_j is penalized against
+#       phi_L_j itself (0 < phi_S_j < phi_L_j), not a fixed constant; the
+#       upper bound shown (0.995) is the outer bound implied by phi_L_j's
+#       own cap, not the true (tighter, fit-specific) limit -- see the
+#       Introduction.
 #
 # Parameters with no penalty term at all (omega_j, f0_j, L0_j, S0_j, omega0,
 # omega_y_l) are unconstrained under BFGS and rendered "NA".
@@ -206,11 +207,11 @@ _B_LIMIT      = 0.98   # LAM_PERSIST threshold, standard GAS / regime B (persist
 _RHO_LIMIT    = 0.98   # LAM_PERSIST threshold, pi AR(1) coefficient
 _STATIC_LIMIT = 20.0   # LAM_STATIC threshold, static GB2 shape params (gamma, zeta, xi)
 _COV_LIMIT    = 20.0   # LAM_COV threshold, covariate-vector L2 norm (implied per-coef bound)
-_BL_UPPER     = 0.995  # Harvey B_L upper threshold (LAM_LONG)
+_PHI_L_UPPER  = 0.995  # Harvey phi_L upper threshold (LAM_LONG)
 
 # (pattern, lower, upper) -- checked in order, first match wins. Patterns are
-# checked with re.fullmatch so e.g. "A_L_phi" cannot accidentally match the
-# generic "A_(phi|xi)_<lag>" rule.
+# checked with re.fullmatch so e.g. "kappa_L_phi" cannot accidentally match
+# the generic "A_(phi|xi)_<lag>" rule.
 _CONSTRAINT_RULES: List[Tuple[str, Optional[float], Optional[float]]] = [
     # Static GB2 shape parameters (gamma, zeta always; xi when phi-only)
     (r"gamma", -_STATIC_LIMIT, _STATIC_LIMIT),
@@ -228,13 +229,13 @@ _CONSTRAINT_RULES: List[Tuple[str, Optional[float], Optional[float]]] = [
     # Stage 4 regime extension
     (r"A_ext_(phi|xi)", -_A_LIMIT, _A_LIMIT),
     # Harvey long component
-    (r"A_L_(phi|xi)",          -_A_LIMIT, _A_LIMIT),
-    (r"B_L_(phi|xi)",           0.0,       _BL_UPPER),
-    (r"gamma_L_(phi|xi)_.+",   -_COV_LIMIT, _COV_LIMIT),
+    (r"kappa_L_(phi|xi)",      -_A_LIMIT, _A_LIMIT),
+    (r"phi_L_(phi|xi)",         0.0,       _PHI_L_UPPER),
+    (r"Gamma_L_(phi|xi)_.+",   -_COV_LIMIT, _COV_LIMIT),
     # Harvey short component
-    (r"A_S_(phi|xi)",          -_A_LIMIT, _A_LIMIT),
-    (r"B_S_(phi|xi)",           0.0,       _BL_UPPER),  # outer bound; also < that fit's B_L
-    (r"gamma_S_(phi|xi)_.+",   -_COV_LIMIT, _COV_LIMIT),
+    (r"kappa_S_(phi|xi)",      -_A_LIMIT, _A_LIMIT),
+    (r"phi_S_(phi|xi)",         0.0,       _PHI_L_UPPER),  # outer bound; also < that fit's phi_L
+    (r"Gamma_S_(phi|xi)_.+",   -_COV_LIMIT, _COV_LIMIT),
     # Standard GAS score/persistence lag coefficients (group bound, see above)
     (r"A_(phi|xi)_\d+", -_A_LIMIT, _A_LIMIT),
     (r"B_(phi|xi)_\d+", -_B_LIMIT, _B_LIMIT),
@@ -498,8 +499,8 @@ This is report-only vocabulary for which GB2 log-link parameters are
 dynamic in each model -- it does not rename $\phi$ (scale) or $\xi$ (shape)
 anywhere else in the codebase or in \texttt{docs/MODELS.md}.
 
-Stage 3's long-component covariates (\texttt{gamma\_L\_*\_el\_nino\_t},
-\texttt{gamma\_L\_*\_la\_nina\_t}, and their \texttt{lag1mo}/\texttt{lag3mo}
+Stage 3's long-component covariates (\texttt{Gamma\_L\_*\_el\_nino\_t},
+\texttt{Gamma\_L\_*\_la\_nina\_t}, and their \texttt{lag1mo}/\texttt{lag3mo}
 counterparts) are monthly El Ni\~no/La Ni\~na dummy indicators built from
 \texttt{data/processed/pacific/ENSO\_clean.csv} (\texttt{data/station\_loader.py}),
 not the 90-day/30-day rolling raw-SST anomaly originally described in
@@ -555,12 +556,12 @@ bound (the true joint constraint is stated once per family, not per row):
     coefficients): the penalty applies to
     $\lVert\Gamma_j\rVert_2\le 20$ for the whole coefficient vector; $\pm20$
     is shown per coefficient as the loosest implied individual bound.
-  \item \textbf{Relative bound} (Stage 3's \texttt{B\_S\_\{phi,xi\}}): the
-    persistence restriction is $0<B_{S,j}<B_{L,j}<1$
-    (\texttt{docs/MODELS.md} \S 20) -- $B_{S,j}$'s true upper bound is that
-    same fit's own $B_{L,j}$ estimate (visible in the same table), not a
-    fixed constant; $0.995$ is shown as the outer bound implied by
-    $B_{L,j}$'s own cap.
+  \item \textbf{Relative bound} (Stage 3's \texttt{phi\_S\_\{phi,xi\}}): the
+    persistence restriction is $0<\phi_{S,j}<\phi_{L,j}<1$
+    (\texttt{docs/MODELS.md} \S 20) -- $\phi_{S,j}$'s true upper bound is
+    that same fit's own $\phi_{L,j}$ estimate (visible in the same table),
+    not a fixed constant; $0.995$ is shown as the outer bound implied by
+    $\phi_{L,j}$'s own cap.
 \end{itemize}
 
 \clearpage

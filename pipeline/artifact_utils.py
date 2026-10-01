@@ -82,9 +82,27 @@ def build_model_from_meta(meta: dict, params_df: pd.DataFrame, model_id: str = "
         from models.harvey_gas import HarveyZAGASModel
         long_names  = meta.get("long_names", [])
         short_names = meta.get("short_names", [])
+        # These six default to the production pipeline's behaviour when
+        # absent (all existing Stage-3 metadata.json files predate them),
+        # but are REQUIRED for a structurally correct reconstruction of a
+        # run_longshort_diagnostics.py artifact: e.g. a sigmoid_both fit's
+        # estimated_parameters.csv holds phi_L_j/phi_S_j on the pre-sigmoid
+        # raw scale, and .filter()/.cdf_series() only decode that correctly
+        # if phi_L_max/phi_S_max are set to match how it was actually fit.
         return HarveyZAGASModel(
             distribution=dist, pi_dynamics=pi_dyn, seasonal="daily",
             long_names=long_names, short_names=short_names, scaling=scaling,
+            restrict_persistence_upper=meta.get("restrict_persistence_upper", True),
+            use_auxiliary_penalties=meta.get("use_auxiliary_penalties", True),
+            fixed_phi_L=meta.get("fixed_phi_L"),
+            phi_L_max=meta.get("phi_L_max"),
+            phi_S_max=meta.get("phi_S_max"),
+            fixed_phi_S=meta.get("fixed_phi_S"),
+            raw_z_ridge=meta.get("raw_z_ridge", 0.0),
+            n_harmonics=meta.get("n_harmonics", 0),
+            seasonal_period=meta.get("seasonal_period", 365.25),
+            kappa_gamma_bound=meta.get("kappa_gamma_bound"),
+            seasonal_damping_max=meta.get("seasonal_damping_max"),
         )
 
     if "Cov" in model_type or model_id.startswith("stage2"):
@@ -95,6 +113,25 @@ def build_model_from_meta(meta: dict, params_df: pd.DataFrame, model_id: str = "
             distribution=dist, pi_dynamics=pi_dyn,
             seasonal="daily", gas_lags=lags, scaling=scaling,
             cov_names=cov_names,
+            # Experimental per-lag sigmoid-bounded A/B/rho (default off for
+            # every existing artifact, which predates these fields) -- see
+            # reports/seasonality GAS/gradient_and_convergence_diagnosis.md §8.
+            bound_ab=meta.get("bound_ab", False),
+            a_max=meta.get("a_max", 2.0), b_max=meta.get("b_max", 1.0),
+            bound_rho=meta.get("bound_rho", False), rho_max=meta.get("rho_max", 0.999),
+            # Link-only ("v3") extensions -- see ZAGASModel's constructor
+            # docstring; default off for every artifact predating them.
+            ab_signed=meta.get("ab_signed", False), rho_signed=meta.get("rho_signed", False),
+            free_zeta_gamma=meta.get("free_zeta_gamma", False),
+            kurtosis_margin=meta.get("kurtosis_margin", 4.0),
+            unconstrained_penalties=meta.get("unconstrained_penalties", False),
+            unconstrained_state=meta.get("unconstrained_state", False),
+            bound_b_joint=meta.get("bound_b_joint", False),
+            b_total_max=meta.get("b_total_max", 0.98),
+            bound_b_tanh_sum=meta.get("bound_b_tanh_sum", False),
+            b_sum_max=meta.get("b_sum_max", 1.0),
+            bound_static_box=meta.get("bound_static_box", False),
+            static_box=tuple(meta.get("static_box", (-2.0, 15.0))),
         )
 
     if model_type in ("ZAGASModel", "RegimeZAGASModel") or model_id.startswith("stage1"):
@@ -103,6 +140,20 @@ def build_model_from_meta(meta: dict, params_df: pd.DataFrame, model_id: str = "
         return ZAGASModel(
             distribution=dist, pi_dynamics=pi_dyn,
             seasonal="daily", gas_lags=lags, scaling=scaling,
+            bound_ab=meta.get("bound_ab", False),
+            a_max=meta.get("a_max", 2.0), b_max=meta.get("b_max", 1.0),
+            bound_rho=meta.get("bound_rho", False), rho_max=meta.get("rho_max", 0.999),
+            ab_signed=meta.get("ab_signed", False), rho_signed=meta.get("rho_signed", False),
+            free_zeta_gamma=meta.get("free_zeta_gamma", False),
+            kurtosis_margin=meta.get("kurtosis_margin", 4.0),
+            unconstrained_penalties=meta.get("unconstrained_penalties", False),
+            unconstrained_state=meta.get("unconstrained_state", False),
+            bound_b_joint=meta.get("bound_b_joint", False),
+            b_total_max=meta.get("b_total_max", 0.98),
+            bound_b_tanh_sum=meta.get("bound_b_tanh_sum", False),
+            b_sum_max=meta.get("b_sum_max", 1.0),
+            bound_static_box=meta.get("bound_static_box", False),
+            static_box=tuple(meta.get("static_box", (-2.0, 15.0))),
         )
 
     # Fallback: plain GAS(1,2,3), phi-only or phi+xi per tv. Safe even for

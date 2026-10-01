@@ -1,0 +1,11 @@
+180 configs to diagnose
+  [20/180] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\stage34_stability_diagnostics\bh\stage4S\dew_temp_enso.json
+  [40/180] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\stage34_stability_diagnostics\bh\stage4S\dew_temp_enso__xi.json
+  [60/180] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\stage34_stability_diagnostics\darwin\stage3\dew_temp_enso.json
+  [80/180] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\stage34_stability_diagnostics\garanhuns\stage3\enso.json
+  [100/180] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\stage34_stability_diagnostics\garanhuns\stage4\dew.json
+  [120/180] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\stage34_stability_diagnostics\garanhuns\stage4S\enso__xi.json
+  [140/180] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\stage34_stability_diagnostics\salvador\stage3\none.json
+  [160/180] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\stage34_stability_diagnostics\salvador\stage4\dew.json
+  [180/180] done C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\stage34_stability_diagnostics\salvador\stage4\dew_temp_enso__xi.json
+diagnostics pass complete {'done': 180, 'skip': 0, 'err': 0, 'missing': 0}

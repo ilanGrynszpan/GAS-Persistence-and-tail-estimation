@@ -1,0 +1,16 @@
+426 metric cells to gather
+  [50/426] bh/stage2/L1_365_366_dew_temp_enso/phi_xi -> ok
+  [56/426] bh/stage5/best/phi_xi -> MISSING
+  [100/426] cruzeiro/stage4/dew_temp_enso/phi_only -> ok
+  [127/426] cruzeiro/stage5/best/phi_xi -> MISSING
+  [150/426] darwin/stage3/none/phi_only -> ok
+  [198/426] darwin/stage5/best/phi_xi -> MISSING
+  [200/426] darwin/stage3/dew_temp_enso/phi_xi -> ok
+  [250/426] garanhuns/stage1/L123/phi_xi -> ok
+  [269/426] garanhuns/stage5/best/phi_xi -> MISSING
+  [300/426] manaus/stage3/dew_temp_enso/phi_only -> ok
+  [340/426] manaus/stage5/best/phi_xi -> MISSING
+  [350/426] salvador/stage1/L123_365_366/phi_only -> ok
+  [400/426] salvador/stage2/L1_dew_enso/phi_xi -> ok
+  [411/426] salvador/stage5/best/phi_xi -> MISSING
+wrote C:\Users\ilang\OneDrive\Documentos\Ilan\academia\dissertação\python attempt\FurtherTopics\artifacts\stage_comparison_20260911\metrics.json

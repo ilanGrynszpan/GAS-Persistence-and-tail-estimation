@@ -1,0 +1,92 @@
+[stage2 dew_enso] 48 tasks on 16 workers
+  [1/48] (skip) stage2 bh/phi_only/L1/dew_enso
+  [2/48] (done) stage2 bh/phi_only/L123/dew_enso rmse=10.197
+  [3/48] (done) stage2 cruzeiro/phi_only/L1/dew_enso rmse=13.945
+  [4/48] (done) stage2 darwin/phi_only/L1/dew_enso rmse=15.018
+  [5/48] (done) stage2 bh/phi_only/L1_365_366/dew_enso rmse=10.190
+  [6/48] (done) stage2 cruzeiro/phi_only/L123/dew_enso rmse=13.944
+  [7/48] (done) stage2 bh/phi_only/L123_365_366/dew_enso rmse=10.307
+  [8/48] (done) stage2 cruzeiro/phi_only/L1_365_366/dew_enso rmse=14.031
+  [9/48] (done) stage2 bh/phi_xi/L1/dew_enso rmse=10.206
+  [10/48] (done) stage2 cruzeiro/phi_only/L123_365_366/dew_enso rmse=14.976
+  [11/48] (done) stage2 darwin/phi_only/L1_365_366/dew_enso rmse=15.025
+  [12/48] (done) stage2 darwin/phi_only/L123/dew_enso rmse=15.109
+  [13/48] (done) stage2 darwin/phi_xi/L1/dew_enso rmse=15.080
+  [14/48] (done) stage2 cruzeiro/phi_xi/L1_365_366/dew_enso rmse=nan
+  [15/48] (done) stage2 cruzeiro/phi_xi/L123/dew_enso rmse=nan
+  [16/48] (done) stage2 bh/phi_xi/L123/dew_enso rmse=10.243
+  [17/48] (done) stage2 cruzeiro/phi_xi/L1/dew_enso rmse=14.014
+  [18/48] (done) stage2 darwin/phi_only/L123_365_366/dew_enso rmse=15.474
+  [19/48] (done) stage2 garanhuns/phi_only/L1/dew_enso rmse=9.873
+  [20/48] (done) stage2 darwin/phi_xi/L123/dew_enso rmse=14.965
+  [21/48] (done) stage2 garanhuns/phi_only/L1_365_366/dew_enso rmse=9.935
+  [22/48] (done) stage2 garanhuns/phi_only/L123/dew_enso rmse=9.903
+  [23/48] (done) stage2 manaus/phi_only/L1/dew_enso rmse=17.556
+  [24/48] (done) stage2 bh/phi_xi/L1_365_366/dew_enso rmse=10.302
+  [25/48] (done) stage2 garanhuns/phi_only/L123_365_366/dew_enso rmse=9.896
+  [26/48] (done) stage2 darwin/phi_xi/L1_365_366/dew_enso rmse=15.145
+  [27/48] (done) stage2 darwin/phi_xi/L123_365_366/dew_enso rmse=15.605
+  [28/48] (done) stage2 manaus/phi_only/L1_365_366/dew_enso rmse=17.435
+  [29/48] (done) stage2 manaus/phi_only/L123/dew_enso rmse=17.531
+  [30/48] (done) stage2 bh/phi_xi/L123_365_366/dew_enso rmse=10.427
+  [31/48] (done) stage2 garanhuns/phi_xi/L1_365_366/dew_enso rmse=9.933
+  [32/48] (done) stage2 garanhuns/phi_xi/L123/dew_enso rmse=9.827
+  [33/48] (done) stage2 garanhuns/phi_xi/L1/dew_enso rmse=9.863
+  [34/48] (done) stage2 cruzeiro/phi_xi/L123_365_366/dew_enso rmse=nan
+  [35/48] (done) stage2 salvador/phi_only/L1/dew_enso rmse=12.805
+  [36/48] (done) stage2 manaus/phi_only/L123_365_366/dew_enso rmse=17.474
+  [37/48] (done) stage2 garanhuns/phi_xi/L123_365_366/dew_enso rmse=10.004
+  [38/48] (done) stage2 salvador/phi_only/L1_365_366/dew_enso rmse=12.658
+  [39/48] (done) stage2 salvador/phi_only/L123/dew_enso rmse=13.087
+  [40/48] (done) stage2 manaus/phi_xi/L1/dew_enso rmse=17.803
+  [41/48] (done) stage2 salvador/phi_only/L123_365_366/dew_enso rmse=12.839
+  [42/48] (done) stage2 salvador/phi_xi/L1/dew_enso rmse=12.743
+  [43/48] (done) stage2 manaus/phi_xi/L1_365_366/dew_enso rmse=47.525
+  [44/48] (done) stage2 manaus/phi_xi/L123/dew_enso rmse=24.665
+  [45/48] (done) stage2 salvador/phi_xi/L123/dew_enso rmse=12.706
+  [46/48] (done) stage2 salvador/phi_xi/L1_365_366/dew_enso rmse=12.612
+  [47/48] (done) stage2 manaus/phi_xi/L123_365_366/dew_enso rmse=302.520
+  [48/48] (done) stage2 salvador/phi_xi/L123_365_366/dew_enso rmse=12.874
+[stage2 dew_enso] done in 173s  {'done': 47, 'skip': 1, 'err': 0}
+[stage3+4 dew_temp (sigmoid phi_L)] 24 tasks on 16 workers
+  [1/24] (skip) stage3 bh/phi_only/dew_temp
+  [2/24] (done) stage3 darwin/phi_only/dew_temp rmse=15.170 crps=4.481 grad=2.52
+  [3/24] (done) stage3 manaus/phi_only/dew_temp rmse=17.563 crps=6.317 grad=1646069.77
+  [4/24] (done) stage3 cruzeiro/phi_only/dew_temp rmse=13.798 crps=5.631 grad=0.23
+  [5/24] (done) stage3 garanhuns/phi_only/dew_temp rmse=9.922 crps=2.979 grad=0.09
+  [6/24] (done) stage3 darwin/phi_xi/dew_temp rmse=14.992 crps=4.457 grad=124137.23
+  [7/24] (done) stage3 cruzeiro/phi_xi/dew_temp rmse=16.487 crps=6.526 grad=11595.71
+  [8/24] (done) stage3 garanhuns/phi_xi/dew_temp rmse=9.918 crps=2.974 grad=0.61
+  [9/24] (done) stage3 manaus/phi_xi/dew_temp rmse=124.068 crps=8.522 grad=8956.91
+  [10/24] (done) stage3 salvador/phi_only/dew_temp rmse=12.685 crps=4.186 grad=0.42
+  [11/24] (done) stage3 bh/phi_xi/dew_temp rmse=10.149 crps=3.215 grad=0.08
+  [12/24] (done) stage3 salvador/phi_xi/dew_temp rmse=14.537 crps=4.305 grad=52890.47
+  [13/24] (done) stage4 cruzeiro/phi_xi/dew_temp rmse=39.678 crps=6.676 grad=46660.58
+  [14/24] (done) stage4 bh/phi_only/dew_temp rmse=10.163 crps=3.220 grad=0.59
+  [15/24] (done) stage4 garanhuns/phi_only/dew_temp rmse=9.882 crps=2.965 grad=0.06
+  [16/24] (done) stage4 manaus/phi_only/dew_temp rmse=17.545 crps=6.281 grad=1.02
+  [17/24] (done) stage4 darwin/phi_only/dew_temp rmse=15.220 crps=4.486 grad=2.50
+  [18/24] (done) stage4 salvador/phi_only/dew_temp rmse=12.637 crps=4.170 grad=0.39
+  [19/24] (done) stage4 cruzeiro/phi_only/dew_temp rmse=13.844 crps=5.646 grad=0.17
+  [20/24] (done) stage4 garanhuns/phi_xi/dew_temp rmse=10.108 crps=3.151 grad=42475.79
+  [21/24] (done) stage4 darwin/phi_xi/dew_temp rmse=nan crps=nan grad=81436.09
+  [22/24] (done) stage4 bh/phi_xi/dew_temp rmse=10.187 crps=3.235 grad=127350.59
+  [23/24] (done) stage4 manaus/phi_xi/dew_temp rmse=33.379 crps=7.943 grad=1897.23
+  [24/24] (done) stage4 salvador/phi_xi/dew_temp rmse=12.689 crps=4.192 grad=59.94
+[stage3+4 dew_temp (sigmoid phi_L)] done in 1188s  {'done': 23, 'skip': 1, 'err': 0}
+[stage4S dew_temp] 12 tasks on 16 workers
+  [1/12] (skip) stage4S bh/phi_only/dew_temp
+  [2/12] (done) stage4S manaus/phi_xi/dew_temp rmse=24.304 crps=7.186 grad=71241.88
+  [3/12] (done) stage4S cruzeiro/phi_xi/dew_temp rmse=17.050 crps=6.482 grad=101742.91
+  [4/12] (done) stage4S cruzeiro/phi_only/dew_temp rmse=13.874 crps=5.667 grad=20.89
+  [5/12] (done) stage4S darwin/phi_xi/dew_temp rmse=nan crps=nan grad=54518.23
+  [6/12] (done) stage4S garanhuns/phi_only/dew_temp rmse=9.851 crps=2.937 grad=0.13
+  [7/12] (done) stage4S darwin/phi_only/dew_temp rmse=15.065 crps=4.470 grad=52.44
+  [8/12] (done) stage4S manaus/phi_only/dew_temp rmse=17.489 crps=6.252 grad=0.14
+  [9/12] (done) stage4S salvador/phi_only/dew_temp rmse=12.643 crps=4.187 grad=68.72
+  [10/12] (done) stage4S garanhuns/phi_xi/dew_temp rmse=nan crps=nan grad=25815.11
+  [11/12] (done) stage4S salvador/phi_xi/dew_temp rmse=12.615 crps=4.171 grad=0.33
+  [12/12] (done) stage4S bh/phi_xi/dew_temp rmse=10.574 crps=3.262 grad=20.17
+[stage4S dew_temp] done in 1341s  {'done': 11, 'skip': 1, 'err': 0}
+
+All extra configs fitted.

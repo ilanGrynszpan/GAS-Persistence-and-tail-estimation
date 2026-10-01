@@ -58,6 +58,36 @@ def _sigmoid(x: float) -> float:
 
 
 @njit(cache=True)
+def _pi_link_terms(eta_t: float, pi_link: int):
+    """
+    Occurrence link: map the latent eta_t to (pi_t, log pi_t, log(1 - pi_t)).
+
+    pi_link == 0 : LOGISTIC (default, unchanged historical behaviour)
+        pi = sigma(eta) = 1 / (1 + exp(-eta))
+    pi_link == 1 : RECIPROCAL  (2026-09-10 request)
+        pi = 1 / (1 + eta)      -- eta acts like the "dry odds" (1-pi)/pi.
+        Requires eta > -1 for a valid probability; the value is clamped
+        into [1e-12, 1 - 1e-12] as a numerical safeguard (CLAUDE.md:
+        "use numerical safeguards rather than allowing invalid
+        evaluations"), so an eta that momentarily leaves the valid region
+        yields a finite, penalised-by-fit log-likelihood rather than a
+        NaN. eta itself is separately bounded by the eta-magnitude penalty
+        that every caller already applies.
+    """
+    if pi_link == 0:
+        return _sigmoid(eta_t), _log_sigmoid(eta_t), _log_sigmoid(-eta_t)
+    denom = 1.0 + eta_t
+    if denom < 1e-12:
+        denom = 1e-12
+    pi_t = 1.0 / denom
+    if pi_t < 1e-12:
+        pi_t = 1e-12
+    elif pi_t > 1.0 - 1e-12:
+        pi_t = 1.0 - 1e-12
+    return pi_t, math.log(pi_t), math.log(1.0 - pi_t)
+
+
+@njit(cache=True)
 def _betaln(a: float, b: float) -> float:
     return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
 
@@ -100,13 +130,26 @@ def _trigamma(x: float) -> float:
     figures for x > 0.  Asymptotic: A&S 6.4.12.
 
     Guard: ψ₁(0+) → +∞.  Return 1e308 to avoid ZeroDivisionError when
-    a = exp(xi) underflows to 0.0 during BFGS line search.
+    a = exp(xi) underflows to 0.0 during BFGS line search. The x <= 0.0
+    check alone is not sufficient: for x positive but smaller than
+    ~2.2e-162, x*x itself underflows to exactly 0.0 (float64's smallest
+    positive value is ~4.9e-324), so 1.0/(x*x) still raises even though
+    x > 0.0. Observed in practice (2026-08-31) once
+    HarveyZAGASModel(use_auxiliary_penalties=False) removed the |zeta|<20
+    static-magnitude clamp: an unbounded BFGS trial step can push zeta_s
+    (or xi_t) far enough that a=exp(xi) or a+b lands in this underflow
+    range. Since trigamma diverges to +inf as x->0+ regardless, treating
+    "too small to square accurately" the same as "x<=0.0" is mathematically
+    consistent, not merely a numerical patch.
     """
     if x <= 0.0:
         return 1.0e308
     result = 0.0
     while x < 6.0:
-        result += 1.0 / (x * x)
+        xx = x * x
+        if xx <= 0.0:
+            return 1.0e308
+        result += 1.0 / xx
         x += 1.0
     inv = 1.0 / x
     inv2 = inv * inv
@@ -249,6 +292,7 @@ def nb_filter_phi_only(
     pi_rho:     float,        # pi AR coefficient
     pi_wy:      np.ndarray,   # (n_pi_lags,) pi y-lag coefficients
     lags_pi:    np.ndarray,   # (n_pi_lags,)  int64
+    pi_link:    int,        # 0=logistic (default), 1=reciprocal pi=1/(1+eta)
     max_lag:    int,
     scaling:    int,          # 0=unit, 1=diag_FI (2=full_FI same for 1-param)
     lam_state:  float,        # penalty weight for large states
@@ -300,17 +344,17 @@ def nb_filter_phi_only(
         if excess_eta > 0.0:
             penalty += lam_eta * excess_eta * excess_eta
 
-        pi_t = _sigmoid(eta_t)
+        pi_t, _lpi_t, _l1mpi_t = _pi_link_terms(eta_t, pi_link)
         pi_arr[i] = pi_t
 
         # ── Log-likelihood ───────────────────────────────────────────────────
         if y[t] == 0.0:
-            loglik += _log_sigmoid(-eta_t)   # log(1 - pi_t)
+            loglik += _l1mpi_t   # log(1 - pi_t)
         else:
             ll_dist = _gb2_logpdf(y[t], phi_t, xi_s, gamma_s, zeta_s)
             if not math.isfinite(ll_dist):
                 return -1e12, penalty, f_arr, s_arr, eta_arr, pi_arr
-            ll_t = _log_sigmoid(eta_t) + ll_dist
+            ll_t = _lpi_t + ll_dist
             if not math.isfinite(ll_t):
                 return -1e12, penalty, f_arr, s_arr, eta_arr, pi_arr
             loglik += ll_t
@@ -371,6 +415,7 @@ def nb_filter_phi_xi(
     pi_rho:     float,
     pi_wy:      np.ndarray,
     lags_pi:    np.ndarray,
+    pi_link:    int,        # 0=logistic (default), 1=reciprocal pi=1/(1+eta)
     max_lag:    int,
     scaling:    int,
     lam_state:  float,
@@ -421,17 +466,17 @@ def nb_filter_phi_xi(
         if ex_eta > 0.0:
             penalty += lam_eta * ex_eta * ex_eta
 
-        pi_t = _sigmoid(eta_t)
+        pi_t, _lpi_t, _l1mpi_t = _pi_link_terms(eta_t, pi_link)
         pi_arr[i] = pi_t
 
         # ── Log-likelihood ───────────────────────────────────────────────────
         if y[t] == 0.0:
-            loglik += _log_sigmoid(-eta_t)
+            loglik += _l1mpi_t
         else:
             ll_dist = _gb2_logpdf(y[t], phi_t, xi_t, gamma_s, zeta_s)
             if not math.isfinite(ll_dist):
                 return -1e12, penalty, f_phi, f_xi, s_phi, s_xi, eta_arr, pi_arr
-            ll_t = _log_sigmoid(eta_t) + ll_dist
+            ll_t = _lpi_t + ll_dist
             if not math.isfinite(ll_t):
                 return -1e12, penalty, f_phi, f_xi, s_phi, s_xi, eta_arr, pi_arr
             loglik += ll_t
@@ -538,6 +583,7 @@ def nb_filter_phi_only_cov(
     pi_rho:     float,
     pi_wy:      np.ndarray,
     lags_pi:    np.ndarray,
+    pi_link:    int,        # 0=logistic (default), 1=reciprocal pi=1/(1+eta)
     max_lag:    int,
     scaling:    int,
     lam_state:  float,
@@ -587,16 +633,16 @@ def nb_filter_phi_only_cov(
         if excess_eta > 0.0:
             penalty += lam_eta * excess_eta * excess_eta
 
-        pi_t = _sigmoid(eta_t)
+        pi_t, _lpi_t, _l1mpi_t = _pi_link_terms(eta_t, pi_link)
         pi_arr[i] = pi_t
 
         if y[t] == 0.0:
-            loglik += _log_sigmoid(-eta_t)
+            loglik += _l1mpi_t
         else:
             ll_dist = _gb2_logpdf(y[t], phi_t, xi_s, gamma_s, zeta_s)
             if not math.isfinite(ll_dist):
                 return -1e12, penalty, f_arr, s_arr, eta_arr, pi_arr
-            ll_t = _log_sigmoid(eta_t) + ll_dist
+            ll_t = _lpi_t + ll_dist
             if not math.isfinite(ll_t):
                 return -1e12, penalty, f_arr, s_arr, eta_arr, pi_arr
             loglik += ll_t
@@ -651,6 +697,7 @@ def nb_filter_phi_xi_cov(
     pi_rho:     float,
     pi_wy:      np.ndarray,
     lags_pi:    np.ndarray,
+    pi_link:    int,        # 0=logistic (default), 1=reciprocal pi=1/(1+eta)
     max_lag:    int,
     scaling:    int,
     lam_state:  float,
@@ -706,16 +753,16 @@ def nb_filter_phi_xi_cov(
         if ex_eta > 0.0:
             penalty += lam_eta * ex_eta * ex_eta
 
-        pi_t = _sigmoid(eta_t)
+        pi_t, _lpi_t, _l1mpi_t = _pi_link_terms(eta_t, pi_link)
         pi_arr[i] = pi_t
 
         if y[t] == 0.0:
-            loglik += _log_sigmoid(-eta_t)
+            loglik += _l1mpi_t
         else:
             ll_dist = _gb2_logpdf(y[t], phi_t, xi_t, gamma_s, zeta_s)
             if not math.isfinite(ll_dist):
                 return -1e12, penalty, f_phi, f_xi, s_phi, s_xi, eta_arr, pi_arr
-            ll_t = _log_sigmoid(eta_t) + ll_dist
+            ll_t = _lpi_t + ll_dist
             if not math.isfinite(ll_t):
                 return -1e12, penalty, f_phi, f_xi, s_phi, s_xi, eta_arr, pi_arr
             loglik += ll_t
@@ -822,6 +869,7 @@ def nb_harvey_phi_only_filter(
     pi_rho:    float,
     pi_wy:     np.ndarray,   # (n_lpi,)
     lags_pi:   np.ndarray,   # (n_lpi,)
+    pi_link:    int,        # 0=logistic (default), 1=reciprocal pi=1/(1+eta)
     max_lag:   int,
     scaling:   int,
     lam_state: float,
@@ -830,27 +878,54 @@ def nb_harvey_phi_only_filter(
     eta_lim:   float,
     CL:        np.ndarray,   # (T,) X_long  @ gamma_L  (zeros if n_long==0)
     CS:        np.ndarray,   # (T,) X_short @ gamma_S  (zeros if n_short==0)
+    n_harmonics: int,        # 0 reproduces the exact previous behaviour
+    cos_h:     np.ndarray,   # (n_harmonics,) cos(2*pi*h/S), h=1..n_harmonics (empty if 0)
+    sin_h:     np.ndarray,   # (n_harmonics,) sin(2*pi*h/S)
+    kappa_gamma: float,      # seasonal score loading (models/harvey_gas.py's kappa_gamma_j)
+    seas0:     np.ndarray,   # (n_harmonics,) gamma_{1|0,h} -- free initial condition, empty if 0
+    seasstar0: np.ndarray,   # (n_harmonics,) gamma*_{1|0,h}
+    psi_gamma: float,        # rotation damping, 1.0 = undamped/pure rotation (models/harvey_gas.py's seasonal_damping_max)
 ) -> tuple:
-    """Harvey filter for φ-only ZA-GB2. Returns (loglik, penalty, L, S, s, eta, pi)."""
+    """
+    Harvey filter for φ-only ZA-GB2, with models/harvey_gas.py's optional
+    trigonometric seasonal component (see that module's docstring for the
+    full derivation -- this is the numba-accelerated mirror of its Python
+    fallback's identical recursion, verified bit-for-bit against it before
+    use). seas_h/seas*_h are seeded from seas0/seasstar0 (free parameters)
+    at the loop's first executed iteration and are purely local loop state
+    here, never returned.
+
+    Returns (loglik, penalty, L, S, s, eta, pi, Gamma_arr) -- Gamma_arr is
+    the per-t total seasonal contribution sum_h(seas_h), all zeros when
+    n_harmonics=0.
+    """
     T     = len(y)
     n_eff = T - max_lag
     n_lpi = len(lags_pi)
+    m     = n_harmonics
 
     L_arr   = np.zeros(T + 1)
     S_arr   = np.zeros(T + 1)
     s_arr   = np.zeros(T)
     eta_arr = np.zeros(n_eff)
     pi_arr  = np.zeros(n_eff)
+    Gamma_arr = np.zeros(T)
 
     L_arr[0] = L0
     S_arr[0] = S0
+    Gm     = seas0.copy()
+    GmStar = seasstar0.copy()
 
     loglik  = 0.0
     penalty = 0.0
 
     for t in range(max_lag, T):
         i     = t - max_lag
-        phi_t = omega + L_arr[t] + S_arr[t]
+        gamma_t = 0.0
+        if m > 0:
+            gamma_t = np.sum(Gm)
+            Gamma_arr[t] = gamma_t
+        phi_t = omega + L_arr[t] + S_arr[t] + gamma_t
 
         excess = abs(phi_t) - state_lim
         if excess > 0.0:
@@ -868,17 +943,18 @@ def nb_harvey_phi_only_filter(
         if ex_eta > 0.0:
             penalty += lam_eta * ex_eta * ex_eta
 
-        pi_arr[i] = _sigmoid(eta_t)
+        pi_t, _lpi_t, _l1mpi_t = _pi_link_terms(eta_t, pi_link)
+        pi_arr[i] = pi_t
 
         if y[t] == 0.0:
-            loglik += _log_sigmoid(-eta_t)
+            loglik += _l1mpi_t
         else:
             ll_dist = _gb2_logpdf(y[t], phi_t, xi_s, gamma_s, zeta_s)
             if not math.isfinite(ll_dist):
-                return -1e12, penalty, L_arr, S_arr, s_arr, eta_arr, pi_arr
-            ll_t = _log_sigmoid(eta_t) + ll_dist
+                return -1e12, penalty, L_arr, S_arr, s_arr, eta_arr, pi_arr, Gamma_arr
+            ll_t = _lpi_t + ll_dist
             if not math.isfinite(ll_t):
-                return -1e12, penalty, L_arr, S_arr, s_arr, eta_arr, pi_arr
+                return -1e12, penalty, L_arr, S_arr, s_arr, eta_arr, pi_arr, Gamma_arr
             loglik += ll_t
 
         s_t = 0.0
@@ -899,11 +975,28 @@ def nb_harvey_phi_only_filter(
         L_next = B_L * L_arr[t] + A_L * s_t + CL[t]
         S_next = B_S * S_arr[t] + A_S * s_t + CS[t]
         if not (math.isfinite(L_next) and math.isfinite(S_next)):
-            return -1e12, penalty, L_arr, S_arr, s_arr, eta_arr, pi_arr
+            return -1e12, penalty, L_arr, S_arr, s_arr, eta_arr, pi_arr, Gamma_arr
         L_arr[t + 1] = L_next
         S_arr[t + 1] = S_next
 
-    return loglik, penalty, L_arr, S_arr, s_arr, eta_arr, pi_arr
+        if m > 0:
+            # Trigonometric seasonal (models/harvey_gas.py's module
+            # docstring): SAME scalar score s_t drives every harmonic
+            # identically, only the rotation angle differs. psi_gamma
+            # damps the whole rotation each step (1.0 = undamped/pure
+            # rotation, the originally-specified model).
+            Gm_next     = psi_gamma * ( Gm * cos_h + GmStar * sin_h) + kappa_gamma * s_t
+            GmStar_next = psi_gamma * (-Gm * sin_h + GmStar * cos_h) + kappa_gamma * s_t
+            ok = True
+            for hh in range(m):
+                if not (math.isfinite(Gm_next[hh]) and math.isfinite(GmStar_next[hh])):
+                    ok = False
+            if not ok:
+                return -1e12, penalty, L_arr, S_arr, s_arr, eta_arr, pi_arr, Gamma_arr
+            Gm     = Gm_next
+            GmStar = GmStar_next
+
+    return loglik, penalty, L_arr, S_arr, s_arr, eta_arr, pi_arr, Gamma_arr
 
 
 @njit(cache=True)
@@ -929,6 +1022,7 @@ def nb_harvey_phi_xi_filter(
     pi_rho:     float,
     pi_wy:      np.ndarray,
     lags_pi:    np.ndarray,
+    pi_link:    int,        # 0=logistic (default), 1=reciprocal pi=1/(1+eta)
     max_lag:    int,
     scaling:    int,
     lam_state:  float,
@@ -939,11 +1033,32 @@ def nb_harvey_phi_xi_filter(
     CS_phi:     np.ndarray,   # (T,) X_short @ gamma_S_phi
     CL_xi:      np.ndarray,   # (T,) X_long  @ gamma_L_xi
     CS_xi:      np.ndarray,   # (T,) X_short @ gamma_S_xi
+    n_harmonics: int,         # 0 reproduces the exact previous behaviour
+    cos_h:      np.ndarray,   # (n_harmonics,) cos(2*pi*h/S)
+    sin_h:      np.ndarray,   # (n_harmonics,) sin(2*pi*h/S)
+    kappa_gamma_phi: float,
+    kappa_gamma_xi:  float,
+    seas0_phi:     np.ndarray,  # (n_harmonics,) gamma_{1|0,h} for phi -- free init, empty if 0
+    seasstar0_phi: np.ndarray,
+    seas0_xi:      np.ndarray,  # same, for xi
+    seasstar0_xi:  np.ndarray,
+    psi_gamma_phi: float,       # rotation damping for phi, 1.0 = undamped/pure rotation
+    psi_gamma_xi:  float,       # rotation damping for xi
 ) -> tuple:
-    """Harvey filter for φ+ξ ZA-GB2. Returns (loglik, penalty, Lphi, Sphi, Lxi, Sxi, sphi, sxi, eta, pi)."""
+    """
+    Harvey filter for φ+ξ ZA-GB2, with the same optional trigonometric
+    seasonal component as nb_harvey_phi_only_filter (see that function's
+    docstring) -- one independent seasonal state pair per dynamic
+    parameter (phi, xi), each with its own kappa_gamma and its own free
+    initial condition.
+
+    Returns (loglik, penalty, Lphi, Sphi, Lxi, Sxi, sphi, sxi, eta, pi,
+    Gamma_arr_phi, Gamma_arr_xi).
+    """
     T     = len(y)
     n_eff = T - max_lag
     n_lpi = len(lags_pi)
+    m     = n_harmonics
 
     L_phi   = np.zeros(T + 1)
     S_phi   = np.zeros(T + 1)
@@ -953,17 +1068,28 @@ def nb_harvey_phi_xi_filter(
     s_xi    = np.zeros(T)
     eta_arr = np.zeros(n_eff)
     pi_arr  = np.zeros(n_eff)
+    Gamma_arr_phi = np.zeros(T)
+    Gamma_arr_xi  = np.zeros(T)
 
     L_phi[0] = L0_phi;  S_phi[0] = S0_phi
     L_xi[0]  = L0_xi;   S_xi[0]  = S0_xi
+    Gm_phi     = seas0_phi.copy(); GmStar_phi = seasstar0_phi.copy()
+    Gm_xi      = seas0_xi.copy();  GmStar_xi  = seasstar0_xi.copy()
 
     loglik  = 0.0
     penalty = 0.0
 
     for t in range(max_lag, T):
         i     = t - max_lag
-        phi_t = omega_phi + L_phi[t] + S_phi[t]
-        xi_t  = omega_xi  + L_xi[t]  + S_xi[t]
+        gamma_t_phi = 0.0
+        gamma_t_xi  = 0.0
+        if m > 0:
+            gamma_t_phi = np.sum(Gm_phi)
+            gamma_t_xi  = np.sum(Gm_xi)
+            Gamma_arr_phi[t] = gamma_t_phi
+            Gamma_arr_xi[t]  = gamma_t_xi
+        phi_t = omega_phi + L_phi[t] + S_phi[t] + gamma_t_phi
+        xi_t  = omega_xi  + L_xi[t]  + S_xi[t]  + gamma_t_xi
 
         for fval in (phi_t, xi_t):
             ex = abs(fval) - state_lim
@@ -982,17 +1108,18 @@ def nb_harvey_phi_xi_filter(
         if ex_eta > 0.0:
             penalty += lam_eta * ex_eta * ex_eta
 
-        pi_arr[i] = _sigmoid(eta_t)
+        pi_t, _lpi_t, _l1mpi_t = _pi_link_terms(eta_t, pi_link)
+        pi_arr[i] = pi_t
 
         if y[t] == 0.0:
-            loglik += _log_sigmoid(-eta_t)
+            loglik += _l1mpi_t
         else:
             ll_dist = _gb2_logpdf(y[t], phi_t, xi_t, gamma_s, zeta_s)
             if not math.isfinite(ll_dist):
-                return -1e12, penalty, L_phi, S_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr
-            ll_t = _log_sigmoid(eta_t) + ll_dist
+                return -1e12, penalty, L_phi, S_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_phi, Gamma_arr_xi
+            ll_t = _lpi_t + ll_dist
             if not math.isfinite(ll_t):
-                return -1e12, penalty, L_phi, S_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr
+                return -1e12, penalty, L_phi, S_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_phi, Gamma_arr_xi
             loglik += ll_t
 
         sp_phi = 0.0
@@ -1036,14 +1163,204 @@ def nb_harvey_phi_xi_filter(
 
         if not (math.isfinite(L_phi_next) and math.isfinite(S_phi_next)
                 and math.isfinite(L_xi_next) and math.isfinite(S_xi_next)):
-            return -1e12, penalty, L_phi, S_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr
+            return -1e12, penalty, L_phi, S_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_phi, Gamma_arr_xi
 
         L_phi[t + 1] = L_phi_next
         S_phi[t + 1] = S_phi_next
         L_xi[t + 1]  = L_xi_next
         S_xi[t + 1]  = S_xi_next
 
-    return loglik, penalty, L_phi, S_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr
+        if m > 0:
+            Gm_phi_next     = psi_gamma_phi * ( Gm_phi * cos_h + GmStar_phi * sin_h) + kappa_gamma_phi * sp_phi
+            GmStar_phi_next = psi_gamma_phi * (-Gm_phi * sin_h + GmStar_phi * cos_h) + kappa_gamma_phi * sp_phi
+            Gm_xi_next      = psi_gamma_xi  * ( Gm_xi  * cos_h + GmStar_xi  * sin_h) + kappa_gamma_xi  * sp_xi
+            GmStar_xi_next  = psi_gamma_xi  * (-Gm_xi  * sin_h + GmStar_xi  * cos_h) + kappa_gamma_xi  * sp_xi
+            ok = True
+            for hh in range(m):
+                if not (math.isfinite(Gm_phi_next[hh]) and math.isfinite(GmStar_phi_next[hh])
+                        and math.isfinite(Gm_xi_next[hh]) and math.isfinite(GmStar_xi_next[hh])):
+                    ok = False
+            if not ok:
+                return -1e12, penalty, L_phi, S_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_phi, Gamma_arr_xi
+            Gm_phi, GmStar_phi = Gm_phi_next, GmStar_phi_next
+            Gm_xi,  GmStar_xi  = Gm_xi_next,  GmStar_xi_next
+
+    return loglik, penalty, L_phi, S_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_phi, Gamma_arr_xi
+
+
+@njit(cache=True)
+def nb_gas1phi_harveyxi_filter(
+    y:          np.ndarray,
+    omega_phi:  float,   # plain GAS(1,1) for phi: phi_{t+1} = omega + A*s_t + B*phi_t
+    G0_phi:     float,
+    A_phi:      float,
+    B_phi:      float,
+    omega_xi:   float,   # Harvey long+short (or structural, when the long
+    L0_xi:      float,   # inputs below are all zero) for xi, same as
+    S0_xi:      float,   # nb_harvey_phi_xi_filter's xi block.
+    A_L_xi:     float,
+    B_L_xi:     float,
+    A_S_xi:     float,
+    B_S_xi:     float,
+    gamma_s:    float,
+    zeta_s:     float,
+    pi_omega0:  float,
+    pi_rho:     float,
+    pi_wy:      np.ndarray,
+    lags_pi:    np.ndarray,
+    pi_link:    int,
+    max_lag:    int,
+    scaling:    int,
+    lam_state:  float,
+    state_lim:  float,
+    lam_eta:    float,
+    eta_lim:    float,
+    CL_xi:      np.ndarray,   # (T,) X_long  @ gamma_L_xi
+    CS_xi:      np.ndarray,   # (T,) X_short @ gamma_S_xi
+    n_harmonics: int,
+    cos_h:      np.ndarray,
+    sin_h:      np.ndarray,
+    kappa_gamma_xi: float,
+    seas0_xi:      np.ndarray,
+    seasstar0_xi:  np.ndarray,
+    psi_gamma_xi:  float,
+) -> tuple:
+    """
+    Hybrid filter (2026-09-11, direct user request): phi follows a PLAIN
+    GAS(1,1) recursion (no covariates, no long/short, no seasonal harmonic
+    -- HarveyZAGASModel's gas1_target), xi keeps the full Harvey treatment
+    (long+short, or structural when the long-block inputs are zeroed,
+    optionally with the trigonometric seasonal harmonic) -- identical xi
+    block to nb_harvey_phi_xi_filter, just with phi's L/S pair replaced by
+    a single plain-GAS state G_phi. Static/decoded-parameter penalties
+    (persistence limits, score-amplitude, covariate-norm) are computed in
+    Python BEFORE this kernel is called (see _run_filter's `penalty`
+    argument to _nb_harvey_dispatch) -- this kernel only accumulates the
+    PATH-DEPENDENT penalties (state/eta explosion), exactly like every
+    other nb_harvey_* kernel.
+
+    Returns (loglik, penalty, G_phi, L_xi, S_xi, s_phi, s_xi, eta, pi, Gamma_arr_xi).
+    """
+    T     = len(y)
+    n_eff = T - max_lag
+    n_lpi = len(lags_pi)
+    m     = n_harmonics
+
+    G_phi   = np.zeros(T + 1)
+    L_xi    = np.zeros(T + 1)
+    S_xi    = np.zeros(T + 1)
+    s_phi   = np.zeros(T)
+    s_xi    = np.zeros(T)
+    eta_arr = np.zeros(n_eff)
+    pi_arr  = np.zeros(n_eff)
+    Gamma_arr_xi = np.zeros(T)
+
+    G_phi[0] = G0_phi
+    L_xi[0]  = L0_xi
+    S_xi[0]  = S0_xi
+    Gm_xi     = seas0_xi.copy()
+    GmStar_xi = seasstar0_xi.copy()
+
+    loglik  = 0.0
+    penalty = 0.0
+
+    for t in range(max_lag, T):
+        i = t - max_lag
+        gamma_t_xi = 0.0
+        if m > 0:
+            gamma_t_xi = np.sum(Gm_xi)
+            Gamma_arr_xi[t] = gamma_t_xi
+        phi_t = G_phi[t]
+        xi_t  = omega_xi + L_xi[t] + S_xi[t] + gamma_t_xi
+
+        for fval in (phi_t, xi_t):
+            ex = abs(fval) - state_lim
+            if ex > 0.0:
+                penalty += lam_state * ex * ex
+
+        eta_prev = eta_arr[i - 1] if i > 0 else 0.0
+        eta_t    = pi_omega0 + pi_rho * eta_prev
+        for k in range(n_lpi):
+            t_lag = t - lags_pi[k]
+            y_lag = y[t_lag] if t_lag >= 0 else 0.0
+            eta_t += pi_wy[k] * y_lag
+        eta_arr[i] = eta_t
+
+        ex_eta = abs(eta_t) - eta_lim
+        if ex_eta > 0.0:
+            penalty += lam_eta * ex_eta * ex_eta
+
+        pi_t, _lpi_t, _l1mpi_t = _pi_link_terms(eta_t, pi_link)
+        pi_arr[i] = pi_t
+
+        if y[t] == 0.0:
+            loglik += _l1mpi_t
+        else:
+            ll_dist = _gb2_logpdf(y[t], phi_t, xi_t, gamma_s, zeta_s)
+            if not math.isfinite(ll_dist):
+                return -1e12, penalty, G_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_xi
+            ll_t = _lpi_t + ll_dist
+            if not math.isfinite(ll_t):
+                return -1e12, penalty, G_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_xi
+            loglik += ll_t
+
+        sp_phi = 0.0
+        sp_xi  = 0.0
+        if y[t] > 0.0:
+            raw_phi = _gb2_score_phi(y[t], phi_t, xi_t, gamma_s, zeta_s)
+            raw_xi  = _gb2_score_xi( y[t], phi_t, xi_t, gamma_s, zeta_s)
+
+            if scaling == 0:
+                sp_phi = raw_phi
+                sp_xi  = raw_xi
+            elif scaling == 1:
+                fi_p = _gb2_fi_phi(xi_t, gamma_s, zeta_s)
+                fi_x = _gb2_fi_xi( xi_t, zeta_s)
+                sp_phi = raw_phi / fi_p if (fi_p > 0.0 and math.isfinite(fi_p)) else raw_phi
+                sp_xi  = raw_xi  / fi_x if (fi_x > 0.0 and math.isfinite(fi_x)) else raw_xi
+                if not math.isfinite(sp_phi): sp_phi = raw_phi
+                if not math.isfinite(sp_xi):  sp_xi  = raw_xi
+            else:
+                fi_pp = _gb2_fi_phi(xi_t, gamma_s, zeta_s)
+                fi_xx = _gb2_fi_xi( xi_t, zeta_s)
+                fi_px = _gb2_fi_cross(xi_t, gamma_s, zeta_s)
+                det   = fi_pp * fi_xx - fi_px * fi_px
+                if det > 1e-12 and math.isfinite(det):
+                    sp_phi = ( fi_xx * raw_phi - fi_px * raw_xi) / det
+                    sp_xi  = (-fi_px * raw_phi + fi_pp * raw_xi) / det
+                    if not (math.isfinite(sp_phi) and math.isfinite(sp_xi)):
+                        sp_phi = raw_phi / fi_pp if fi_pp > 0 else raw_phi
+                        sp_xi  = raw_xi  / fi_xx if fi_xx > 0 else raw_xi
+                else:
+                    sp_phi = raw_phi
+                    sp_xi  = raw_xi
+
+        s_phi[t] = sp_phi
+        s_xi[t]  = sp_xi
+
+        G_phi_next = omega_phi + A_phi * sp_phi + B_phi * G_phi[t]
+        L_xi_next  = B_L_xi * L_xi[t] + A_L_xi * sp_xi + CL_xi[t]
+        S_xi_next  = B_S_xi * S_xi[t] + A_S_xi * sp_xi + CS_xi[t]
+
+        if not (math.isfinite(G_phi_next) and math.isfinite(L_xi_next) and math.isfinite(S_xi_next)):
+            return -1e12, penalty, G_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_xi
+
+        G_phi[t + 1] = G_phi_next
+        L_xi[t + 1]  = L_xi_next
+        S_xi[t + 1]  = S_xi_next
+
+        if m > 0:
+            Gm_xi_next     = psi_gamma_xi * ( Gm_xi * cos_h + GmStar_xi * sin_h) + kappa_gamma_xi * sp_xi
+            GmStar_xi_next = psi_gamma_xi * (-Gm_xi * sin_h + GmStar_xi * cos_h) + kappa_gamma_xi * sp_xi
+            ok = True
+            for hh in range(m):
+                if not (math.isfinite(Gm_xi_next[hh]) and math.isfinite(GmStar_xi_next[hh])):
+                    ok = False
+            if not ok:
+                return -1e12, penalty, G_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_xi
+            Gm_xi, GmStar_xi = Gm_xi_next, GmStar_xi_next
+
+    return loglik, penalty, G_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_xi
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1082,7 +1399,7 @@ def _warmup():
             xi_s=0.0, gamma_s=0.2, zeta_s=1.5,
             pi_omega0=0.0, pi_rho=0.3,
             pi_wy=np.zeros(n_pl),
-            lags_pi=pi_lags,
+            lags_pi=pi_lags, pi_link=0,
             max_lag=ml,
             scaling=0,
             lam_state=1e3, state_lim=15.0,
@@ -1100,7 +1417,7 @@ def _warmup():
             gamma_s=0.2, zeta_s=1.5,
             pi_omega0=0.0, pi_rho=0.3,
             pi_wy=np.zeros(n_pl),
-            lags_pi=pi_lags,
+            lags_pi=pi_lags, pi_link=0,
             max_lag=ml,
             scaling=0,
             lam_state=1e3, state_lim=15.0,
@@ -1118,7 +1435,7 @@ def _warmup():
             xi_s=0.0, gamma_s=0.2, zeta_s=1.5,
             pi_omega0=0.0, pi_rho=0.3,
             pi_wy=np.zeros(n_pl),
-            lags_pi=pi_lags,
+            lags_pi=pi_lags, pi_link=0,
             max_lag=ml,
             scaling=0,
             lam_state=1e3, state_lim=15.0,
@@ -1137,7 +1454,7 @@ def _warmup():
             gamma_s=0.2, zeta_s=1.5,
             pi_omega0=0.0, pi_rho=0.3,
             pi_wy=np.zeros(n_pl),
-            lags_pi=pi_lags,
+            lags_pi=pi_lags, pi_link=0,
             max_lag=ml,
             scaling=0,
             lam_state=1e3, state_lim=15.0,
@@ -1147,37 +1464,152 @@ def _warmup():
         )
 
     # Harvey phi-only (no GAS lag array — lag structure is scalar B_L/B_S)
-    nb_harvey_phi_only_filter(
-        y_dummy,
-        omega=0.0, L0=0.0, A_L=0.01, B_L=0.95, S0=0.0, A_S=0.05, B_S=0.5,
-        xi_s=0.0, gamma_s=0.2, zeta_s=1.5,
-        pi_omega0=0.0, pi_rho=0.3,
-        pi_wy=np.zeros(n_pl),
-        lags_pi=pi_lags,
-        max_lag=ml,
-        scaling=1,
-        lam_state=1e3, state_lim=15.0,
-        lam_eta=1e2,   eta_lim=30.0,
-        CL=C_dummy, CS=C_dummy,
-    )
+    # -- both the no-seasonal (n_harmonics=0) and seasonal (n_harmonics=3,
+    # a representative small m) signatures are pre-compiled here so a
+    # real harmonic-seasonal fit's FIRST call is not the one paying numba's
+    # 5-20s JIT compilation cost.
+    no_h = (0, np.zeros(0), np.zeros(0))
+    h3   = (3, np.cos(2 * np.pi * np.arange(1, 4) / 365.25), np.sin(2 * np.pi * np.arange(1, 4) / 365.25))
+    for n_harmonics, cos_h, sin_h in (no_h, h3):
+        nb_harvey_phi_only_filter(
+            y_dummy,
+            omega=0.0, L0=0.0, A_L=0.01, B_L=0.95, S0=0.0, A_S=0.05, B_S=0.5,
+            xi_s=0.0, gamma_s=0.2, zeta_s=1.5,
+            pi_omega0=0.0, pi_rho=0.3,
+            pi_wy=np.zeros(n_pl),
+            lags_pi=pi_lags, pi_link=0,
+            max_lag=ml,
+            scaling=1,
+            lam_state=1e3, state_lim=15.0,
+            lam_eta=1e2,   eta_lim=30.0,
+            CL=C_dummy, CS=C_dummy,
+            n_harmonics=n_harmonics, cos_h=cos_h, sin_h=sin_h, kappa_gamma=0.05,
+            seas0=np.zeros(n_harmonics), seasstar0=np.zeros(n_harmonics), psi_gamma=0.999,
+        )
 
-    # Harvey phi+xi
-    nb_harvey_phi_xi_filter(
-        y_dummy,
-        omega_phi=0.0, omega_xi=0.0,
-        L0_phi=0.0, S0_phi=0.0, A_L_phi=0.01, B_L_phi=0.95, A_S_phi=0.05, B_S_phi=0.5,
-        L0_xi=0.0,  S0_xi=0.0,  A_L_xi=0.01,  B_L_xi=0.95,  A_S_xi=0.05,  B_S_xi=0.5,
-        gamma_s=0.2, zeta_s=1.5,
-        pi_omega0=0.0, pi_rho=0.3,
-        pi_wy=np.zeros(n_pl),
-        lags_pi=pi_lags,
-        max_lag=ml,
-        scaling=1,
-        lam_state=1e3, state_lim=15.0,
-        lam_eta=1e2,   eta_lim=30.0,
-        CL_phi=C_dummy, CS_phi=C_dummy,
-        CL_xi=C_dummy,  CS_xi=C_dummy,
-    )
+        # Harvey phi+xi
+        nb_harvey_phi_xi_filter(
+            y_dummy,
+            omega_phi=0.0, omega_xi=0.0,
+            L0_phi=0.0, S0_phi=0.0, A_L_phi=0.01, B_L_phi=0.95, A_S_phi=0.05, B_S_phi=0.5,
+            L0_xi=0.0,  S0_xi=0.0,  A_L_xi=0.01,  B_L_xi=0.95,  A_S_xi=0.05,  B_S_xi=0.5,
+            gamma_s=0.2, zeta_s=1.5,
+            pi_omega0=0.0, pi_rho=0.3,
+            pi_wy=np.zeros(n_pl),
+            lags_pi=pi_lags, pi_link=0,
+            max_lag=ml,
+            scaling=1,
+            lam_state=1e3, state_lim=15.0,
+            lam_eta=1e2,   eta_lim=30.0,
+            CL_phi=C_dummy, CS_phi=C_dummy,
+            CL_xi=C_dummy,  CS_xi=C_dummy,
+            n_harmonics=n_harmonics, cos_h=cos_h, sin_h=sin_h,
+            kappa_gamma_phi=0.05, kappa_gamma_xi=0.05,
+            seas0_phi=np.zeros(n_harmonics), seasstar0_phi=np.zeros(n_harmonics),
+            seas0_xi=np.zeros(n_harmonics), seasstar0_xi=np.zeros(n_harmonics),
+            psi_gamma_phi=0.999, psi_gamma_xi=0.999,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regime-sensitive xi-only filter (models.regime_gas.RegimeXiOnlyModel)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# phi_t/pi_t are frozen, precomputed arrays (not part of theta) -- only xi's
+# own GAS(1,1) recursion is estimated here, with a threshold-sensitive score
+# loading A_eff = A + A_ext*1(y_t > threshold_c). This mirrors
+# RegimeXiOnlyModel._run_filter exactly (2026-09-06: that method previously
+# ran a pure-Python loop -- ~50x slower, per the class's own historical
+# comment -- solely because nobody had extended this module's existing
+# numba-safe GB2 score/Fisher building blocks to include the regime branch;
+# the branch itself is a plain data-dependent indicator, fully numba-safe).
+# Penalty terms (persistence/score/covariate-norm bounds, which depend only
+# on theta, and the state-excess bound, which is a cheap vectorized numpy
+# op on the returned xi_arr) are computed in Python by the caller, exactly
+# as this module's convention already is for every other filter here.
+
+@njit(cache=True)
+def nb_regime_xi_only_filter(
+    y:            np.ndarray,   # (T,) full series
+    phi_full:     np.ndarray,   # (T,) frozen, aligned phi path
+    pi_full:      np.ndarray,   # (T,) frozen, aligned pi path
+    X:            np.ndarray,   # (T, n_cov) xi covariates (nan-safe)
+    gamma_v:      float,
+    zeta_v:       float,
+    eff:          int,          # recursion start index
+    f0:           float,
+    omega:        float,
+    A:            float,
+    B:            float,
+    A_ext:        float,
+    gamma_cov:    np.ndarray,   # (n_cov,)
+    threshold_c:  float,
+    scaling:      int,          # 0 = unit, 1 = diagonal_inverse_fisher
+) -> tuple:
+    """
+    Returns (loglik, xi_arr, s_arr). loglik = -1e12 on numerical failure
+    (matching every other filter in this module's failure convention).
+    """
+    T      = len(y)
+    n_cov  = X.shape[1]
+    xi_arr = np.zeros(T + 1)
+    s_arr  = np.zeros(T)
+    for k in range(eff + 1):
+        xi_arr[k] = f0
+
+    loglik = 0.0
+
+    for t in range(eff, T):
+        phi_t = phi_full[t]
+        if not math.isfinite(phi_t):
+            return -1e12, xi_arr, s_arr
+        xi_t = xi_arr[t]
+
+        pi_t = pi_full[t]
+        if pi_t < 1e-12:
+            pi_t = 1e-12
+        elif pi_t > 1.0 - 1e-12:
+            pi_t = 1.0 - 1e-12
+
+        if y[t] == 0.0:
+            ll_t = math.log(1.0 - pi_t)
+        else:
+            ll_dist = _gb2_logpdf(y[t], phi_t, xi_t, gamma_v, zeta_v)
+            if not math.isfinite(ll_dist):
+                return -1e12, xi_arr, s_arr
+            ll_t = math.log(pi_t) + ll_dist
+        if not math.isfinite(ll_t):
+            return -1e12, xi_arr, s_arr
+        loglik += ll_t
+
+        s_t = 0.0
+        if y[t] > 0.0:
+            s_raw = _gb2_score_xi(y[t], phi_t, xi_t, gamma_v, zeta_v)
+            if scaling == 1:
+                fi = _gb2_fi_xi(xi_t, zeta_v)
+                if fi > 1e-8 and math.isfinite(fi):
+                    s_t = s_raw / fi
+                    if not math.isfinite(s_t):
+                        s_t = s_raw
+                else:
+                    s_t = s_raw
+            else:
+                s_t = s_raw
+            if not math.isfinite(s_t):
+                return -1e12, xi_arr, s_arr
+        s_arr[t] = s_t
+
+        regime_t = 1.0 if y[t] > threshold_c else 0.0
+        A_eff = A + A_ext * regime_t
+        cov_term = 0.0
+        for k in range(n_cov):
+            cov_term += gamma_cov[k] * X[t, k]
+        xi_next = omega + A_eff * s_t + B * xi_t + cov_term
+        if not math.isfinite(xi_next):
+            return -1e12, xi_arr, s_arr
+        xi_arr[t + 1] = xi_next
+
+    return loglik, xi_arr, s_arr
 
 
 _warmup()

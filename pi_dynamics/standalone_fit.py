@@ -37,6 +37,11 @@ IMPLEMENTATION NOTES
   guards its own seasonal lags (y_full[t-l] if t-l>=0 else 0.0), so the
   recursion is well-defined for every t from 0, unlike a GAS filter's
   positive-part recursion which needs a max_lag warm-up window.
+* The exact scalar objective minimised here is exposed as the public name
+  ``standalone_neg_loglik(theta, pi_dyn, y, seasonal)`` so that callers can
+  evaluate it at the fitted optimum for an independent gradient / Hessian
+  check (e.g. diagnostics/numerical_diff.numerical_gradient_checked) without
+  reaching into a private function. Nothing else in the fit changes.
 """
 
 from __future__ import annotations
@@ -75,6 +80,13 @@ def _neg_loglik(theta: np.ndarray, pi_dyn: PiDynamics, y: np.ndarray, seasonal: 
     if not np.isfinite(ll):
         return 1e12 + penalty
     return -ll + penalty
+
+
+# Public alias: the exact objective minimised by fit_pi_dynamics_standalone
+# (negative pi-only Bernoulli log-likelihood + the same eta-magnitude soft
+# penalty used by models/za_gas_model.py). Signature matches _neg_loglik:
+# standalone_neg_loglik(theta, pi_dyn, y, seasonal) -> float.
+standalone_neg_loglik = _neg_loglik
 
 
 def fit_pi_dynamics_standalone(

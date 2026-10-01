@@ -40,7 +40,7 @@ MATHEMATICAL / METHODOLOGICAL NOTES
 =============================================================================
 "Near its soft-penalty boundary" = the fitted value (or, for grouped
 constraints, the group aggregate -- a lag-sum, a covariate-vector L2 norm,
-or Harvey's B_S-vs-B_L relative persistence check) is within 10% of the
+or Harvey's phi_S-vs-phi_L relative persistence check) is within 10% of the
 threshold that model's own _run_filter penalizes, mirroring the exact
 "near_limit" convention already computed and saved by ZAGASModel.fit() /
 CovZAGASModel.fit() (models/za_gas_model.py, models/cov_gas_model.py) --
@@ -81,7 +81,7 @@ _load_boundary_flags()      -- per (location, stage, branch): near-limit
     v
 _stage_narrative(stage)     -- for each of the 4 stages, compute the specific
                                 counts/fractions the write-up below cites
-                                (e.g. "B_L_phi near its ceiling at 6/6
+                                (e.g. "phi_L_phi near its ceiling at 6/6
                                 locations"), so the numbers stay correct if
                                 the underlying artifacts ever change.
     |
@@ -200,10 +200,10 @@ def _near_limit_tags(stage: int, branch: str, meta: dict, params: Dict[str, floa
     Stage 3/4: HarveyZAGASModel.fit()/RegimeXiOnlyModel.fit() (models/
     harvey_gas.py, models/regime_gas.py) do not save this field, so it is
     computed here from estimated_parameters.csv using those two models' own
-    penalty thresholds (A/B individual bounds 2.0/0.98, Harvey B_L ceiling
-    0.995, Harvey's relative 0 < B_S < B_L restriction, covariate-vector L2
-    norm bound 20) -- a deterministic read of already-saved point estimates,
-    not a re-fit.
+    penalty thresholds (kappa/phi individual bounds 2.0/0.98, Harvey phi_L
+    ceiling 0.995, Harvey's relative 0 < phi_S < phi_L restriction,
+    covariate-vector L2 norm bound 20) -- a deterministic read of
+    already-saved point estimates, not a re-fit.
     """
     tags: List[str] = []
     bd = meta.get("bound_diagnostics")
@@ -215,24 +215,24 @@ def _near_limit_tags(stage: int, branch: str, meta: dict, params: Dict[str, floa
 
     if stage == 3:
         for j in ("phi", "xi"):
-            if f"A_L_{j}" not in params:
+            if f"kappa_L_{j}" not in params:
                 continue
-            A_L, B_L = params[f"A_L_{j}"], params[f"B_L_{j}"]
-            A_S, B_S = params[f"A_S_{j}"], params[f"B_S_{j}"]
-            if abs(A_L) > _MARGIN * 2.0:
-                tags.append(f"A_L_{j}")
-            if B_L > _MARGIN * 0.995 or B_L < (1 - _MARGIN) * 0.995:
-                tags.append(f"B_L_{j}")
-            if abs(A_S) > _MARGIN * 2.0:
-                tags.append(f"A_S_{j}")
-            if B_S > _MARGIN * B_L:
-                tags.append(f"B_S_{j}_vs_B_L")
-            gl = [v for k, v in params.items() if k.startswith(f"gamma_L_{j}_")]
-            gs = [v for k, v in params.items() if k.startswith(f"gamma_S_{j}_")]
+            kappa_L, phi_L = params[f"kappa_L_{j}"], params[f"phi_L_{j}"]
+            kappa_S, phi_S = params[f"kappa_S_{j}"], params[f"phi_S_{j}"]
+            if abs(kappa_L) > _MARGIN * 2.0:
+                tags.append(f"kappa_L_{j}")
+            if phi_L > _MARGIN * 0.995 or phi_L < (1 - _MARGIN) * 0.995:
+                tags.append(f"phi_L_{j}")
+            if abs(kappa_S) > _MARGIN * 2.0:
+                tags.append(f"kappa_S_{j}")
+            if phi_S > _MARGIN * phi_L:
+                tags.append(f"phi_S_{j}_vs_phi_L")
+            gl = [v for k, v in params.items() if k.startswith(f"Gamma_L_{j}_")]
+            gs = [v for k, v in params.items() if k.startswith(f"Gamma_S_{j}_")]
             if gl and np.linalg.norm(gl) > _MARGIN * 20:
-                tags.append(f"gamma_L_{j}_norm")
+                tags.append(f"Gamma_L_{j}_norm")
             if gs and np.linalg.norm(gs) > _MARGIN * 20:
-                tags.append(f"gamma_S_{j}_norm")
+                tags.append(f"Gamma_S_{j}_norm")
         if "rho" in params and abs(params["rho"]) > _MARGIN * 0.98:
             tags.append("rho")
         for s in ("gamma", "zeta", "xi"):
@@ -449,7 +449,7 @@ of the weather signal sitting in the most recent reading.
     grad3p = grad_stats(3, "phi_only")
     bh_grad = grad3x[grad3x["display"] == "Belo Horizonte"]["grad_norm_inf"].iloc[0]
     other_grads = grad3x[grad3x["display"] != "Belo Horizonte"]
-    z_enso = big[(big["stage"] == 3) & big["parameter"].str.match(r"gamma_L_(phi|xi)_(el_nino|la_nina)_t$")]
+    z_enso = big[(big["stage"] == 3) & big["parameter"].str.match(r"Gamma_L_(phi|xi)_(el_nino|la_nina)_t$")]
     n_enso_loc = z_enso["display"].nunique()
     n_enso_zero = int(z_enso.groupby("display")["ci_includes_zero"].any().sum())
     dead = big[big["class"] == "harvey_dead"]
@@ -458,12 +458,12 @@ of the weather signal sitting in the most recent reading.
 \section{{{STAGE_NAME[3]}}}
 
 \subsection*{{Boundary proximity and a linked optimizer-instability finding}}
-The Harvey long-component persistence $B_{{L,\phi}}$ is within 10\% of its
-0.995 ceiling at \textbf{{{c3x['B_L_phi']}/{n_loc} locations in both
-branches}} ({c3p['B_L_phi']}/{n_loc} phi-only) -- the long-run climate-scale
-component is essentially always estimated as near-unit-root. $B_{{L,\xi}}$
-and the relative check $B_{{S,\xi}}$-vs-$B_{{L,\xi}}$ follow at
-{c3x['B_L_xi']}/{n_loc} and {c3x['B_S_xi_vs_B_L']}/{n_loc} locations
+The Harvey long-component persistence $\phi_{{L,\phi}}$ is within 10\% of its
+0.995 ceiling at \textbf{{{c3x['phi_L_phi']}/{n_loc} locations in both
+branches}} ({c3p['phi_L_phi']}/{n_loc} phi-only) -- the long-run climate-scale
+component is essentially always estimated as near-unit-root. $\phi_{{L,\xi}}$
+and the relative check $\phi_{{S,\xi}}$-vs-$\phi_{{L,\xi}}$ follow at
+{c3x['phi_L_xi']}/{n_loc} and {c3x['phi_S_xi_vs_phi_L']}/{n_loc} locations
 respectively (all except Belo Horizonte).
 
 This boundary-pinning is \textbf{{not benign}} at most locations. Comparing
@@ -481,7 +481,7 @@ Belo Horizonte is the only location where the fit converged in the usual
 sense (gradient norm $\approx${bh_grad:.3f} after 106 iterations); the other
 five terminated after only 2-25 iterations with residual gradient norms of
 $10^4$-$10^6$ -- consistent with a flat/ridge-like objective near the
-$B_L\to1$ boundary that BFGS cannot resolve. The pipeline's post-fit
+$\phi_L\to1$ boundary that BFGS cannot resolve. The pipeline's post-fit
 classifier labels \emph{{all}} of these \texttt{{valid\_with\_warning}}
 (the same label given to Belo Horizonte's clean fit), since it only checks
 finiteness once \texttt{{scipy.success=False}}, not gradient magnitude --
@@ -490,8 +490,8 @@ acceptable or only mildly elevated'' clause is not actually being enforced
 here). Standard errors and CIs for the five affected locations' $\phi+\xi$
 Harvey tables should be read with this in mind; it is the most likely
 explanation for the scattered exact-1.0 standard errors on \texttt{{zeta}},
-\texttt{{omega0}}, \texttt{{omega\_phi/xi}}, \texttt{{A\_S/B\_S}}, and some
-\texttt{{gamma\_S\_*}} covariates seen at Cruzeiro, Garanhuns, and Salvador.
+\texttt{{omega0}}, \texttt{{omega\_phi/xi}}, \texttt{{kappa\_S/phi\_S}}, and
+some \texttt{{Gamma\_S\_*}} covariates seen at Cruzeiro, Garanhuns, and Salvador.
 
 \subsection*{{A separate, unconditional finding: three dead parameter
 slots}}
@@ -524,14 +524,14 @@ that ENSO coefficient's 95\% CI includes zero at
 \textbf{{{n_enso_zero}/{n_enso_loc}}} of those locations -- ENSO's
 out-of-sample benefit (the reason it was selected as the winner) is not
 accompanied by an in-sample statistically distinguishable GAS coefficient.
-Short-component score response ($A_{{S,\phi}}$, $A_{{S,\xi}}$) is
+Short-component score response ($\kappa_{{S,\phi}}$, $\kappa_{{S,\xi}}$) is
 insignificant at 5/6 locations, while short- and long-component persistence
-($B_S$, $B_L$) are the more robustly identified part of the Harvey
+($\phi_S$, $\phi_L$) are the more robustly identified part of the Harvey
 decomposition (modulo the instability caveat above).
 """)
     body_parts.append(_summary_table([
-        (r"B\_L\_phi near 0.995", f"{c3x['B_L_phi']}/{n_loc} (both branches)", "universal"),
-        (r"B\_L\_xi, B\_S\_xi vs B\_L near limit", f"{c3x['B_L_xi']}, {c3x['B_S_xi_vs_B_L']}/{n_loc}", "all except Belo Horizonte"),
+        (r"phi\_L\_phi near 0.995", f"{c3x['phi_L_phi']}/{n_loc} (both branches)", "universal"),
+        (r"phi\_L\_xi, phi\_S\_xi vs phi\_L near limit", f"{c3x['phi_L_xi']}, {c3x['phi_S_xi_vs_phi_L']}/{n_loc}", "all except Belo Horizonte"),
         ("Non-convergent phi+xi Harvey fits", "5/6", "grad norm $10^4$-$10^6$, only BH clean"),
         ("f0/L0/S0 dead parameters", "6/6, both branches", "std\\_error = 1.0 exactly; code issue, not a finding"),
         ("ENSO dummy coefficient CI incl. 0", f"{n_enso_zero}/{n_enso_loc}", "wherever ENSO is in the winner"),
@@ -619,7 +619,7 @@ document.
 
 \textbf{Near-boundary} means the fitted value (or, for grouped penalties,
 the group aggregate -- a lag sum, a covariate-vector Euclidean norm, or
-Harvey's relative $B_S$-vs-$B_L$ check) is within 10\% of the soft-penalty
+Harvey's relative $\phi_S$-vs-$\phi_L$ check) is within 10\% of the soft-penalty
 threshold that parameter's model actually enforces during unbounded BFGS
 (docs/OPTIMIZATION.md \S\S 2-3, 11.2) -- the same convention Stage 1/2's
 own \texttt{fit()} methods already compute and save.

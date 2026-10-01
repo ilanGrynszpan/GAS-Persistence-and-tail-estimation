@@ -839,12 +839,48 @@ The restriction ensures that the long component is more persistent than the shor
 
 The optimizer estimates:
 
-* \(A_{L,j}\), long-component score response;
-* \(B_{L,j}\), long-component persistence;
+* \(\kappa_{L,j}\), long-component score response;
+* \(\phi_{L,j}\), long-component persistence;
 * \(\Gamma_{L,j}\), long-component covariate effects;
-* \(A_{S,j}\), short-component score response;
-* \(B_{S,j}\), short-component persistence;
+* \(\kappa_{S,j}\), short-component score response;
+* \(\phi_{S,j}\), short-component persistence;
 * \(\Gamma_{S,j}\), short-component covariate effects.
+
+---
+
+# 20.1 Harvey Long-Short with Trigonometric Seasonality (optional)
+
+An optional third additive component extends the combined dynamic parameter with a Harvey (1989) trigonometric seasonal, on top of the Long/Short decomposition of Section 20. Using \(\lambda\) for the filtered dynamic parameter (\(\lambda=\log\varphi\) or \(\lambda=\log\xi\)):
+
+$$
+\lambda_{j,t|t-1} = \omega_j + \lambda_{L,j,t|t-1} + \lambda_{S,j,t|t-1} + \gamma_{j,t|t-1},
+$$
+
+$$
+\lambda_{L,j,t+1|t} = \phi_{L,j}\,\lambda_{L,j,t|t-1} + \kappa_{L,j}\,\tilde s_{j,t} + c_{L,j}'x_{L,t},
+$$
+
+$$
+\lambda_{S,j,t+1|t} = \phi_{S,j}\,\lambda_{S,j,t|t-1} + \kappa_{S,j}\,\tilde s_{j,t} + c_{S,j}'x_{S,t},
+$$
+
+$$
+\gamma_{j,t+1|t} = \sum_{h=1}^{m} \gamma_{j,t+1|t,h},
+$$
+
+$$
+\gamma_{j,t+1|t,h} = \gamma_{j,t|t-1,h}\cos\!\left(\frac{2\pi h}{S}\right) + \gamma^{*}_{j,t|t-1,h}\sin\!\left(\frac{2\pi h}{S}\right) + \kappa_{\gamma,j}\,\tilde s_{j,t},
+$$
+
+$$
+\gamma^{*}_{j,t+1|t,h} = -\gamma_{j,t|t-1,h}\sin\!\left(\frac{2\pi h}{S}\right) + \gamma^{*}_{j,t|t-1,h}\cos\!\left(\frac{2\pi h}{S}\right) + \kappa_{\gamma,j}\,\tilde s_{j,t},
+$$
+
+for \(h=1,\dots,m\), \(m \le \lfloor S/2\rfloor\). \(S\) is the seasonal period (365.25 for an annual cycle on daily data). \(\lambda_L,\lambda_S\) here are exactly \(L_{j,t},S_{j,t}\) from Section 20; \(c_{L,j},c_{S,j}\) are exactly \(\Gamma_{L,j},\Gamma_{S,j}\) from Section 20, renamed \(c\) in this section (and in this extension's report tables) ONLY to avoid colliding with the new seasonal \(\gamma_{j,t}\) — the covariate-effect parameters themselves, and their code/CSV identifiers (`Gamma_L`, `Gamma_S`), are unchanged.
+
+Each \((\gamma_h,\gamma^{*}_h)\) pair is a pure rotation (no damping factor, unlike \(\phi_L,\phi_S\)): a trigonometric seasonal is, by construction, an integrated component, so its amplitude is controlled entirely through the shared score-driven forcing \(\kappa_{\gamma,j}\tilde s_{j,t}\) and bounded only by the same state-magnitude safeguard already applied to the combined \(\lambda_{j,t}\) (Section on numerical safeguards), not a statistical bound.
+
+**Free parameters added per \(j\)**: \(\kappa_{\gamma,j}\); and, per harmonic \(h=1,\dots,m\), the initial conditions \(\gamma_{j,1|0,h}\) and \(\gamma^{*}_{j,1|0,h}\) — \(2m\) additional free parameters, independent across harmonics (not a single shared initial value).
 
 ---
 

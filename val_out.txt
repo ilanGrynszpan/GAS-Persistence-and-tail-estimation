@@ -1,0 +1,12 @@
+uses nb (old): True  obj= 6086.4386069043385
+uses nb (new logistic): True
+PARITY logistic: old=6086.4386069043  new=6086.4386069043  diff=0.00e+00
+reciprocal param_names: ['omega0', 'rho', 'omega_y_1', 'omega_y_2', 'omega_y_3']  uses nb: True
+RECIPROCAL nb vs py: nb=76620.77547182  py=76620.77547182  reldiff=9.50e-16
+  eta= -2.0 -> pi(recip)=1.000000
+  eta= -0.5 -> pi(recip)=1.000000
+  eta=  0.0 -> pi(recip)=1.000000
+  eta=  1.0 -> pi(recip)=0.500000
+  eta=  3.0 -> pi(recip)=0.250000
+  eta= 10.0 -> pi(recip)=0.090909
+DONE

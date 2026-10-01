@@ -1,0 +1,1 @@
+[stage5 hybrid (gas1 phi, harvey xi)] 6 tasks on 6 workers

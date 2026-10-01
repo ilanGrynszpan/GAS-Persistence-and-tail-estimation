@@ -402,6 +402,10 @@ class StationDataLoader:
             covariate_blocks_train                   — {block_name: ndarray}
             covariate_blocks_test                    — {block_name: ndarray}
             covariate_col_names                      — {block_name: [col, ...]}
+            covariate_scalers                        — {block_name: {"mu": {col: float}, "std": {col: float}}},
+                                                          training moments used to standardise each block
+                                                          (raw = std*value + mu); needed to convert a raw-unit
+                                                          covariate perturbation into standardised units
             nino34_train, nino34_test                — ONI anomaly (unscaled, corrected)
             enso_label_train, enso_label_test         — "El Niño"/"La Niña"/"Neutral"
             summary                                  — data summary dict
@@ -457,6 +461,16 @@ class StationDataLoader:
         blocks_train: Dict[str, np.ndarray] = {}
         blocks_test:  Dict[str, np.ndarray] = {}
         col_names:    Dict[str, List[str]]  = {}
+        # Per-block, per-column (mu, std) used by _apply_scaler above, kept
+        # here (rather than only inside the closure) so callers that need to
+        # convert a RAW-unit covariate perturbation (e.g. "+1 degC dew
+        # point") into the standardised units the fitted Gamma coefficients
+        # actually multiply can do so without recomputing training moments
+        # themselves: delta_x_std = delta_x_raw / std[block][col]. Added
+        # 2026-09-16 for the marginal-effects deliverable
+        # (marginal_effects/); purely additive, every existing key/value is
+        # unchanged.
+        covariate_scalers: Dict[str, Dict[str, Dict[str, float]]] = {}
 
         for name, raw_df in raw_blocks.items():
             raw_tr = raw_df.reindex(dates_train).fillna(0.0)
@@ -465,6 +479,10 @@ class StationDataLoader:
             mu, std = self._fit_scaler(raw_tr)
             blocks_train[name] = self._apply_scaler(raw_tr, mu, std)
             blocks_test[name]  = self._apply_scaler(raw_te, mu, std)
+            covariate_scalers[name] = {
+                "mu": {c: float(mu[c]) for c in raw_tr.columns},
+                "std": {c: float(std[c]) for c in raw_tr.columns},
+            }
 
         # Corrected (unscaled) ONI anomaly + precomputed El Nino/La Nina/Neutral
         # labels for ENSO diagnostics (replaces the previous raw-SST array).
@@ -504,6 +522,7 @@ class StationDataLoader:
             "covariate_blocks_train": blocks_train,
             "covariate_blocks_test":  blocks_test,
             "covariate_col_names":    col_names,
+            "covariate_scalers":      covariate_scalers,
             "nino34_train":           nino34_train,
             "nino34_test":            nino34_test,
             "enso_label_train":       enso_label_train,

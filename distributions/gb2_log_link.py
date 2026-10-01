@@ -172,6 +172,9 @@ class GB2LogLink(Distribution):
         return full[np.ix_(idx, idx)]
 
     def cdf(self, y: float, **params) -> float:
+        """`phi` (and only `phi`) may be a numpy array; returns an array of
+        the same shape in that case, a Python float otherwise -- matching
+        raw_moment/exceedance_effect_kernel's identical convention."""
         phi, xi, gamma, zeta = self._unpack(params)
         a = np.exp(xi)
         b = np.exp(zeta)
@@ -179,7 +182,8 @@ class GB2LogLink(Distribution):
         sigma = np.exp(phi)
         z = (y / sigma) ** p
         u = np.clip(z / (1.0 + z), 1e-12, 1.0 - 1e-12)
-        return float(betainc(a, b, u))
+        result = betainc(a, b, u)
+        return float(result) if np.ndim(phi) == 0 else result
 
     def ppf(self, q: float | np.ndarray, **params) -> float | np.ndarray:
         """Quantile function for the positive GB2 component."""
@@ -206,6 +210,12 @@ class GB2LogLink(Distribution):
         b - k/p appears as a Beta-function argument and scipy's beta_fn
         silently returns a large-magnitude or non-finite value once that
         argument crosses zero, rather than raising.
+
+        `phi` (and only `phi`) may be a numpy array; xi/gamma/zeta must stay
+        scalar (arg2 = b - k/p depends only on them, so the existence check
+        above is well-defined either way). Returns an array of the same
+        shape when phi is an array, a Python float otherwise -- matching
+        exceedance_effect_kernel's identical convention.
         """
         phi, xi, gamma, zeta = self._unpack(params)
         a = np.exp(xi)
@@ -214,12 +224,96 @@ class GB2LogLink(Distribution):
         sigma = np.exp(phi)
         arg2 = b - k / p
         if not (arg2 > 0):
-            return float("nan")
-        return float(sigma ** k * beta_fn(a + k / p, arg2) / beta_fn(a, b))
+            return np.full_like(sigma, np.nan) if np.ndim(phi) > 0 else float("nan")
+        result = sigma ** k * beta_fn(a + k / p, arg2) / beta_fn(a, b)
+        return float(result) if np.ndim(phi) == 0 else result
 
     def mean(self, **params) -> float:
         """E[Y] for the positive GB2 component (see raw_moment)."""
         return self.raw_moment(1, **params)
+
+    def R_moment_ratio(self, k: int, **params) -> float:
+        """
+        R_{k,t} = E[Y^k] / sigma^k = B(a + k/p, b - k/p) / B(a, b), i.e. the
+        moment ratio used by the marginal-effects formulas in
+        docs/claude_code_marginal_effects_instructions.md (there written
+        R_{k,t} = B(xi_t+k*gamma, zeta-k*gamma)/B(xi_t,zeta) in the natural
+        -scale notation of docs/MODELS.md Sec.5, where a=exp(xi)=xi_t,
+        b=exp(zeta)=zeta, and k/p = k*exp(gamma_code) = k*gamma_t in that
+        same natural-scale notation). Equivalent to raw_moment(k,...) /
+        sigma**k, exposed separately because the marginal-effects formulas
+        need R_{k,t} directly (not scaled by sigma^k). Returns NaN under the
+        same non-existence condition as raw_moment (b <= k/p).
+        """
+        phi, xi, gamma, zeta = self._unpack(params)
+        a = np.exp(xi)
+        b = np.exp(zeta)
+        p = np.exp(-gamma)
+        arg2 = b - k / p
+        if not (arg2 > 0):
+            return float("nan")
+        return float(beta_fn(a + k / p, arg2) / beta_fn(a, b))
+
+    def psi_diff(self, k: float, **params) -> float:
+        """
+        O_t^k = psi(xi_t + k*gamma) - psi(xi_t) in the natural-scale
+        notation of docs/claude_code_marginal_effects_instructions.md
+        Sec.1 (xi_t = a = exp(xi), gamma = 1/p = exp(gamma_code) here).
+        Used by the ZA-GB2 marginal-effects formulas for models where both
+        phi and xi are time-varying (the O_t^1, O_t^2 terms). k need not be
+        an integer (k=1, k=2 are the only values the formulas use).
+        """
+        _, xi, gamma, _ = self._unpack(params)
+        a = np.exp(xi)
+        gamma_nat = np.exp(gamma)  # = 1/p, MODELS.md Sec.5's "gamma"
+        return float(digamma(a + k * gamma_nat) - digamma(a))
+
+    def exceedance_effect_kernel(self, u, **params) -> float:
+        """
+        d S(u)/d phi_t, expressed as a pure function of (u, phi, xi, gamma,
+        zeta) -- the kernel of the exceedance-probability marginal-effect
+        formula (docs/math_proofs.tex Sec.12; user-supplied formula,
+        2026-09-18):
+
+            d P(Y_t > u) / d x_{v,t-1}
+                = c_v^phi * w^xi_t * (1-w)^zeta / (gamma_t * B(xi_t, zeta)),
+            w = z/(1+z),  z = (u/phi_t)^{1/gamma_t},
+
+        all in the natural-scale notation of R_moment_ratio/psi_diff
+        (xi_t=a=exp(xi), zeta=b=exp(zeta), gamma_t=1/p=exp(gamma_code),
+        phi_t=sigma=exp(phi)). This method returns the kernel alone (i.e.
+        the RHS above divided by c_v^phi); multiply by c_v^phi externally
+        exactly as the other one-step marginal-effect formulas do
+        (marginal_effects.onestep multiplies raw_moment()/psi_diff() by
+        c_v the same way). Computed in log-space (log w, log(1-w) via
+        log1p, and betaln) to avoid under/overflow when w is close to 0
+        or 1, or xi/zeta are large -- direct w**xi*(1-w)**zeta would not
+        be safe there.
+
+        Returns 0.0 (not NaN) when u<=0, matching the formula's own
+        "y_t>0" domain restriction (the positive-GB2 survival function is
+        undefined/degenerate at u<=0 in this zero-augmented setting).
+
+        `phi` (and only `phi`) may be a numpy array (e.g. a whole filtered
+        f_arr[:,0] path); xi/gamma/zeta must stay scalar (the formula holds
+        them static -- this is the phi-only marginal-effect case). Returns
+        an array in that case, a Python float when phi is scalar too,
+        matching distributions.gb2_log_link's existing ppf() convention.
+        """
+        if u <= 0:
+            return 0.0
+        phi, xi, gamma, zeta = self._unpack(params)
+        a = np.exp(xi)
+        b = np.exp(zeta)
+        p = np.exp(-gamma)
+        gamma_nat = np.exp(gamma)  # = 1/p
+        sigma = np.exp(phi)
+        z = (u / sigma) ** p
+        log_w = np.log(z) - np.log1p(z)          # log(z/(1+z))
+        log_1mw = -np.log1p(z)                    # log(1/(1+z))
+        log_kernel = a * log_w + b * log_1mw - np.log(gamma_nat) - betaln(a, b)
+        result = np.exp(log_kernel)
+        return float(result) if np.ndim(phi) == 0 else result
 
     def rvs(self, n: int = 1, **params) -> np.ndarray:
         phi, xi, gamma, zeta = self._unpack(params)
