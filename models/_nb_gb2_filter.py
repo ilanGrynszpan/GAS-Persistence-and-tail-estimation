@@ -16,8 +16,11 @@ Both return (loglik, f_arr, s_arr, eta_arr, pi_arr) or indicate failure
 via loglik = -1e12.
 
 Penalty computation stays in Python (cheap, avoids numba complexity).
-Scaling modes: 0 = unit, 1 = diagonal_inverse_fisher, 2 = inverse_fisher.
-For phi-only, modes 1 and 2 are equivalent (1×1 matrix).
+Scaling modes: 0 = unit, 1 = diagonal_inverse_fisher, 2 = inverse_fisher,
+3 = mixed_inverse_fisher (phi-only ZA kernel only; Fisher information of the
+zero-adjusted mixed density). For one time-varying parameter, modes 1 and 2
+are equivalent (1x1 matrix); before 2026-10-01 the one-parameter kernels
+checked only `scaling == 1`, so mode 2 silently ran as unit scaling.
 
 =============================================================================
 FIRST-CALL COMPILATION
@@ -274,6 +277,93 @@ def _gb2_fi_cross(xi: float, gamma: float, zeta: float) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Scaled score of the zero-adjusted (mixed) density  (2026-10-01)
+# ─────────────────────────────────────────────────────────────────────────────
+# f(y) = (1 - pi_t) 1{y=0} + pi_t g(y; phi_t, xi_t) 1{y>0}, logistic link,
+# eta_t = ... + lambda_1 phi_{t|t-1}  (lambda_1 = pi_lam_phi, 0 unless the
+# occurrence probability is phi-linked). With w = 1{y>0}:
+#
+#   score    s_phi = w dlog g/dphi + lambda_1 (w - pi_t),   s_xi = w dlog g/dxi
+#   Fisher   M = [[pi I_pp + lambda_1^2 pi (1-pi),  pi I_px],
+#                 [pi I_px,                         pi I_xx]]
+#   (I_.. = GB2 Fisher information, log scale; cross terms with the
+#    occurrence part vanish because E[dlog g] = 0.)
+#
+# scaling codes:
+#   0  unit                                  s
+#   1  GB2 diagonal inverse FI (historical)  w * dlog g / diag(I)     (lambda_1 must be 0)
+#   2  GB2 full inverse FI     (historical)  w * I^{-1} dlog g        (lambda_1 must be 0)
+#   3  mixed full inverse FI                 M^{-1} s
+#   4  mixed diagonal inverse FI             s / diag(M)
+# Codes 1-2 reproduce the pre-2026-10-01 kernels exactly (fallbacks:
+# full -> diagonal -> unit). For one time-varying parameter 1==2 and 3==4.
+
+@njit(cache=True)
+def _scaled_score_1(y_t: float, phi_t: float, xi_s: float, gamma_s: float, zeta_s: float,
+                    pi_t: float, lam: float, scaling: int) -> float:
+    wet = 1.0 if y_t > 0.0 else 0.0
+    s_mag = _gb2_score_phi(y_t, phi_t, xi_s, gamma_s, zeta_s) if y_t > 0.0 else 0.0
+    s_raw = s_mag + lam * (wet - pi_t)
+    if scaling == 0:
+        return s_raw
+    fi = _gb2_fi_phi(xi_s, gamma_s, zeta_s)
+    if scaling == 1 or scaling == 2:
+        if fi > 0.0 and math.isfinite(fi):
+            out = s_mag / fi
+            return out if math.isfinite(out) else s_mag
+        return s_mag
+    m = pi_t * fi + lam * lam * pi_t * (1.0 - pi_t)
+    if m > 0.0 and math.isfinite(m):
+        out = s_raw / m
+        return out if math.isfinite(out) else s_raw
+    return s_raw
+
+
+@njit(cache=True)
+def _scaled_score_2(y_t: float, phi_t: float, xi_t: float, gamma_s: float, zeta_s: float,
+                    pi_t: float, lam: float, scaling: int):
+    wet = 1.0 if y_t > 0.0 else 0.0
+    raw_phi = 0.0
+    raw_xi = 0.0
+    if y_t > 0.0:
+        raw_phi = _gb2_score_phi(y_t, phi_t, xi_t, gamma_s, zeta_s)
+        raw_xi = _gb2_score_xi(y_t, phi_t, xi_t, gamma_s, zeta_s)
+    s_phi = raw_phi + lam * (wet - pi_t)
+    s_xi = raw_xi
+    if scaling == 0:
+        return s_phi, s_xi
+    fi_pp = _gb2_fi_phi(xi_t, gamma_s, zeta_s)
+    fi_xx = _gb2_fi_xi(xi_t, zeta_s)
+    fi_px = _gb2_fi_cross(xi_t, gamma_s, zeta_s)
+    if scaling == 1 or scaling == 2:
+        if y_t <= 0.0:
+            return 0.0, 0.0
+    else:
+        fi_pp = pi_t * fi_pp + lam * lam * pi_t * (1.0 - pi_t)
+        fi_xx = pi_t * fi_xx
+        fi_px = pi_t * fi_px
+        raw_phi = s_phi
+        raw_xi = s_xi
+    if scaling == 1 or scaling == 4:
+        sp = raw_phi / fi_pp if (fi_pp > 0.0 and math.isfinite(fi_pp)) else raw_phi
+        sx = raw_xi / fi_xx if (fi_xx > 0.0 and math.isfinite(fi_xx)) else raw_xi
+        if not math.isfinite(sp):
+            sp = raw_phi
+        if not math.isfinite(sx):
+            sx = raw_xi
+        return sp, sx
+    det = fi_pp * fi_xx - fi_px * fi_px
+    if det > 1e-12 and math.isfinite(det):
+        sp = (fi_xx * raw_phi - fi_px * raw_xi) / det
+        sx = (-fi_px * raw_phi + fi_pp * raw_xi) / det
+        if not (math.isfinite(sp) and math.isfinite(sx)):
+            sp = raw_phi / fi_pp if fi_pp > 0 else raw_phi
+            sx = raw_xi / fi_xx if fi_xx > 0 else raw_xi
+        return sp, sx
+    return raw_phi, raw_xi
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Compiled filter: phi-only variant
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -294,14 +384,33 @@ def nb_filter_phi_only(
     lags_pi:    np.ndarray,   # (n_pi_lags,)  int64
     pi_link:    int,        # 0=logistic (default), 1=reciprocal pi=1/(1+eta)
     max_lag:    int,
-    scaling:    int,          # 0=unit, 1=diag_FI (2=full_FI same for 1-param)
+    scaling:    int,          # see _scaled_score_1: 0 unit, 1/2 GB2 inverse FI, 3/4 mixed inverse FI
     lam_state:  float,        # penalty weight for large states
     state_lim:  float,        # STATE_LIMIT (15.0)
     lam_eta:    float,        # penalty weight for large eta
     eta_lim:    float,        # ETA_LIMIT (30.0)
+    pi_lam_phi: float = 0.0,  # lambda_1: eta_t += lambda_1 * phi_{t|t-1} (0 = pi does not depend on phi)
 ) -> tuple:
     """
     GAS filter for phi-only ZA-GB2 model, compiled by numba.
+
+    Occurrence logit:
+        eta_t = omega0 + rho*eta_{t-1} + sum_l w_l y_{t-l} + lambda_1 * phi_{t|t-1}
+    (lambda_1 = pi_lam_phi; 0 for every pi dynamics except the joint
+    phi-linked one, which uses omega0=lambda_0, rho=0 and no y-lags).
+
+    Score of the zero-adjusted (mixed) density w.r.t. the log-scale phi,
+    with I_t = 1{y_t > 0}:
+        s_t = I_t * dlog g/dphi + lambda_1 * (I_t - pi_t)
+    (the second term is the occurrence part, present only when pi depends
+    on phi; with logistic link d pi/d phi = lambda_1 pi (1 - pi)).
+
+    Scaling:
+        0      unit                      s_t
+        1, 2   GB2 inverse FI            I_t * dlog g/dphi / I_g   (1 param: diag == full)
+        3      mixed inverse FI          s_t / [pi_t I_g + lambda_1^2 pi_t (1 - pi_t)]
+    where I_g = p^2 a b / (a+b+1) is the GB2 Fisher information for phi.
+    Modes 1/2 are only defined for lambda_1 = 0 (ZAGASModel enforces this).
 
     Returns (loglik, penalty, f_arr, s_arr, eta_arr, pi_arr).
     Returns loglik = -1e12 on numerical failure.
@@ -337,6 +446,7 @@ def nb_filter_phi_only(
             t_lag = t - lags_pi[k]
             y_lag = y[t_lag] if t_lag >= 0 else 0.0
             eta_t += pi_wy[k] * y_lag
+        eta_t += pi_lam_phi * phi_t
         eta_arr[i] = eta_t
 
         # ── Eta penalty ──────────────────────────────────────────────────────
@@ -359,20 +469,7 @@ def nb_filter_phi_only(
                 return -1e12, penalty, f_arr, s_arr, eta_arr, pi_arr
             loglik += ll_t
 
-        # ── Score ────────────────────────────────────────────────────────────
-        s_t = 0.0
-        if y[t] > 0.0:
-            s_raw = _gb2_score_phi(y[t], phi_t, xi_s, gamma_s, zeta_s)
-            if scaling == 1:
-                fi = _gb2_fi_phi(xi_s, gamma_s, zeta_s)
-                if fi > 0.0 and math.isfinite(fi):
-                    s_t = s_raw / fi
-                    if not math.isfinite(s_t):
-                        s_t = s_raw
-                else:
-                    s_t = s_raw
-            else:
-                s_t = s_raw
+        s_t = _scaled_score_1(y[t], phi_t, xi_s, gamma_s, zeta_s, pi_t, pi_lam_phi, scaling)
         s_arr[t] = s_t
 
         # ── GAS update ───────────────────────────────────────────────────────
@@ -422,6 +519,7 @@ def nb_filter_phi_xi(
     state_lim:  float,
     lam_eta:    float,
     eta_lim:    float,
+    pi_lam_phi: float = 0.0,  # lambda_1: eta_t += lambda_1 * phi_{t|t-1}
 ) -> tuple:
     """GAS filter for phi+xi ZA-GB2 model, compiled by numba."""
     T      = len(y)
@@ -460,6 +558,7 @@ def nb_filter_phi_xi(
             t_lag = t - lags_pi[k]
             y_lag = y[t_lag] if t_lag >= 0 else 0.0
             eta_t += pi_wy[k] * y_lag
+        eta_t += pi_lam_phi * phi_t
         eta_arr[i] = eta_t
 
         ex_eta = abs(eta_t) - eta_lim
@@ -482,46 +581,7 @@ def nb_filter_phi_xi(
             loglik += ll_t
 
         # ── Score + scaling ──────────────────────────────────────────────────
-        sp_phi = 0.0
-        sp_xi  = 0.0
-        if y[t] > 0.0:
-            raw_phi = _gb2_score_phi(y[t], phi_t, xi_t, gamma_s, zeta_s)
-            raw_xi  = _gb2_score_xi( y[t], phi_t, xi_t, gamma_s, zeta_s)
-
-            if scaling == 0:  # unit
-                sp_phi = raw_phi
-                sp_xi  = raw_xi
-
-            elif scaling == 1:  # diagonal inverse FI
-                fi_p = _gb2_fi_phi(xi_t, gamma_s, zeta_s)
-                fi_x = _gb2_fi_xi( xi_t, zeta_s)
-                if fi_p > 0.0 and math.isfinite(fi_p):
-                    sp_phi = raw_phi / fi_p
-                else:
-                    sp_phi = raw_phi
-                if fi_x > 0.0 and math.isfinite(fi_x):
-                    sp_xi = raw_xi / fi_x
-                else:
-                    sp_xi = raw_xi
-
-            else:  # scaling == 2: full inverse FI (2x2)
-                fi_pp = _gb2_fi_phi(xi_t, gamma_s, zeta_s)
-                fi_xx = _gb2_fi_xi( xi_t, zeta_s)
-                fi_px = _gb2_fi_cross(xi_t, gamma_s, zeta_s)
-                det   = fi_pp * fi_xx - fi_px * fi_px
-                if det > 1e-12 and math.isfinite(det):
-                    # I^{-1} * grad
-                    sp_phi = ( fi_xx * raw_phi - fi_px * raw_xi) / det
-                    sp_xi  = (-fi_px * raw_phi + fi_pp * raw_xi) / det
-                    if not (math.isfinite(sp_phi) and math.isfinite(sp_xi)):
-                        # diagonal fallback
-                        sp_phi = raw_phi / fi_pp if fi_pp > 0 else raw_phi
-                        sp_xi  = raw_xi  / fi_xx if fi_xx > 0 else raw_xi
-                else:
-                    # unit fallback
-                    sp_phi = raw_phi
-                    sp_xi  = raw_xi
-
+        sp_phi, sp_xi = _scaled_score_2(y[t], phi_t, xi_t, gamma_s, zeta_s, pi_t, pi_lam_phi, scaling)
         s_phi[t] = sp_phi
         s_xi[t]  = sp_xi
 
@@ -591,6 +651,7 @@ def nb_filter_phi_only_cov(
     lam_eta:    float,
     eta_lim:    float,
     C_phi:      np.ndarray,   # (T,)  precomputed X @ gamma_phi
+    pi_lam_phi: float = 0.0,  # lambda_1: eta_t += lambda_1 * phi_{t|t-1}
 ) -> tuple:
     """
     GAS filter for phi-only ZA-GB2 model with exogenous covariates.
@@ -627,6 +688,7 @@ def nb_filter_phi_only_cov(
             t_lag = t - lags_pi[k]
             y_lag = y[t_lag] if t_lag >= 0 else 0.0
             eta_t += pi_wy[k] * y_lag
+        eta_t += pi_lam_phi * phi_t
         eta_arr[i] = eta_t
 
         excess_eta = abs(eta_t) - eta_lim
@@ -647,19 +709,7 @@ def nb_filter_phi_only_cov(
                 return -1e12, penalty, f_arr, s_arr, eta_arr, pi_arr
             loglik += ll_t
 
-        s_t = 0.0
-        if y[t] > 0.0:
-            s_raw = _gb2_score_phi(y[t], phi_t, xi_s, gamma_s, zeta_s)
-            if scaling == 1:
-                fi = _gb2_fi_phi(xi_s, gamma_s, zeta_s)
-                if fi > 0.0 and math.isfinite(fi):
-                    s_t = s_raw / fi
-                    if not math.isfinite(s_t):
-                        s_t = s_raw
-                else:
-                    s_t = s_raw
-            else:
-                s_t = s_raw
+        s_t = _scaled_score_1(y[t], phi_t, xi_s, gamma_s, zeta_s, pi_t, pi_lam_phi, scaling)
         s_arr[t] = s_t
 
         score_p = 0.0
@@ -706,6 +756,7 @@ def nb_filter_phi_xi_cov(
     eta_lim:    float,
     C_phi:      np.ndarray,   # (T,)  precomputed X @ gamma_phi
     C_xi:       np.ndarray,   # (T,)  precomputed X @ gamma_xi
+    pi_lam_phi: float = 0.0,  # lambda_1: eta_t += lambda_1 * phi_{t|t-1}
 ) -> tuple:
     """
     GAS filter for phi+xi ZA-GB2 model with exogenous covariates.
@@ -747,6 +798,7 @@ def nb_filter_phi_xi_cov(
             t_lag = t - lags_pi[k]
             y_lag = y[t_lag] if t_lag >= 0 else 0.0
             eta_t += pi_wy[k] * y_lag
+        eta_t += pi_lam_phi * phi_t
         eta_arr[i] = eta_t
 
         ex_eta = abs(eta_t) - eta_lim
@@ -767,43 +819,7 @@ def nb_filter_phi_xi_cov(
                 return -1e12, penalty, f_phi, f_xi, s_phi, s_xi, eta_arr, pi_arr
             loglik += ll_t
 
-        sp_phi = 0.0
-        sp_xi  = 0.0
-        if y[t] > 0.0:
-            raw_phi = _gb2_score_phi(y[t], phi_t, xi_t, gamma_s, zeta_s)
-            raw_xi  = _gb2_score_xi( y[t], phi_t, xi_t, gamma_s, zeta_s)
-
-            if scaling == 0:
-                sp_phi = raw_phi
-                sp_xi  = raw_xi
-
-            elif scaling == 1:
-                fi_p = _gb2_fi_phi(xi_t, gamma_s, zeta_s)
-                fi_x = _gb2_fi_xi( xi_t, zeta_s)
-                if fi_p > 0.0 and math.isfinite(fi_p):
-                    sp_phi = raw_phi / fi_p
-                else:
-                    sp_phi = raw_phi
-                if fi_x > 0.0 and math.isfinite(fi_x):
-                    sp_xi = raw_xi / fi_x
-                else:
-                    sp_xi = raw_xi
-
-            else:
-                fi_pp = _gb2_fi_phi(xi_t, gamma_s, zeta_s)
-                fi_xx = _gb2_fi_xi( xi_t, zeta_s)
-                fi_px = _gb2_fi_cross(xi_t, gamma_s, zeta_s)
-                det   = fi_pp * fi_xx - fi_px * fi_px
-                if det > 1e-12 and math.isfinite(det):
-                    sp_phi = ( fi_xx * raw_phi - fi_px * raw_xi) / det
-                    sp_xi  = (-fi_px * raw_phi + fi_pp * raw_xi) / det
-                    if not (math.isfinite(sp_phi) and math.isfinite(sp_xi)):
-                        sp_phi = raw_phi / fi_pp if fi_pp > 0 else raw_phi
-                        sp_xi  = raw_xi  / fi_xx if fi_xx > 0 else raw_xi
-                else:
-                    sp_phi = raw_phi
-                    sp_xi  = raw_xi
-
+        sp_phi, sp_xi = _scaled_score_2(y[t], phi_t, xi_t, gamma_s, zeta_s, pi_t, pi_lam_phi, scaling)
         s_phi[t] = sp_phi
         s_xi[t]  = sp_xi
 
@@ -885,6 +901,7 @@ def nb_harvey_phi_only_filter(
     seas0:     np.ndarray,   # (n_harmonics,) gamma_{1|0,h} -- free initial condition, empty if 0
     seasstar0: np.ndarray,   # (n_harmonics,) gamma*_{1|0,h}
     psi_gamma: float,        # rotation damping, 1.0 = undamped/pure rotation (models/harvey_gas.py's seasonal_damping_max)
+    pi_lam_phi: float = 0.0,  # lambda_1: eta_t += lambda_1 * phi_{t|t-1}
 ) -> tuple:
     """
     Harvey filter for φ-only ZA-GB2, with models/harvey_gas.py's optional
@@ -937,6 +954,7 @@ def nb_harvey_phi_only_filter(
             t_lag = t - lags_pi[k]
             y_lag = y[t_lag] if t_lag >= 0 else 0.0
             eta_t += pi_wy[k] * y_lag
+        eta_t += pi_lam_phi * phi_t
         eta_arr[i] = eta_t
 
         ex_eta = abs(eta_t) - eta_lim
@@ -957,19 +975,7 @@ def nb_harvey_phi_only_filter(
                 return -1e12, penalty, L_arr, S_arr, s_arr, eta_arr, pi_arr, Gamma_arr
             loglik += ll_t
 
-        s_t = 0.0
-        if y[t] > 0.0:
-            s_raw = _gb2_score_phi(y[t], phi_t, xi_s, gamma_s, zeta_s)
-            if scaling == 1:
-                fi = _gb2_fi_phi(xi_s, gamma_s, zeta_s)
-                if fi > 0.0 and math.isfinite(fi):
-                    s_t = s_raw / fi
-                    if not math.isfinite(s_t):
-                        s_t = s_raw
-                else:
-                    s_t = s_raw
-            else:
-                s_t = s_raw
+        s_t = _scaled_score_1(y[t], phi_t, xi_s, gamma_s, zeta_s, pi_t, pi_lam_phi, scaling)
         s_arr[t] = s_t
 
         L_next = B_L * L_arr[t] + A_L * s_t + CL[t]
@@ -1044,6 +1050,7 @@ def nb_harvey_phi_xi_filter(
     seasstar0_xi:  np.ndarray,
     psi_gamma_phi: float,       # rotation damping for phi, 1.0 = undamped/pure rotation
     psi_gamma_xi:  float,       # rotation damping for xi
+    pi_lam_phi: float = 0.0,  # lambda_1: eta_t += lambda_1 * phi_{t|t-1}
 ) -> tuple:
     """
     Harvey filter for φ+ξ ZA-GB2, with the same optional trigonometric
@@ -1102,6 +1109,7 @@ def nb_harvey_phi_xi_filter(
             t_lag = t - lags_pi[k]
             y_lag = y[t_lag] if t_lag >= 0 else 0.0
             eta_t += pi_wy[k] * y_lag
+        eta_t += pi_lam_phi * phi_t
         eta_arr[i] = eta_t
 
         ex_eta = abs(eta_t) - eta_lim
@@ -1122,37 +1130,7 @@ def nb_harvey_phi_xi_filter(
                 return -1e12, penalty, L_phi, S_phi, L_xi, S_xi, s_phi, s_xi, eta_arr, pi_arr, Gamma_arr_phi, Gamma_arr_xi
             loglik += ll_t
 
-        sp_phi = 0.0
-        sp_xi  = 0.0
-        if y[t] > 0.0:
-            raw_phi = _gb2_score_phi(y[t], phi_t, xi_t, gamma_s, zeta_s)
-            raw_xi  = _gb2_score_xi( y[t], phi_t, xi_t, gamma_s, zeta_s)
-
-            if scaling == 0:
-                sp_phi = raw_phi
-                sp_xi  = raw_xi
-            elif scaling == 1:
-                fi_p = _gb2_fi_phi(xi_t, gamma_s, zeta_s)
-                fi_x = _gb2_fi_xi( xi_t, zeta_s)
-                sp_phi = raw_phi / fi_p if (fi_p > 0.0 and math.isfinite(fi_p)) else raw_phi
-                sp_xi  = raw_xi  / fi_x if (fi_x > 0.0 and math.isfinite(fi_x)) else raw_xi
-                if not math.isfinite(sp_phi): sp_phi = raw_phi
-                if not math.isfinite(sp_xi):  sp_xi  = raw_xi
-            else:
-                fi_pp = _gb2_fi_phi(xi_t, gamma_s, zeta_s)
-                fi_xx = _gb2_fi_xi( xi_t, zeta_s)
-                fi_px = _gb2_fi_cross(xi_t, gamma_s, zeta_s)
-                det   = fi_pp * fi_xx - fi_px * fi_px
-                if det > 1e-12 and math.isfinite(det):
-                    sp_phi = ( fi_xx * raw_phi - fi_px * raw_xi) / det
-                    sp_xi  = (-fi_px * raw_phi + fi_pp * raw_xi) / det
-                    if not (math.isfinite(sp_phi) and math.isfinite(sp_xi)):
-                        sp_phi = raw_phi / fi_pp if fi_pp > 0 else raw_phi
-                        sp_xi  = raw_xi  / fi_xx if fi_xx > 0 else raw_xi
-                else:
-                    sp_phi = raw_phi
-                    sp_xi  = raw_xi
-
+        sp_phi, sp_xi = _scaled_score_2(y[t], phi_t, xi_t, gamma_s, zeta_s, pi_t, pi_lam_phi, scaling)
         s_phi[t] = sp_phi
         s_xi[t]  = sp_xi
 
@@ -1404,6 +1382,7 @@ def _warmup():
             scaling=0,
             lam_state=1e3, state_lim=15.0,
             lam_eta=1e2,   eta_lim=30.0,
+            pi_lam_phi=0.0,
         )
 
         # phi+xi
@@ -1585,7 +1564,7 @@ def nb_regime_xi_only_filter(
         s_t = 0.0
         if y[t] > 0.0:
             s_raw = _gb2_score_xi(y[t], phi_t, xi_t, gamma_v, zeta_v)
-            if scaling == 1:
+            if scaling == 1 or scaling == 2:  # one parameter: diagonal == full inverse FI
                 fi = _gb2_fi_xi(xi_t, zeta_v)
                 if fi > 1e-8 and math.isfinite(fi):
                     s_t = s_raw / fi

@@ -278,7 +278,8 @@ try:
 except ImportError:
     pass
 
-_HARVEY_SCALING_INT = {"unit": 0, "diagonal_inverse_fisher": 1, "inverse_fisher": 2}
+from models.mixed_score import SCALING_CODE as _HARVEY_SCALING_INT  # 0..4, see models/mixed_score.py
+from models import mixed_score as MS
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-parameter Harvey block size
@@ -447,12 +448,16 @@ class HarveyZAGASModel:
         # with the seasonal harmonic.
         include_long: bool = True,
     ):
-        from models.gas_filter import GASFilter, _VALID_SCALING
+        from models.gas_filter import GASFilter, _VALID_SCALING, MIXED_SCALINGS
+        from models import mixed_score as MS
 
-        if scaling not in _VALID_SCALING:
+        if scaling not in _VALID_SCALING and scaling not in MIXED_SCALINGS:
             raise ValueError(
-                f"scaling must be one of {sorted(_VALID_SCALING)}, got '{scaling!r}'"
+                f"scaling must be one of {sorted(_VALID_SCALING | MIXED_SCALINGS)}, got '{scaling!r}'"
             )
+        MS.check_scaling(pi_dynamics, scaling)
+        if MS.pi_uses_phi(pi_dynamics) and gas1_target:
+            raise ValueError("phi-linked pi dynamics are not implemented together with gas1_target")
         if fixed_phi_L is not None and phi_L_max is not None:
             raise ValueError(
                 "fixed_phi_L and phi_L_max are mutually exclusive parameterisations of "
@@ -931,7 +936,9 @@ class HarveyZAGASModel:
             return self.gas1_target == ["phi"] and self.harvey_target == ["xi"]
         from pi_dynamics.ar_logistic import ARLogisticPiDynamics
         from pi_dynamics.ar_logistic_custom_lags import ARLogisticCustomLagsPiDynamics
-        if not isinstance(self.pi_dyn, (ARLogisticPiDynamics, ARLogisticCustomLagsPiDynamics)):
+        from pi_dynamics.phi_linked import PhiLinkedJointPiDynamics
+        if not isinstance(self.pi_dyn, (ARLogisticPiDynamics, ARLogisticCustomLagsPiDynamics,
+                                        PhiLinkedJointPiDynamics)):
             return False
         from distributions.gb2_log_link import GB2LogLink
         from distributions.gb2_phi_only import GB2LogLinkPhiOnly
@@ -953,12 +960,8 @@ class HarveyZAGASModel:
         return_paths: bool,
         gas1d: Optional[dict] = None,
     ):
-        pi_lags_py = list(getattr(self.pi_dyn, "lags", None) or SEASONAL_LAGS[self.seasonal])
-        lags_pi    = np.array(pi_lags_py, dtype=np.int64)
-        pi_wy      = np.array([pip[f"omega_y_{l}"] for l in pi_lags_py], dtype=np.float64)
-        pi_omega0  = float(pip["omega0"])
-        pi_rho     = float(pip.get("rho", 0.0))
-        pi_link    = 1 if getattr(self.pi_dyn, "link", "logistic") == "reciprocal" else 0
+        lags_pi, pi_wy, pi_omega0, pi_rho, pi_lam_phi, pi_link = MS.nb_pi_args(
+            self.pi_dyn, pip, SEASONAL_LAGS[self.seasonal])
         scaling_i  = _HARVEY_SCALING_INT.get(self.scaling, 0)
 
         Xl = np.nan_to_num(X_long,  nan=0.0).astype(np.float64)
@@ -1071,6 +1074,7 @@ class HarveyZAGASModel:
                     seas0=hj["seas0"] if self.n_harmonics > 0 else np.zeros(0),
                     seasstar0=hj["seasstar0"] if self.n_harmonics > 0 else np.zeros(0),
                     psi_gamma=float(hj["psi_gamma"]) if hj.get("psi_gamma") is not None else 1.0,
+                    pi_lam_phi=pi_lam_phi,
                 )
             )
             total_pen = pre_penalty + loop_pen
@@ -1146,6 +1150,7 @@ class HarveyZAGASModel:
                     seasstar0_xi=hxi["seasstar0"] if self.n_harmonics > 0 else np.zeros(0),
                     psi_gamma_phi=float(hphi["psi_gamma"]) if hphi.get("psi_gamma") is not None else 1.0,
                     psi_gamma_xi=float(hxi["psi_gamma"]) if hxi.get("psi_gamma") is not None else 1.0,
+                    pi_lam_phi=pi_lam_phi,
                 )
             )
             total_pen = pre_penalty + loop_pen
@@ -1379,14 +1384,8 @@ class HarveyZAGASModel:
 
             # Pi recursion (eta_eff is i-indexed to avoid t-vs-i indexing bug)
             i_eff = t - self.max_lag
-            eta_t = self.pi_dyn.compute_eta(
-                i=i_eff,
-                eta_hist=eta_eff,
-                y_full=y,
-                t=t,
-                params=pip,
-                seasonal=self.seasonal,
-            )
+            eta_t = MS.eta_step(self.pi_dyn, i_eff, eta_eff, y, t, pip, self.seasonal,
+                                f_arr[t, self.tv_names.index("phi")])
             eta_eff[i_eff] = eta_t
             eta_arr[t]     = eta_t
             # Numerical-safety guard (not a statistical restriction): during
@@ -1416,14 +1415,14 @@ class HarveyZAGASModel:
                 return (1e12 + penalty) if not return_paths else {}
             loglik += ll_t
 
-            # Score
-            if y[t] > 0:
-                raw_score = self.dist.score(y[t], **call_params)
-                scaled    = self._scaled_score(raw_score, call_params)
-                for j, name in enumerate(self.tv_names):
-                    s_arr[t, j] = scaled[name]
-                if not np.all(np.isfinite(s_arr[t, :])):
-                    return (1e12 + penalty) if not return_paths else {}
+            # Score of the zero-adjusted density (models/mixed_score.py)
+            scaled = MS.scaled_score(self.dist, self.tv_names, self.scaling, y[t], call_params,
+                                     pi_arr[t], MS.phi_link_lambda(self.pi_dyn, pip),
+                                     historical_fn=self._scaled_score)
+            for j, name in enumerate(self.tv_names):
+                s_arr[t, j] = scaled[name]
+            if not np.all(np.isfinite(s_arr[t, :])):
+                return (1e12 + penalty) if not return_paths else {}
 
             # Component updates
             xl_t = Xl[t]
@@ -1835,6 +1834,41 @@ class HarveyZAGASModel:
         X_long_test: np.ndarray,
         X_short_train: np.ndarray,
         X_short_test: np.ndarray,
+        use_numba: bool = True,
+    ) -> dict:
+        """
+        1-step-ahead rolling OOS evaluation (2026-10-01: Numba route).
+
+        The one-step-ahead OOS path is the filter run over train+test with
+        the fitted theta, so the compiled filter (the same kernel used for
+        estimation) produces it directly; the pure-Python recursion
+        (_simulate_oos_python) is the fallback and the parity reference
+        (tests/test_pi_linked_all_models.py).
+        """
+        if use_numba and self._use_nb_filter:
+            T_train = len(y_train)
+            p = self._run_filter(theta, np.concatenate([y_train, y_test]),
+                                 np.vstack([X_long_train, X_long_test]),
+                                 np.vstack([X_short_train, X_short_test]), return_paths=True)
+            if p:
+                k = T_train - int(p["eff_start"])
+                return {"f_arr_oos": np.asarray(p["f_arr"])[k:, :],
+                        "L_arr_oos": np.asarray(p["L_arr"])[k:, :],
+                        "S_arr_oos": np.asarray(p["S_arr"])[k:, :],
+                        "pi_oos": np.asarray(p["pi"])[k:], "eta_oos": np.asarray(p["eta"])[k:],
+                        "static": dict(p["static"]), "tv_names": self.tv_names, "y_test": y_test}
+        return self._simulate_oos_python(theta, y_train, y_test, X_long_train, X_long_test,
+                                         X_short_train, X_short_test)
+
+    def _simulate_oos_python(
+        self,
+        theta: np.ndarray,
+        y_train: np.ndarray,
+        y_test: np.ndarray,
+        X_long_train: np.ndarray,
+        X_long_test: np.ndarray,
+        X_short_train: np.ndarray,
+        X_short_test: np.ndarray,
     ) -> dict:
         """1-step-ahead rolling OOS evaluation by concatenating train + test."""
         st_theta, pi_theta, hv_theta = self._split_theta(theta)
@@ -1897,18 +1931,16 @@ class HarveyZAGASModel:
             # eta_hist[i-1] for the AR term, so the t-indexed eta_arr would
             # fetch a value max_lag steps too early and break the recursion.
             i_eff = t - max_lag
-            eta_arr[t] = self.pi_dyn.compute_eta(
-                i=i_eff, eta_hist=eta_eff,
-                y_full=y_full, t=t, params=pip, seasonal=self.seasonal,
-            )
+            eta_arr[t] = MS.eta_step(self.pi_dyn, i_eff, eta_eff, y_full, t, pip, self.seasonal,
+                                     f_arr[t, self.tv_names.index("phi")])
             eta_eff[i_eff] = eta_arr[t]
             pi_arr[t] = float(self.pi_dyn.pi_from_eta(eta_arr[t]))
 
-            if y_full[t] > 0:
-                raw_score = self.dist.score(y_full[t], **call_params)
-                scaled    = self._scaled_score(raw_score, call_params)
-                for j, name in enumerate(self.tv_names):
-                    s_arr[t, j] = scaled[name]
+            scaled = MS.scaled_score(self.dist, self.tv_names, self.scaling, y_full[t], call_params,
+                                     pi_arr[t], MS.phi_link_lambda(self.pi_dyn, pip),
+                                     historical_fn=self._scaled_score)
+            for j, name in enumerate(self.tv_names):
+                s_arr[t, j] = scaled[name]
 
             xl_t = Xl_full[t]
             xs_t = Xs_full[t]

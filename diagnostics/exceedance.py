@@ -80,3 +80,58 @@ def exceedance_from_draws(draws_list, actuals, q: float) -> dict:
                 "kupiec_lr": float("nan"), "kupiec_p": float("nan")}
     lr, p = kupiec(v, n, 1.0 - q)
     return {"rate": v / n, "n_viol": v, "n": n, "kupiec_lr": lr, "kupiec_p": p}
+
+
+def _xlogy(n: float, p: float) -> float:
+    """n * log(p) with the 0 * log(0) = 0 convention."""
+    return 0.0 if n == 0 else float(n * np.log(p))
+
+
+def christoffersen_from_pit(pit: np.ndarray, q: float) -> dict:
+    """
+    Christoffersen (1998) independence and conditional-coverage tests for
+    UPPER-tail violations I_t = 1{PIT_t > q} of the one-step forecasts.
+
+    With n_ij = #{t : I_{t-1} = i, I_t = j}:
+        pi01 = n01 / (n00 + n01)   P(violation | no violation the day before)
+        pi11 = n11 / (n10 + n11)   P(violation | violation the day before)
+        pi   = (n01 + n11) / (n00 + n01 + n10 + n11)
+        LR_ind = -2 [ log L(pi) - log L(pi01, pi11) ]  ~ chi2(1)
+            L(pi)         = (1-pi)^(n00+n10) pi^(n01+n11)
+            L(pi01, pi11) = (1-pi01)^n00 pi01^n01 (1-pi11)^n10 pi11^n11
+        LR_cc  = LR_uc + LR_ind                        ~ chi2(2)
+    (LR_uc = Kupiec, from `kupiec` above on the same sequence.) Clustering of
+    extremes shows as pi11 > pi01 with a small LR_ind p-value. 0*log(0) = 0,
+    so sequences without consecutive violations are handled exactly; with no
+    violations at all the independence test is undefined (NaN).
+    Non-finite PIT values are dropped before forming the sequence.
+    """
+    pit = np.asarray(pit, dtype=float)
+    pit = pit[np.isfinite(pit)]
+    I = (pit > q).astype(int)
+    n = len(I)
+    out = {"n": n, "n_viol": int(I.sum())}
+    if n < 2:
+        return {**out, "pi01": np.nan, "pi11": np.nan, "lr_ind": np.nan, "p_ind": np.nan,
+                "lr_cc": np.nan, "p_cc": np.nan, "n00": 0, "n01": 0, "n10": 0, "n11": 0}
+    prev, cur = I[:-1], I[1:]
+    n00 = int(np.sum((prev == 0) & (cur == 0)))
+    n01 = int(np.sum((prev == 0) & (cur == 1)))
+    n10 = int(np.sum((prev == 1) & (cur == 0)))
+    n11 = int(np.sum((prev == 1) & (cur == 1)))
+    pi01 = n01 / (n00 + n01) if (n00 + n01) else np.nan
+    pi11 = n11 / (n10 + n11) if (n10 + n11) else np.nan
+    pi = (n01 + n11) / (n00 + n01 + n10 + n11)
+    if n01 + n11 == 0:
+        lr_ind, p_ind = np.nan, np.nan
+    else:
+        ll0 = _xlogy(n00 + n10, 1 - pi) + _xlogy(n01 + n11, pi)
+        ll1 = (_xlogy(n00, 1 - pi01) + _xlogy(n01, pi01)
+               + (_xlogy(n10, 1 - pi11) + _xlogy(n11, pi11) if (n10 + n11) else 0.0))
+        lr_ind = max(0.0, -2.0 * (ll0 - ll1))
+        p_ind = float(chi2.sf(lr_ind, df=1))
+    lr_uc, _ = kupiec(int(I.sum()), n, 1.0 - q)
+    lr_cc = lr_uc + lr_ind if np.isfinite(lr_ind) else np.nan
+    p_cc = float(chi2.sf(lr_cc, df=2)) if np.isfinite(lr_cc) else np.nan
+    return {**out, "n00": n00, "n01": n01, "n10": n10, "n11": n11, "pi01": pi01, "pi11": pi11,
+            "lr_ind": lr_ind, "p_ind": p_ind, "lr_cc": lr_cc, "p_cc": p_cc}

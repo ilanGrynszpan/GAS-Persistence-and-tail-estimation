@@ -127,14 +127,17 @@ class GB2LogLink(Distribution):
             I = [[I_phi_phi,  I_phi_xi ],
                  [I_xi_phi,   I_xi_xi  ]]
 
-        Cross-term derivation (chain rule from natural-parameter FI):
-            I_{phi,xi} = I_{sigma,a} * sigma * a
-                       = [-p/(sigma) * b/(a+b+1)] * sigma * a
-                       = -p * a * b / (a+b+1)
-
-        where I_{sigma,a} in natural space comes from MODELS.md:
-            I_{phi_nat, xi_nat} = -1/(gamma_nat * phi_nat) * zeta_nat/(xi_nat+zeta_nat+1)
+        Cross-term derivation.  With Z = z/(1+z) ~ Beta(a, b):
+            d logf/d sigma = (p/sigma) * [(a+b) Z - a]
+            d^2 logf/(d sigma d a) = (p/sigma) * (Z - 1)
+        so, using E[Z] = a/(a+b),
+            I_{sigma,a} = -E[(p/sigma)(Z - 1)] = (p/sigma) * b/(a+b)
+        i.e. in natural notation 1/(gamma_nat * phi_nat) * zeta_nat/(xi_nat+zeta_nat)
         with phi_nat = sigma, gamma_nat = 1/p, xi_nat = a, zeta_nat = b.
+        The denominator is (a+b), not (a+b+1), and the sign is positive.
+        Chain rule to log-space:
+            I_{phi,xi} = I_{sigma,a} * sigma * a = p * a * b / (a+b)
+        This matches _gb2_fi_cross in models/_nb_gb2_filter.py.
 
         Returns
         -------
@@ -144,11 +147,11 @@ class GB2LogLink(Distribution):
         a = np.exp(xi)
         b = np.exp(zeta)
         p = np.exp(-gamma)
-        denom = a + b + 1.0
+        denom = a + b + 1.0  # used by I_pp only
 
         I_pp = p ** 2 * a * b / denom
         I_xi_xi = a ** 2 * (polygamma(1, a) - polygamma(1, a + b))
-        I_px = -p * a * b / denom   # cross-term in log-space
+        I_px = p * a * b / (a + b)   # cross-term in log-space (see docstring)
 
         mat = np.array([[I_pp, I_px],
                         [I_px, I_xi_xi]])

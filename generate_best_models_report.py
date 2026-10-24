@@ -6,7 +6,7 @@ Per location, the best config within each of 5 model classes:
   2. GAS(p,q) + external variables        -> Stage 2  (best of 4 lags x 4 covariate sets)
   3. long-short dynamics                  -> Stage 3  (best of 5 Harvey covariate configs)
   4. long-short dynamics + seasonality    -> Stage 4  (best of 5 Harvey covariate configs)
-  5. basic structural model               -> Stage 4S (best of 5 Harvey covariate configs)
+  5. DCS/UC - ST (dcs_uc_st)            -> Stage 4S (best of 5 Harvey covariate configs)
 
 Two selection criteria, each producing a 1-TVP and a 2-TVP table:
   A. "gradient ok, then minimise RMSE and CRPS": the standard rule used
@@ -47,7 +47,7 @@ CLASSES = [
     ("stage2", "GAS(p,q) + external variables"),
     ("stage3", "long-short dynamics"),
     ("stage4", "long-short dynamics + seasonality"),
-    ("stage4S", "basic structural model"),
+    ("stage4S", "DCS/UC - ST"),
 ]
 BRANCH_LBL = {"phi_only": "1 TVP ($\\varphi$)", "phi_xi": "2 TVP ($\\varphi,\\xi$)"}
 BRANCH_SHORT = {"phi_only": "1 TVP", "phi_xi": "2 TVP"}
@@ -56,7 +56,7 @@ CLASS_SHORT = {
     "GAS(p,q) + external variables": "GAS + ext.",
     "long-short dynamics": "long-short",
     "long-short dynamics + seasonality": "long-short+seas.",
-    "basic structural model": "structural",
+    "DCS/UC - ST": "dcs_uc_st",
 }
 DISP_SHORT = {s: DISP[s].split(" (")[0] for s in SHORTS}
 

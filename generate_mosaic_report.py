@@ -138,6 +138,54 @@ def build_mosaic(columns, kind, fname):
     print(f"wrote {fname}.pdf/.png ({nrow}x{ncol})")
 
 
+def _draw_qq(ax, qr):
+    stats.probplot(qr, dist="norm", plot=ax)
+    ax.set_title("")
+    ax.get_lines()[0].set_markersize(1.6)
+    ax.get_lines()[1].set_linewidth(1.0)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.tick_params(labelsize=5)
+
+
+def _draw_acf(ax, qr):
+    a = acf(qr, NLAGS)
+    ci = 1.96 / np.sqrt(len(qr))
+    ax.bar(range(1, len(a)), a[1:], width=1.0, color="#3b6", linewidth=0)
+    ax.axhline(ci, color="grey", lw=0.5, ls="--")
+    ax.axhline(-ci, color="grey", lw=0.5, ls="--")
+    ax.axhline(0, color="black", lw=0.4)
+    ax.set_ylim(-1.0, 1.0)
+    ax.tick_params(labelsize=5)
+
+
+def build_qq_acf_mosaic(qr_by_short, fname, rep=None):
+    """Rows = locations, columns = [QQ plot, ACF] of the same in-sample
+    quantile residuals (one model per location, e.g. Stage 5). No figure
+    title, no column titles, no legend; location names as row labels."""
+    rep = rep or REP
+    fig, axes = plt.subplots(len(SHORTS), 2, figsize=(2.3 + 2.6, 1.9 * len(SHORTS)), squeeze=False)
+    for r, short in enumerate(SHORTS):
+        qr = qr_by_short.get(short, np.array([]))
+        qr = qr[np.isfinite(qr)] if len(qr) else qr
+        for c in (0, 1):
+            ax = axes[r][c]
+            if len(qr) < 20:
+                ax.text(0.5, 0.5, "no fit", ha="center", va="center", transform=ax.transAxes, fontsize=7)
+                ax.set_xticks([]); ax.set_yticks([])
+            elif c == 0:
+                _draw_qq(ax, qr)
+            else:
+                _draw_acf(ax, qr)
+        axes[r][0].set_ylabel(DISP[short].split(" (")[0], fontsize=7.5)
+    fig.tight_layout()
+    rep.mkdir(parents=True, exist_ok=True)
+    fig.savefig(rep / f"{fname}.pdf")
+    fig.savefig(rep / f"{fname}.png", dpi=150)
+    plt.close(fig)
+    print(f"wrote {fname}.pdf/.png ({len(SHORTS)}x2)")
+
+
 def main():
     # ---- 1. Stage 1: 4 columns ----
     stage1_cols = [
@@ -183,7 +231,7 @@ def main():
          lambda s: harvey_winner(s, "stage3", "phi_xi")),
         ("Time varying\nlocation and\nshape - seasonal\ncomponent included",
          lambda s: harvey_winner(s, "stage4", "phi_xi")),
-        ("Time varying\nlocation and shape\n- basic structural\nmodel",
+        ("Time varying\nlocation and shape\n- DCS/UC - ST",
          lambda s: harvey_winner(s, "stage4S", "phi_xi")),
     ]
     build_mosaic(stage34_phionly, "qq", "qq_stage34_phionly")

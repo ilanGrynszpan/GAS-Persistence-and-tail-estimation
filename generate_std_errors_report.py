@@ -410,6 +410,8 @@ def latex_param_name(name):
         return r"$\rho$"
     if name == "omega0":
         return r"$\omega_0$"
+    if name in ("lambda0", "lambda1"):   # phi-linked occurrence logit (2026-10-01)
+        return rf"$\lambda_{name[-1]}$"
     m = re.match(r"^omega_y_(\d+)$", name)
     if m:
         return rf"$\omega_{{y,{m.group(1)}}}$"

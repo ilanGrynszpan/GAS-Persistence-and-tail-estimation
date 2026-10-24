@@ -86,7 +86,9 @@ def three_level_stats(short, ident, res):
     m = compute_extended_oos_metrics(model, oos, y_te, quantile_levels=(0.95, 0.98),
                                      twcrps_levels=(0.95, 0.98), brier_levels=(),
                                      n_draws=500, seed=42, return_raw=True)
-    pit = np.asarray(m.get("_pit_values", []), dtype=float)
+    # Upper-tail PIT F(y-): a dry day is never a violation (diagnostics/scoring.py,
+    # "_pit_upper_values"; fixes the dry-day F(0) = 1 - pi artefact, 2026-10-01).
+    pit = np.asarray(m.get("_pit_upper_values", m.get("_pit_values", [])), dtype=float)
     out = {}
     for lbl, q in (("95", 0.95), ("98", 0.98), ("1in30", Q_1IN30)):
         out[lbl] = exceedance_from_pit(pit, q)

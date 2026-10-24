@@ -67,6 +67,7 @@ from scipy.special import expit, log_expit  # logistic σ(x) = 1/(1+e^{-x})
 from distributions.base import Distribution
 from pi_dynamics.base import PiDynamics
 from models.gas_filter import GASFilter, _sigmoid_scalar, _logit_scalar
+from models import mixed_score as MS
 from models.lags import SEASONAL_LAGS
 
 try:
@@ -76,7 +77,8 @@ except Exception:
     _NB_AVAIL = False
 
 _NB_DIST_NAMES = {"GB2LogLink", "GB2LogLinkPhiOnly"}
-_NB_PI_NAMES   = {"ARLogisticPiDynamics", "ARLogisticCustomLagsPiDynamics"}
+_NB_PI_NAMES   = {"ARLogisticPiDynamics", "ARLogisticCustomLagsPiDynamics",
+                  "PhiLinkedJointPiDynamics"}
 
 
 class ZAGASModel:
@@ -195,7 +197,12 @@ class ZAGASModel:
             bound_b_tanh_sum=bound_b_tanh_sum, b_sum_max=b_sum_max,
             free_zeta_gamma=free_zeta_gamma, kurtosis_margin=kurtosis_margin,
             bound_static_box=bound_static_box, static_box=static_box,
+            allow_mixed_scaling=True,
         )
+
+        # pi_t driven by the filter's own phi_{t|t-1} (PhiLinkedJointPiDynamics)
+        self._pi_uses_phi = MS.pi_uses_phi(pi_dynamics)
+        MS.check_scaling(pi_dynamics, self.gas.scaling)
 
         self.lags    = self.gas.lags
         self.max_lag = self.gas.max_lag
@@ -286,6 +293,22 @@ class ZAGASModel:
     # Core recursion
     # ==================================================================
 
+    # ==================================================================
+    # Occurrence logit and zero-adjusted score (Python path)
+    # ==================================================================
+
+    def _eta_t(self, i, eta_hist, y, t, pi_params, phi_t) -> float:
+        """eta_t from the pi dynamics; phi-linked joint dynamics read the
+        filter's own phi_{t|t-1} (already formed from information up to t-1)."""
+        return MS.eta_step(self.pi_dyn, i, eta_hist, y, t, pi_params, self.seasonal, phi_t)
+
+    def _za_scaled_score(self, y_t, call_params, pi_t, pi_params) -> dict:
+        """Scaled score of the zero-adjusted density (models/mixed_score.py);
+        mirrors the Numba kernels' _scaled_score_1/_2 exactly."""
+        return MS.scaled_score(self.dist, self.gas.tv_names, self.gas.scaling, y_t, call_params,
+                               pi_t, MS.phi_link_lambda(self.pi_dyn, pi_params),
+                               historical_fn=self.gas._scaled_score)
+
     def _use_nb_filter(self) -> bool:
         """Return True when the compiled numba filter covers this model config."""
         return (
@@ -295,7 +318,7 @@ class ZAGASModel:
         )
 
     # Scaling name → int code expected by the numba functions
-    _SCALING_INT = {"unit": 0, "diagonal_inverse_fisher": 1, "inverse_fisher": 2}
+    _SCALING_INT = MS.SCALING_CODE
 
     def _nb_dispatch(
         self,
@@ -319,12 +342,8 @@ class ZAGASModel:
         scaling_i  = self._SCALING_INT.get(self.gas.scaling, 0)
 
         lags_gas   = np.array(list(L), dtype=np.int64)
-        pi_lags_py = list(getattr(self.pi_dyn, "lags", None) or SEASONAL_LAGS[self.seasonal])
-        lags_pi    = np.array(pi_lags_py, dtype=np.int64)
-        pi_wy      = np.array([pi_params[f"omega_y_{l}"] for l in pi_lags_py])
-        pi_omega0  = float(pi_params["omega0"])
-        pi_rho     = float(pi_params.get("rho", 0.0))
-        pi_link    = 1 if getattr(self.pi_dyn, "link", "logistic") == "reciprocal" else 0
+        lags_pi, pi_wy, pi_omega0, pi_rho, pi_lam_phi, pi_link = MS.nb_pi_args(
+            self.pi_dyn, pi_params, SEASONAL_LAGS[self.seasonal])
 
         LAM_STATE   = 0.0 if self.unconstrained_state else 1e3
         LAM_ETA     = 1e2
@@ -352,6 +371,7 @@ class ZAGASModel:
                 max_lag=eff, scaling=scaling_i,
                 lam_state=LAM_STATE, state_lim=STATE_LIMIT,
                 lam_eta=LAM_ETA,    eta_lim=ETA_LIMIT,
+                pi_lam_phi=pi_lam_phi,
             )
             loglik_nb, loop_pen, f1d, s1d, eta1d, pi1d = out
 
@@ -403,6 +423,7 @@ class ZAGASModel:
                 max_lag=eff, scaling=scaling_i,
                 lam_state=LAM_STATE, state_lim=STATE_LIMIT,
                 lam_eta=LAM_ETA,    eta_lim=ETA_LIMIT,
+                pi_lam_phi=pi_lam_phi,
             )
             loglik_nb, loop_pen, f_phi, f_xi, s_phi, s_xi, eta1d, pi1d = out
 
@@ -614,14 +635,7 @@ class ZAGASModel:
             # eta_eff is i-indexed so compute_eta's AR access eta_eff[i-1]
             # gives the immediately-preceding step (not max_lag steps back).
             i = t - self.max_lag
-            eta_t = self.pi_dyn.compute_eta(
-                i=i,
-                eta_hist=eta_eff,
-                y_full=y,
-                t=t,
-                params=pi_params,
-                seasonal=self.seasonal,
-            )
+            eta_t = self._eta_t(i, eta_eff, y, t, pi_params, f_arr[t, 0])
             eta_eff[i]  = eta_t
             eta_arr[t]  = eta_t
 
@@ -657,14 +671,12 @@ class ZAGASModel:
 
             loglik += ll_t
 
-            # Score — use gas._scaled_score to support all 3 scaling modes
-            if y[t] > 0:
-                raw_score = self.dist.score(y[t], **call_params)
-                scaled = self.gas._scaled_score(raw_score, call_params)
-                for j, name in enumerate(self.gas.tv_names):
-                    s_arr[t, j] = scaled[name]
-                if not np.all(np.isfinite(s_arr[t, :])):
-                    return 1e12 + penalty if not return_paths else {}
+            # Score of the zero-adjusted density, scaled (see _za_scaled_score)
+            scaled = self._za_scaled_score(y[t], call_params, pi_arr[t], pi_params)
+            for j, name in enumerate(self.gas.tv_names):
+                s_arr[t, j] = scaled[name]
+            if not np.all(np.isfinite(s_arr[t, :])):
+                return 1e12 + penalty if not return_paths else {}
 
             # GAS update, no clipping
             for j, name in enumerate(self.gas.tv_names):
@@ -1003,6 +1015,32 @@ class ZAGASModel:
         theta: np.ndarray,
         y_train: np.ndarray,
         y_test: np.ndarray,
+        use_numba: bool = True,
+    ) -> dict:
+        """
+        1-step-ahead rolling OOS evaluation (2026-10-01: Numba route).
+
+        The one-step-ahead OOS path is the filter run over train+test with
+        the fitted theta, so the compiled filter (the same kernel used for
+        estimation) produces it directly; the pure-Python recursion
+        (_simulate_oos_python) is the fallback and the parity reference
+        (tests/test_pi_linked_all_models.py).
+        """
+        if use_numba and self._use_nb_filter():
+            T_train = len(y_train)
+            p = self._run_filter(theta, np.concatenate([y_train, y_test]), return_paths=True)
+            if p:
+                k = T_train - int(p["eff_start"])
+                return {"f_arr_oos": np.asarray(p["f_arr"])[k:, :], "pi_oos": np.asarray(p["pi"])[k:],
+                        "eta_oos": np.asarray(p["eta"])[k:], "static": p["static"],
+                        "tv_names": list(self.gas.tv_names), "y_test": y_test}
+        return self._simulate_oos_python(theta, y_train, y_test)
+
+    def _simulate_oos_python(
+        self,
+        theta: np.ndarray,
+        y_train: np.ndarray,
+        y_test: np.ndarray,
     ) -> dict:
         """
         1-step-ahead rolling OOS evaluation.
@@ -1039,21 +1077,14 @@ class ZAGASModel:
             call_params.update({s: gp[s] for s in self.gas.static_names})
 
             i = t - max_lag
-            eta_t = self.pi_dyn.compute_eta(
-                i=i, eta_hist=eta_eff,
-                y_full=y_full, t=t,
-                params=pi_params, seasonal=self.seasonal,
-            )
+            eta_t = self._eta_t(i, eta_eff, y_full, t, pi_params, f_arr[t, 0])
             eta_eff[i] = eta_t
             eta_arr[t] = eta_t
             pi_arr[t] = float(self.pi_dyn.pi_from_eta(eta_t))
 
-            if y_full[t] > 0:
-                raw_score = self.dist.score(y_full[t], **call_params)
-                # Use gas._scaled_score to support all 3 scaling modes
-                scaled    = self.gas._scaled_score(raw_score, call_params)
-                for j, name in enumerate(self.gas.tv_names):
-                    s_arr[t, j] = scaled[name]
+            scaled = self._za_scaled_score(y_full[t], call_params, pi_arr[t], pi_params)
+            for j, name in enumerate(self.gas.tv_names):
+                s_arr[t, j] = scaled[name]
 
             for j, name in enumerate(self.gas.tv_names):
                 omega_j = gp[f"omega_{name}"]

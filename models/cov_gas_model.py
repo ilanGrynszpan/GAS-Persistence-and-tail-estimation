@@ -35,6 +35,7 @@ from scipy.special import expit, log_expit
 
 from distributions.base import Distribution
 from pi_dynamics.base import PiDynamics
+from models import mixed_score as MS
 from models.gas_filter import GASFilter, _sigmoid_scalar, _logit_scalar
 from models.lags import SEASONAL_LAGS
 from models.za_gas_model import ZAGASModel
@@ -155,7 +156,9 @@ class CovZAGASModel:
             bound_b_tanh_sum=bound_b_tanh_sum, b_sum_max=b_sum_max,
             free_zeta_gamma=free_zeta_gamma, kurtosis_margin=kurtosis_margin,
             bound_static_box=bound_static_box, static_box=static_box,
+            allow_mixed_scaling=True,
         )
+        MS.check_scaling(pi_dynamics, self.gas.scaling)
 
         self.lags    = self.gas.lags
         self.max_lag = self.gas.max_lag
@@ -243,7 +246,7 @@ class CovZAGASModel:
     # ─────────────────────────────────────────────────────────────────────────
 
     # Maps scaling name to the integer code expected by the Numba functions.
-    _SCALING_INT = {"unit": 0, "diagonal_inverse_fisher": 1, "inverse_fisher": 2}
+    _SCALING_INT = MS.SCALING_CODE
 
     @property
     def _use_nb_filter(self) -> bool:
@@ -253,7 +256,9 @@ class CovZAGASModel:
         # Numba filter only supports ARLogistic pi dynamics (hardcoded recursion)
         from pi_dynamics.ar_logistic import ARLogisticPiDynamics
         from pi_dynamics.ar_logistic_custom_lags import ARLogisticCustomLagsPiDynamics
-        if not isinstance(self.pi_dyn, (ARLogisticPiDynamics, ARLogisticCustomLagsPiDynamics)):
+        from pi_dynamics.phi_linked import PhiLinkedJointPiDynamics
+        if not isinstance(self.pi_dyn, (ARLogisticPiDynamics, ARLogisticCustomLagsPiDynamics,
+                                        PhiLinkedJointPiDynamics)):
             return False
         # Numba filter only supports GB2LogLink / GB2LogLinkPhiOnly distributions
         from distributions.gb2_log_link import GB2LogLink
@@ -287,13 +292,8 @@ class CovZAGASModel:
         scaling_i  = self._SCALING_INT.get(self.gas.scaling, 0)
 
         lags_gas  = np.array(list(L), dtype=np.int64)
-        pi_lags_py = list(getattr(self.pi_dyn, "lags", None) or SEASONAL_LAGS[self.seasonal])
-        lags_pi   = np.array(pi_lags_py, dtype=np.int64)
-        pi_wy     = np.array([pi_params[f"omega_y_{l}"] for l in pi_lags_py],
-                              dtype=np.float64)
-        pi_omega0 = float(pi_params["omega0"])
-        pi_rho    = float(pi_params.get("rho", 0.0))
-        pi_link   = 1 if getattr(self.pi_dyn, "link", "logistic") == "reciprocal" else 0
+        lags_pi, pi_wy, pi_omega0, pi_rho, pi_lam_phi, pi_link = MS.nb_pi_args(
+            self.pi_dyn, pi_params, SEASONAL_LAGS[self.seasonal])
 
         # Zeroed entirely under unconstrained_state -- the independent
         # isfinite() crash-guard in models/_nb_gb2_filter.py stays active
@@ -333,6 +333,7 @@ class CovZAGASModel:
                 lam_state=LAM_STATE, state_lim=STATE_LIMIT,
                 lam_eta=LAM_ETA,    eta_lim=ETA_LIMIT,
                 C_phi=C_phi,
+                pi_lam_phi=pi_lam_phi,
             )
             loglik_nb, loop_pen, f1d, s1d, eta1d, pi1d = out
 
@@ -383,6 +384,7 @@ class CovZAGASModel:
                 lam_eta=LAM_ETA,    eta_lim=ETA_LIMIT,
                 C_phi=C_phi,
                 C_xi=C_xi,
+                pi_lam_phi=pi_lam_phi,
             )
             loglik_nb, loop_pen, f_phi, f_xi, s_phi, s_xi, eta1d, pi1d = out
 
@@ -545,14 +547,7 @@ class CovZAGASModel:
             # Pi recursion — eta_eff is i-indexed so compute_eta's AR access
             # eta_eff[i-1] gives the immediately-preceding step (matches Numba).
             i = t - self.max_lag
-            eta_t = self.pi_dyn.compute_eta(
-                i=i,
-                eta_hist=eta_eff,
-                y_full=y,
-                t=t,
-                params=pi_params,
-                seasonal=self.seasonal,
-            )
+            eta_t = MS.eta_step(self.pi_dyn, i, eta_eff, y, t, pi_params, self.seasonal, f_arr[t, 0])
             eta_eff[i]  = eta_t   # i-indexed history for next step's AR term
             eta_arr[t]  = eta_t   # t-indexed for return paths
             # Numerical-safety guard (see models/harvey_gas.py's identical
@@ -580,14 +575,14 @@ class CovZAGASModel:
                 return 1e12 + penalty if not return_paths else {}
             loglik += ll_t
 
-            # Score — use gas._scaled_score to support all 3 scaling modes
-            if y[t] > 0:
-                raw_score = self.dist.score(y[t], **call_params)
-                scaled = self.gas._scaled_score(raw_score, call_params)
-                for j, name in enumerate(self.tv_names):
-                    s_arr[t, j] = scaled[name]
-                if not np.all(np.isfinite(s_arr[t, :])):
-                    return 1e12 + penalty if not return_paths else {}
+            # Score of the zero-adjusted density (models/mixed_score.py)
+            scaled = MS.scaled_score(self.dist, self.tv_names, self.gas.scaling, y[t], call_params,
+                                     pi_arr[t], MS.phi_link_lambda(self.pi_dyn, pi_params),
+                                     historical_fn=self.gas._scaled_score)
+            for j, name in enumerate(self.tv_names):
+                s_arr[t, j] = scaled[name]
+            if not np.all(np.isfinite(s_arr[t, :])):
+                return 1e12 + penalty if not return_paths else {}
 
             # GAS update + covariate contribution
             x_t = X_safe[t]  # shape (n_cov,)
@@ -840,6 +835,37 @@ class CovZAGASModel:
         y_test: np.ndarray,
         X_train: np.ndarray,
         X_test: np.ndarray,
+        use_numba: bool = True,
+    ) -> dict:
+        """
+        1-step-ahead rolling OOS evaluation (2026-10-01: Numba route).
+
+        The one-step-ahead OOS path is the filter run over train+test with
+        the fitted theta, so the compiled filter (the same kernel used for
+        estimation) produces it directly; the pure-Python recursion
+        (_simulate_oos_python) is the fallback and the parity reference
+        (tests/test_pi_linked_all_models.py).
+        """
+        if use_numba and self._use_nb_filter:
+            T_train = len(y_train)
+            p = self._run_filter(theta, np.concatenate([y_train, y_test]),
+                                 np.vstack([X_train, X_test]), return_paths=True)
+            if p:
+                k = T_train - int(p["eff_start"])
+                f = np.asarray(p["f_arr"])[k:, :]
+                return {"f_arr_oos": f, "phi_oos": f[:, 0],
+                        "xi_oos": f[:, 1] if f.shape[1] > 1 else None,
+                        "eta_oos": np.asarray(p["eta"])[k:], "pi_oos": np.asarray(p["pi"])[k:],
+                        "static": p["static"], "tv_names": self.tv_names, "y_test": y_test}
+        return self._simulate_oos_python(theta, y_train, y_test, X_train, X_test)
+
+    def _simulate_oos_python(
+        self,
+        theta: np.ndarray,
+        y_train: np.ndarray,
+        y_test: np.ndarray,
+        X_train: np.ndarray,
+        X_test: np.ndarray,
     ) -> dict:
         """
         Advance the fitted model into the test period (1-step-ahead rolling).
@@ -880,18 +906,17 @@ class CovZAGASModel:
             # reads eta_hist[i-1] for the AR term, so passing the t-indexed eta_arr
             # would fetch a value max_lag steps too early and break the recursion.
             i = t - max_lag
-            eta_arr[t] = self.pi_dyn.compute_eta(
-                i=i, eta_hist=eta_eff,
-                y_full=y_full, t=t, params=pi_params, seasonal=self.seasonal,
-            )
+            eta_arr[t] = MS.eta_step(self.pi_dyn, i, eta_eff, y_full, t, pi_params,
+                                     self.seasonal, f_arr[t, 0])
             eta_eff[i] = eta_arr[t]
             pi_arr[t] = float(self.pi_dyn.pi_from_eta(eta_arr[t]))
 
-            if y_full[t] > 0:
-                raw    = self.dist.score(y_full[t], **call_params)
-                scaled = self.gas._scaled_score(raw, call_params)
-                for j, name in enumerate(self.tv_names):
-                    s_arr[t, j] = scaled[name]
+            scaled = MS.scaled_score(self.dist, self.tv_names, self.gas.scaling, y_full[t],
+                                     call_params, pi_arr[t],
+                                     MS.phi_link_lambda(self.pi_dyn, pi_params),
+                                     historical_fn=self.gas._scaled_score)
+            for j, name in enumerate(self.tv_names):
+                s_arr[t, j] = scaled[name]
 
             x_t = X_full[t]
             for j, name in enumerate(self.tv_names):

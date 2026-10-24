@@ -154,3 +154,50 @@ class PhiLinkedPiDynamics(PiDynamics):
                 f"must span the full y array this instance is fit against."
             )
         return float(params["lambda0"] + params["lambda1"] * self.phi_path[t])
+
+
+class PhiLinkedJointPiDynamics(PiDynamics):
+    """
+    Joint (not frozen) phi-linked occurrence dynamics, 2026-10-01:
+
+        eta_t = lambda_0 + lambda_1 * phi_{t|t-1}
+
+    where phi_{t|t-1} is the magnitude state of the SAME ZA-GAS filter
+    (ZAGASModel), estimated jointly with lambda_0, lambda_1. At each t the
+    filter first forms phi_{t|t-1} from information up to t-1, then pi_t
+    from it, then scores y_t and updates phi_{t+1|t}.
+
+    Because pi_t depends on phi_t, the phi-score of the zero-adjusted
+    density gains an occurrence term (logistic link,
+    d pi/d phi = lambda_1 pi (1 - pi)):
+
+        d log f / d phi = 1{y>0} d log g / d phi + lambda_1 (1{y>0} - pi_t)
+
+    and its Fisher information is pi_t I_g + lambda_1^2 pi_t (1 - pi_t).
+    ZAGASModel applies both (numba kernel nb_filter_phi_only with
+    pi_lam_phi = lambda_1, and ZAGASModel._za_scaled_score in Python).
+
+    The frozen-path variant above (PhiLinkedPiDynamics) is kept for the
+    standalone two-step experiment; this class only works inside ZAGASModel.
+    """
+
+    uses_filtered_phi = True
+
+    def param_names(self, seasonal: str) -> List[str]:
+        return ["lambda0", "lambda1"]
+
+    def default_bounds(self, seasonal: str):
+        return [(-5.0, 2.0), (-3.0, 3.0)]
+
+    def initial_params(self, y: np.ndarray, seasonal: str) -> np.ndarray:
+        pi_hat = float(np.clip(np.mean(y > 0), 0.01, 0.99))
+        return np.array([np.log(pi_hat / (1.0 - pi_hat)), 0.0])
+
+    def eta_from_phi(self, phi_t: float, params: dict) -> float:
+        return float(params["lambda0"] + params["lambda1"] * phi_t)
+
+    def compute_eta(self, i, eta_hist, y_full, t, params, seasonal) -> float:
+        raise NotImplementedError(
+            "PhiLinkedJointPiDynamics needs the filtered phi_{t|t-1}; it is "
+            "evaluated by ZAGASModel via eta_from_phi(), not compute_eta()."
+        )

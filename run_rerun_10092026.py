@@ -181,7 +181,7 @@ def _evaluate(model, theta, data, filt_kwargs, oos_kwargs, ms_covariates, fit_re
 
     # 1-step OOS upper-tail exceedance + Kupiec at q = 0.95, 0.98
     from diagnostics.exceedance import exceedance_from_pit
-    pit = np.asarray(m.get("_pit_values", []), dtype=float)
+    pit = np.asarray(m.get("_pit_upper_values", m.get("_pit_values", [])), dtype=float)
     exc = {}
     for q in (0.95, 0.98):
         e = exceedance_from_pit(pit, q)

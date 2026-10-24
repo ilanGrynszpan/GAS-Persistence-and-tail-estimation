@@ -64,6 +64,8 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
+
+from models import mixed_score as MS
 import pandas as pd
 from scipy.special import expit
 
@@ -92,6 +94,27 @@ MULTISTEP_TWCRPS_LEVELS = (0.95, 0.98)
 # _split_theta returns a 2-tuple (gas_theta, pi_theta), not CovZAGASModel's
 # 3-tuple, and it has no _decode_cov/cov_target/n_cov attributes at all.
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _eta_forward(model, pi_params: dict, eta_prev: float, y_lookup, t: int, phi_t: float) -> float:
+    """eta_t during forward simulation: y-lags read real history up to the
+    origin and simulated values after it; phi-linked dynamics read the
+    simulated path's own phi_{t|t-1} (models/mixed_score.py)."""
+    if MS.pi_uses_phi(model.pi_dyn):
+        return model.pi_dyn.eta_from_phi(phi_t, pi_params)
+    lags_pi = list(getattr(model.pi_dyn, 'lags', None) or SEASONAL_LAGS[model.seasonal])
+    omega_y = np.array([pi_params[f"omega_y_{l}"] for l in lags_pi])
+    y_lags = np.array([y_lookup(t - l) if (t - l) >= 0 else 0.0 for l in lags_pi])
+    return float(pi_params["omega0"] + pi_params.get("rho", 0.0) * eta_prev + np.dot(omega_y, y_lags))
+
+
+def _scaled_into(model, scaling, historical_fn, s_arr, t, y_t, call_params, pi_t, pi_params) -> None:
+    """Write the scaled score of the zero-adjusted density at t into s_arr."""
+    tv = list(getattr(model, "tv_names", None) or model.gas.tv_names)
+    scaled = MS.scaled_score(model.dist, tv, scaling, y_t, call_params, pi_t,
+                             MS.phi_link_lambda(model.pi_dyn, pi_params), historical_fn=historical_fn)
+    for j, name in enumerate(tv):
+        s_arr[t, j] = scaled[name]
+
 
 def _base_replay(model, theta: np.ndarray, y_full: np.ndarray) -> dict:
     """Deterministic replay of ZAGASModel.simulate_oos's own recursion over
@@ -124,17 +147,11 @@ def _base_update(t, y_full, f_arr, s_arr, eta_arr, pi_arr, model, gp, pi_params,
 
     # eta_arr is t-indexed here; pass i=t so compute_eta's eta_hist[i-1]
     # reads eta_arr[t-1] (the previous step), matching the forecast recursion.
-    eta_arr[t] = model.pi_dyn.compute_eta(
-        i=t, eta_hist=eta_arr, y_full=y_full, t=t,
-        params=pi_params, seasonal=model.seasonal,
-    )
+    eta_arr[t] = MS.eta_step(model.pi_dyn, t, eta_arr, y_full, t, pi_params, model.seasonal,
+                             f_arr[t, 0])
     pi_arr[t] = float(model.pi_dyn.pi_from_eta(eta_arr[t]))
-
-    if y_full[t] > 0:
-        raw = model.dist.score(y_full[t], **call_params)
-        scaled = model.gas._scaled_score(raw, call_params)
-        for j, name in enumerate(model.gas.tv_names):
-            s_arr[t, j] = scaled[name]
+    _scaled_into(model, model.gas.scaling, model.gas._scaled_score, s_arr, t, y_full[t],
+                 call_params, pi_arr[t], pi_params)
 
     for j, name in enumerate(model.gas.tv_names):
         omega_j = gp[f"omega_{name}"]
@@ -155,7 +172,6 @@ def _base_simulate_forward(model, replay: dict, t0: int, h_max: int,
     gp, pi_params, lags = replay["gp"], replay["pi_params"], model.lags
     max_lag, n_tv = model.max_lag, len(model.gas.tv_names)
     T_ext = t0 + h_max + 1
-    lags_pi = list(getattr(model.pi_dyn, 'lags', None) or SEASONAL_LAGS[model.seasonal])
 
     out = np.zeros((n_draws, h_max))
     for d in range(n_draws):
@@ -180,20 +196,15 @@ def _base_simulate_forward(model, replay: dict, t0: int, h_max: int,
                 return _y_real[tau] if tau <= _t0 else _y_sim[tau]
 
             eta_prev = eta_arr[t - 1] if t - 1 >= 0 else 0.0
-            omega_y = np.array([pi_params[f"omega_y_{l}"] for l in lags_pi])
-            y_lags = np.array([y_lookup(t - l) if (t - l) >= 0 else 0.0 for l in lags_pi])
-            eta_arr[t] = float(pi_params["omega0"] + pi_params.get("rho", 0.0) * eta_prev + np.dot(omega_y, y_lags))
+            eta_arr[t] = _eta_forward(model, pi_params, eta_prev, y_lookup, t, f_arr[t, 0])
             pi_arr[t] = float(model.pi_dyn.pi_from_eta(eta_arr[t]))
 
             y_draw = _draw_y(model, call_params, pi_arr[t], rng)
             y_sim[t] = y_draw
             out[d, k] = y_draw
 
-            if y_draw > 0:
-                raw = model.dist.score(y_draw, **call_params)
-                scaled = model.gas._scaled_score(raw, call_params)
-                for j, name in enumerate(model.gas.tv_names):
-                    s_arr[t, j] = scaled[name]
+            _scaled_into(model, model.gas.scaling, model.gas._scaled_score, s_arr, t, y_draw,
+                         call_params, pi_arr[t], pi_params)
 
             for j, name in enumerate(model.gas.tv_names):
                 omega_j = gp[f"omega_{name}"]
@@ -301,17 +312,11 @@ def _cov_update(t, y_full, X_full, f_arr, s_arr, eta_arr, pi_arr, model, gp, pi_
 
     # eta_arr is t-indexed here; pass i=t so compute_eta's eta_hist[i-1]
     # reads eta_arr[t-1] (the previous step), matching the forecast recursion.
-    eta_arr[t] = model.pi_dyn.compute_eta(
-        i=t, eta_hist=eta_arr, y_full=y_full, t=t,
-        params=pi_params, seasonal=model.seasonal,
-    )
+    eta_arr[t] = MS.eta_step(model.pi_dyn, t, eta_arr, y_full, t, pi_params, model.seasonal,
+                             f_arr[t, 0])
     pi_arr[t] = float(model.pi_dyn.pi_from_eta(eta_arr[t]))
-
-    if y_full[t] > 0:
-        raw = model.dist.score(y_full[t], **call_params)
-        scaled = model.gas._scaled_score(raw, call_params)
-        for j, name in enumerate(model.tv_names):
-            s_arr[t, j] = scaled[name]
+    _scaled_into(model, model.gas.scaling, model.gas._scaled_score, s_arr, t, y_full[t],
+                 call_params, pi_arr[t], pi_params)
 
     x_t = X_full[t]
     for j, name in enumerate(model.tv_names):
@@ -388,22 +393,16 @@ def _cov_simulate_forward(model, replay: dict, X_full: np.ndarray, t0: int, h_ma
             def y_lookup(tau, _t0=t0, _y_sim=y_sim, _y_real=replay["_y_real"]):
                 return _y_real[tau] if tau <= _t0 else _y_sim[tau]
 
-            lags_pi = list(getattr(model.pi_dyn, 'lags', None) or SEASONAL_LAGS[model.seasonal])
             eta_prev = eta_arr[t - 1] if t - 1 >= 0 else 0.0
-            omega_y = np.array([pi_params[f"omega_y_{l}"] for l in lags_pi])
-            y_lags = np.array([y_lookup(t - l) if (t - l) >= 0 else 0.0 for l in lags_pi])
-            eta_arr[t] = float(pi_params["omega0"] + pi_params.get("rho", 0.0) * eta_prev + np.dot(omega_y, y_lags))
+            eta_arr[t] = _eta_forward(model, pi_params, eta_prev, y_lookup, t, f_arr[t, 0])
             pi_arr[t] = float(model.pi_dyn.pi_from_eta(eta_arr[t]))
 
             y_draw = _draw_y(model, call_params, pi_arr[t], rng)
             y_sim[t] = y_draw
             out[d, k] = y_draw
 
-            if y_draw > 0:
-                raw = model.dist.score(y_draw, **call_params)
-                scaled = model.gas._scaled_score(raw, call_params)
-                for j, name in enumerate(model.tv_names):
-                    s_arr[t, j] = scaled[name]
+            _scaled_into(model, model.gas.scaling, model.gas._scaled_score, s_arr, t, y_draw,
+                         call_params, pi_arr[t], pi_params)
 
             x_t = X_full[t]
             for j, name in enumerate(model.tv_names):
@@ -491,17 +490,11 @@ def _harvey_step_real(t, y_full, L_arr, S_arr, f_arr, s_arr, eta_arr, pi_arr,
 
     # eta_arr is t-indexed here; pass i=t so compute_eta's eta_hist[i-1]
     # reads eta_arr[t-1] (the previous step), matching the forecast recursion.
-    eta_arr[t] = model.pi_dyn.compute_eta(
-        i=t, eta_hist=eta_arr, y_full=y_full, t=t,
-        params=pip, seasonal=model.seasonal,
-    )
+    eta_arr[t] = MS.eta_step(model.pi_dyn, t, eta_arr, y_full, t, pip, model.seasonal,
+                             f_arr[t, model.tv_names.index("phi")])
     pi_arr[t] = float(model.pi_dyn.pi_from_eta(eta_arr[t]))
-
-    if y_full[t] > 0:
-        raw = model.dist.score(y_full[t], **call)
-        scaled = model._scaled_score(raw, call)
-        for j, name in enumerate(model.tv_names):
-            s_arr[t, j] = scaled[name]
+    _scaled_into(model, model.scaling, model._scaled_score, s_arr, t, y_full[t], call,
+                 pi_arr[t], pip)
 
     xl_t, xs_t = Xl_full[t], Xs_full[t]
     for j, name in enumerate(model.tv_names):
@@ -533,7 +526,6 @@ def _harvey_simulate_forward(model, replay: dict, y_real: np.ndarray, Xl_full: n
     T_ext = t0 + h_max + 1
     Xl_full = np.nan_to_num(Xl_full, nan=0.0)
     Xs_full = np.nan_to_num(Xs_full, nan=0.0)
-    lags_pi = list(getattr(model.pi_dyn, 'lags', None) or SEASONAL_LAGS[model.seasonal])
     m = model.n_harmonics
 
     out = np.zeros((n_draws, h_max))
@@ -571,20 +563,16 @@ def _harvey_simulate_forward(model, replay: dict, y_real: np.ndarray, Xl_full: n
                 return _y_real[tau] if tau <= _t0 else _y_sim[tau]
 
             eta_prev = eta_arr[t - 1] if t - 1 >= 0 else 0.0
-            omega_y = np.array([pip[f"omega_y_{l}"] for l in lags_pi])
-            y_lags = np.array([y_lookup(t - l) if (t - l) >= 0 else 0.0 for l in lags_pi])
-            eta_arr[t] = float(pip["omega0"] + pip["rho"] * eta_prev + np.dot(omega_y, y_lags))
+            eta_arr[t] = _eta_forward(model, pip, eta_prev, y_lookup, t,
+                                      f_arr[t, model.tv_names.index("phi")])
             pi_arr[t] = float(model.pi_dyn.pi_from_eta(eta_arr[t]))
 
             y_draw = _draw_y(model, call, pi_arr[t], rng)
             y_sim[t] = y_draw
             out[d, k] = y_draw
 
-            if y_draw > 0:
-                raw = model.dist.score(y_draw, **call)
-                scaled = model._scaled_score(raw, call)
-                for j, name in enumerate(model.tv_names):
-                    s_arr[t, j] = scaled[name]
+            _scaled_into(model, model.scaling, model._scaled_score, s_arr, t, y_draw, call,
+                         pi_arr[t], pip)
 
             xl_t, xs_t = Xl_full[t], Xs_full[t]
             for j, name in enumerate(model.tv_names):

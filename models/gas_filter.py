@@ -79,6 +79,16 @@ from constants import SEASONAL_LAGS
 # Supported scaling modes
 _VALID_SCALING = {"unit", "diagonal_inverse_fisher", "inverse_fisher"}
 
+# Inverse Fisher information of the zero-adjusted (mixed) density
+#     f(y) = (1 - pi_t) 1{y=0} + pi_t g(y; phi_t) 1{y>0}
+# w.r.t. phi:  I_mixed = pi_t * I_g(phi) [+ lambda_1^2 pi_t (1 - pi_t) when
+# pi_t depends on phi_t]. It needs pi_t, which only the zero-adjusted model
+# knows, so it is accepted only when the owning model opts in
+# (GASFilter(..., allow_mixed_scaling=True), see ZAGASModel) and is applied
+# by that model, never by GASFilter._scaled_score.
+MIXED_SCALING = "mixed_inverse_fisher"
+MIXED_SCALINGS = {"mixed_inverse_fisher", "mixed_diagonal_inverse_fisher"}
+
 
 # ===========================================================================
 # Parameter codec: maps a flat numpy vector <-> named parameter dict
@@ -510,12 +520,17 @@ class GASFilter:
         kurtosis_margin: float = 4.0,
         bound_static_box: bool = False,
         static_box: Tuple[float, float] = (-2.0, 15.0),
+        allow_mixed_scaling: bool = False,
     ):
         if seasonal not in SEASONAL_LAGS:
             raise ValueError(
                 f"seasonal must be one of {list(SEASONAL_LAGS)}, got '{seasonal}'"
             )
-        if scaling not in _VALID_SCALING:
+        if scaling in MIXED_SCALINGS and not allow_mixed_scaling:
+            raise ValueError(
+                f"scaling '{scaling}' needs pi_t and is only supported by the zero-adjusted models"
+            )
+        if scaling not in _VALID_SCALING and scaling not in MIXED_SCALINGS:
             raise ValueError(
                 f"scaling must be one of {sorted(_VALID_SCALING)}, got '{scaling!r}'"
             )
@@ -586,6 +601,11 @@ class GASFilter:
 
         if self.scaling == "unit":
             return unit_score
+        if self.scaling in MIXED_SCALINGS:
+            raise RuntimeError(
+                f"'{self.scaling}' depends on pi_t and is applied by "
+                "models/mixed_score.py::scaled_score, not GASFilter._scaled_score"
+            )
 
         # ── diagonal_inverse_fisher ──────────────────────────────────────────
         if self.scaling == "diagonal_inverse_fisher":

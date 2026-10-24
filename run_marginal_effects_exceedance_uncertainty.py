@@ -280,6 +280,21 @@ def main():
     obj = lambda th: _objective(model, winner["family"], data, lm.ms_kwargs, th)
     se_result = numerical_std_errors(obj, theta_hat)
     se = se_result["std_errors"]
+    if se_result["quality"] == "failed" and se_result.get("hessian") is not None:
+        # Singular Hessian: drop the directions with (numerically) no curvature
+        # -- the rule generate_std_errors_report.py uses -- and invert the rest.
+        # Dropped parameters get no SE and are held at the estimate below.
+        H = np.asarray(se_result["hessian"], float)
+        d = np.abs(np.diag(H))
+        keep = np.where(np.isfinite(d) & (d > 1e-8 * np.nanmax(d)))[0]
+        try:
+            cov = np.linalg.inv(H[np.ix_(keep, keep)])
+            v = np.diag(cov)
+            se = np.full(len(theta_hat), np.nan)
+            se[keep] = np.where(v > 0, np.sqrt(np.abs(v)), np.nan)
+            se_result["quality"] = "partial (flat directions dropped)"
+        except np.linalg.LinAlgError:
+            pass
     print(f"  quality={se_result['quality']}  ({time.time()-t0:.2f}s)")
 
     n_nan_se = int(np.sum(~np.isfinite(se)))
@@ -303,11 +318,24 @@ def main():
     q95 = float(np.quantile(wet, 0.95))
     print(f"  q95 (wet-day, training) = {q95:.3f}")
 
-    dpt_idx = list(model.cov_names).index(DPT_COLUMN)
     dpt_std = column_std(data, DPT_COLUMN)
+    is_harvey = hasattr(model, "harvey_target")
+    if is_harvey:
+        # Long-short family: DPT enters the short component, S_{t+1} = ... + Gamma_S x_t,
+        # and phi_t = omega + L_t + S_t, so a shock at t-1 moves phi_t by Gamma_S * Delta.
+        cv_name = f"Gamma_S_phi_{DPT_COLUMN}"
+        filt_args = (lm.ms_kwargs["X_long_train"], lm.ms_kwargs["X_short_train"])
+    else:
+        dpt_idx = list(model.cov_names).index(DPT_COLUMN)
+        filt_args = (lm.ms_kwargs["X_train"],)
+
+    def _cv_std(paths, theta_k):
+        if is_harvey:
+            return float(dict(zip(param_names, theta_k))[cv_name])
+        return float(paths["gamma"]["phi"][dpt_idx])
 
     # ---- point-estimate in-sample filtered path (for the date index only) ----
-    paths0 = model.filter(theta_hat, y_train, lm.ms_kwargs["X_train"])
+    paths0 = model.filter(theta_hat, y_train, *filt_args)
     eff_start = paths0["eff_start"]
     dates = pd.DatetimeIndex(data["dates_train"])[eff_start:]
     T_eff = len(dates)
@@ -327,10 +355,10 @@ def main():
     # x_{t-1} by a FINITE raw amount Delta shifts the log-state at t by
     # EXACTLY c_v_raw*Delta (the recursion's other terms -- omega, the
     # score/AR parts -- do not depend on x_{t-1} at all), before any
-    # nonlinear moment/CDF map is applied. pi_t is unchanged (c_v^pi=0), so
-    # it cancels out of both ratios -- the ZA percentage change in the mean
-    # equals the positive-part percentage change, and likewise for the
-    # exceedance probability.
+    # nonlinear moment/CDF map is applied. Since 2026-10-01 pi_t is shifted
+    # too when it is phi-linked (eta_t moves by exactly lambda1 c_v Delta), so
+    # the ratios use pi_after; for any other pi dynamics lambda1 = 0, pi
+    # cancels, and the ZA percentage change equals the positive-part one.
     pct_mean = {delta: np.empty((N_DRAWS, T_eff)) for delta in DELTAS}
     pct_prob = {delta: np.empty((N_DRAWS, T_eff)) for delta in DELTAS}
     # LEVELS (not effects/percentages), for the "with comparison" charts
@@ -343,33 +371,41 @@ def main():
 
     for k in range(N_DRAWS):
         theta_k = theta_hat + rng.standard_normal(len(theta_hat)) * se_safe
-        paths = model.filter(theta_k, y_train, lm.ms_kwargs["X_train"])
+        paths = model.filter(theta_k, y_train, *filt_args)
         phi_path = paths["f_arr"][:, 0]
         pi_path = paths["pi"]
         stat = paths["static"]
         xi_k, gamma_k, zeta_k = stat["xi"], stat["gamma"], stat["zeta"]
-        c_v_std = paths["gamma"]["phi"][dpt_idx]
+        c_v_std = _cv_std(paths, theta_k)
         c_v_raw = c_v_std / dpt_std
+        # Occurrence channel (2026-10-01): with phi-linked occurrence dynamics
+        # pi_t = logistic(lambda0 + lambda1 phi_t), the shock also moves pi_t:
+        # d pi/d phi = lambda1 pi (1 - pi). lambda1 = 0 for every other pi
+        # dynamics, which reproduces the earlier (pi-invariant) formulas exactly.
+        lam1 = float(dict(zip(param_names, theta_k)).get("lambda1", 0.0))
+        dpi_dphi = lam1 * pi_path * (1.0 - pi_path)
+        logit_pi = np.log(pi_path) - np.log1p(-pi_path)
 
         m1_before = dist.raw_moment(1, phi=phi_path, xi=xi_k, gamma=gamma_k, zeta=zeta_k)
-        dm1_dx = c_v_raw * m1_before
-        green[k, :] = pi_path * dm1_dx  # d M1_t / d x  (c_v^pi=0)
+        # d(pi E[G])/dx = c_v [dpi/dphi E[G] + pi dE[G]/dphi], dE[G]/dphi = E[G] (phi = log scale)
+        green[k, :] = c_v_raw * (dpi_dphi * m1_before + pi_path * m1_before)
         M1_before_lv[k, :] = pi_path * m1_before
 
         kernel = dist.exceedance_effect_kernel(q95, phi=phi_path, xi=xi_k, gamma=gamma_k, zeta=zeta_k)
-        red[k, :] = pi_path * c_v_raw * kernel
-
         s_before = 1.0 - dist.cdf(q95, phi=phi_path, xi=xi_k, gamma=gamma_k, zeta=zeta_k)
+        # d(pi S(u))/dx = c_v [dpi/dphi S(u) + pi dS(u)/dphi]
+        red[k, :] = c_v_raw * (dpi_dphi * s_before + pi_path * kernel)
         P_before_lv[k, :] = pi_path * s_before
         for delta in DELTAS:
             phi_after = phi_path + c_v_raw * delta
+            pi_after = 1.0 / (1.0 + np.exp(-(logit_pi + lam1 * c_v_raw * delta)))
             m1_after = dist.raw_moment(1, phi=phi_after, xi=xi_k, gamma=gamma_k, zeta=zeta_k)
-            pct_mean[delta][k, :] = (m1_after - m1_before) / m1_before
-            M1_after_lv[delta][k, :] = pi_path * m1_after
+            pct_mean[delta][k, :] = (pi_after * m1_after - pi_path * m1_before) / (pi_path * m1_before)
+            M1_after_lv[delta][k, :] = pi_after * m1_after
 
             s_after = 1.0 - dist.cdf(q95, phi=phi_after, xi=xi_k, gamma=gamma_k, zeta=zeta_k)
-            pct_prob[delta][k, :] = (s_after - s_before) / s_before
-            P_after_lv[delta][k, :] = pi_path * s_after
+            pct_prob[delta][k, :] = (pi_after * s_after - pi_path * s_before) / (pi_path * s_before)
+            P_after_lv[delta][k, :] = pi_after * s_after
 
     print(f"  done in {time.time()-t0:.2f}s")
 

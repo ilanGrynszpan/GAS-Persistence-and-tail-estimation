@@ -681,6 +681,13 @@ def compute_extended_oos_metrics(
         # both take pit_values + alpha) -- saving it lets those tests be
         # re-run later at ANY alpha level without re-simulating draws.
         result["_pit_values"] = pit_vals.tolist()
+        # Upper-tail exceedance PIT (2026-10-01): F(y-), the left limit of the
+        # zero-adjusted CDF. Identical to pit_vals on wet days; 0 on dry days,
+        # because y_t = 0 can never exceed the model's q-quantile. The
+        # non-randomised pit_vals sets a dry day to F(0) = 1 - pi_t, which is
+        # > q whenever pi_t < 1 - q and then wrongly counts the dry day as an
+        # upper-tail violation (Kupiec / Christoffersen).
+        result["_pit_upper_values"] = np.where(np.asarray(y_test) > 0, pit_vals, 0.0).tolist()
 
     return result
 
